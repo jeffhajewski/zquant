@@ -22,10 +22,14 @@ Three things worth remembering even if nothing else here is:
 1. **The distortion-bound constant in the paper's PDF is easy to misread, and I did.**
    It is `√3·π/2 = 2.7207`, not `√(3π)/2 = 1.535`. See [8ff805c](#8ff805c).
 
-2. **An orthogonal QJL sketch is strictly better than the paper's Gaussian one** — exact
-   rather than asymptotic normalization, and ~2.7× lower inner-product distortion. This
-   was verified by re-implementing the paper's construction in the same harness before
-   claiming anything. See [71b1e1b](#71b1e1b).
+2. **An orthogonal QJL sketch is better than the paper's Gaussian one** — exact rather than
+   asymptotic normalization, and ~2.7× lower inner-product distortion. Verified by
+   re-implementing the paper's construction in the same harness before claiming anything.
+   See [71b1e1b](#71b1e1b). *Status of the two halves differs:* unbiasedness is **proven**
+   (exact at finite m, by a symmetry argument); the variance improvement is **empirical
+   only** — the paper's proofs assume Gaussian S and do not transfer. And lower estimator
+   variance on random unit vectors is not yet evidence of better recall on real
+   embeddings; that is a P1 question for the turbovec comparison.
 
 3. **Lloyd's convergence is governed by its linear rate, not by the tolerance.** Loosening
    tolerance 6 orders of magnitude cut iterations 33% while costing 4 orders of accuracy.
@@ -329,6 +333,30 @@ conclusive, so it is *not* asserted as one. Worth a proper derivation sometime: 
 `Var·m = π/2 − 1` exactly for an orthogonal sketch, that is a clean small result. Note the
 Gaussian case is exactly `π/2`, so a "−1" is plausibly the removed row-norm variance.
 
+### A small arithmetic error in the paper
+
+Verified after the fact, while checking that `D_prod(b) = (π/2)·D_mse(b−1)` held. The
+paper's quoted `D_prod` values propagate its own *rounded* `D_mse` values rather than the
+exact ones:
+
+| b | paper `D_prod` | correct `(π/2)·D_mse(b−1)` | error |
+|---|---|---|---|
+| 1 | 1.57 | 1.571 | 0.1% |
+| 2 | 0.56 | 0.571 | 1.9% |
+| 3 | 0.18 | 0.184 | 2.5% |
+| 4 | **0.047** | **0.054** | **13.4%** |
+
+Root cause is upstream: `D_mse(3)` is quoted as `0.03` when it is `0.034548` — one
+significant figure, 13% low. Then `(π/2)·0.03 = 0.0471`, which is exactly the quoted 0.047.
+
+Consequence: none that matters. These are illustrative "finer-grained values", not the
+theorem; the bound `√3·π/2 · 4^−b` holds throughout. Recorded only so that a future
+comparison against `0.047` is not mistaken for a bug on our side.
+
+**Not to be confused with the constant in [8ff805c](#8ff805c).** That one was *my* error —
+`pdftotext` mangled `\frac{\sqrt{3}\pi}{2d}` into a stacked fraction under a displaced
+radical, and I reconstructed it wrong. The paper is correct there.
+
 ### A statistics bug in my own test
 
 The test for "MSE-only estimation is biased by 2/π" first measured **0.194** against an
@@ -366,7 +394,8 @@ Ordered by how much I would want to resolve them before building on top:
    plus the 32-vector blocked, dimension-major layout is the actual P1 deliverable.
 3. **Codebooks are solved at runtime.** Fine at these sizes but wants comptime tables,
    particularly since the KV path needs per-(layer, head) configurations.
-4. **The `π/2 − 1` conjecture** for the orthogonal sketch variance (above).
+4. **Derive the orthogonal sketch's variance** rather than measuring it, both to justify
+   the ~2.7× claim properly and to settle the `π/2 − 1` conjecture (above).
 5. **turbovec has not been run yet.** The plan commits to running it in our own harness
    rather than comparing against its README. Also: find out what its `calibrate()` does —
    TurboQuant is data-oblivious by construction, so a calibration step implies something

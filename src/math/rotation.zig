@@ -96,6 +96,7 @@ pub const Rotation = struct {
     pub fn apply(self: Rotation, src: []const f32, dst: []f32) void {
         std.debug.assert(src.len <= self.padded);
         std.debug.assert(dst.len == self.padded);
+        assertDisjoint(src, dst);
 
         switch (self.kind) {
             .hadamard => {
@@ -124,6 +125,7 @@ pub const Rotation = struct {
     pub fn applyInverse(self: Rotation, src: []const f32, dst: []f32) void {
         std.debug.assert(src.len == self.padded);
         std.debug.assert(dst.len == self.padded);
+        assertDisjoint(src, dst);
 
         switch (self.kind) {
             .hadamard => {
@@ -153,6 +155,15 @@ pub const Rotation = struct {
         return self.data[round * self.padded ..][0..self.padded];
     }
 };
+
+/// Both transforms stage through `dst` and then work in place, so an aliasing
+/// `src` would be partially overwritten before it is read. Caught here rather than
+/// left to produce quietly wrong codes.
+fn assertDisjoint(src: []const f32, dst: []const f32) void {
+    const s = @intFromPtr(src.ptr);
+    const d = @intFromPtr(dst.ptr);
+    std.debug.assert(s + src.len * @sizeOf(f32) <= d or d + dst.len * @sizeOf(f32) <= s);
+}
 
 fn applySigns(x: []f32, signs: []const f32) void {
     for (x, signs) |*v, s| v.* *= s;

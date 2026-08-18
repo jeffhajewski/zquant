@@ -10,6 +10,9 @@ pub const density = @import("math/density.zig");
 pub const lloyd_max = @import("math/lloyd_max.zig");
 pub const rotation = @import("math/rotation.zig");
 
+pub const codebook = @import("quant/codebook.zig");
+pub const mse = @import("quant/mse.zig");
+
 test {
     @import("std").testing.refAllDecls(@This());
 }

@@ -91,10 +91,23 @@ This is what makes a FastScan-style blocked layout the right core kernel (§4.2)
 The paper generates `Π` by QR on a Gaussian matrix: `O(d²)` per vector, and `O(d²)` storage.
 That is fine on a GPU with a batched GEMM; it is the wrong choice for a CPU library.
 
-We use a **Randomized Hadamard Transform**, `Π = (1/√d)·H·D₃·H·D₂·H·D₁` (3 rounds, `D_i` random
-±1 diagonals, interleaved with a random permutation): `O(d log d)`, in-cache, branch-free,
-and specified by `3d` sign bits + a permutation seed instead of `d²` floats.
-Same for `S'` — a second independent RHT instance, which is sub-Gaussian rather than Gaussian.
+We use a **Randomized Hadamard Transform**, `Π = H·D₂·H·D₁·H·D₀` (3 rounds, `D_i` random ±1
+diagonals, `H` normalized so it is orthogonal): `O(d log d)`, in-cache, branch-free, and specified
+by `3d` sign bits instead of `d²` floats. Same for `S'` — a second RHT instance under a different
+RNG purpose, which is sub-Gaussian rather than Gaussian.
+
+*Implemented without the inter-round permutation this section originally called for.* FWHT already
+makes every output coordinate depend on every input coordinate, so a permutation adds little that
+another sign-flip round does not, and omitting it keeps `apply` allocation-free and thread-safe
+(permuting in place otherwise needs scratch). Justified by measurement, not assertion: the RHT
+reproduces the sphere coordinate density's exact fourth moment `3/(d(d+2))` — distinguishably not
+the Gaussian `3/d²` — and matches the dense Haar reference to within 5%. If that ever regresses,
+add rounds before adding permutations.
+
+Rounds are 3 because 1 is provably not enough: a single `H·D` maps a standard basis vector to
+`±1/√d` in *every* coordinate — identical magnitudes, the exact opposite of the Beta-distributed
+spread the scalar quantizer is built for. Axis-aligned and one-hot-ish vectors do occur in real
+corpora, so this is a real input, not a contrived one. There is a regression test for it.
 
 This is standard practice (QuIP#, KIVI, ScaNN all do it) but it is *an approximation of the paper*,
 so it is gated on a measured test: empirical `D_mse` / `D_prod` from the RHT path must match the

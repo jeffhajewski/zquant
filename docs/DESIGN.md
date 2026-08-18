@@ -36,7 +36,12 @@ So the intractable d-dimensional VQ problem collapses to **one scalar quantizer 
 Centroids solve the continuous 1-D k-means problem
 `C(f_X, b) = min Σ_i ∫ |t − c_i|² f_X(t) dt` over Voronoi cells. Solved **once, offline**, per `(b, d)`.
 
-Guarantee: `D_mse ≤ (√(3π)/2) · 4^−b`, within ≈2.7× of the Shannon lower bound.
+Guarantee: `D_mse ≤ (√3·π/2) · 4^−b`. The constant is 2.7207, and since the Shannon lower
+bound for this problem is exactly `4^−b`, that constant *is* the "≈2.7 factor" the abstract
+quotes. It also falls out of Panter-Dite independently: `(1/12)·(∫f^(1/3))³ = (1/12)·6√3·π`
+for a unit Gaussian. (The PDF renders this as a stacked `3π / 2d` under a radical, which reads
+naturally but wrongly as `√(3π)/2 = 1.535` — a value the true optimal quantizer violates at
+every bit-width.)
 
 ### 1.2 `TurboQuant_prod(b)` — unbiased inner products
 
@@ -57,7 +62,9 @@ DeQuant(idx, qjl, γ):
             x̃ = DeQuant_mse(idx) + (√(π/2) / d) · γ · Sᵀ · qjl
 ```
 
-`E[⟨y, x̃⟩] = ⟨y, x⟩` exactly. `D_prod ≤ √(3π²/d) · ‖y‖² · 4^−b`.
+`E[⟨y, x̃⟩] = ⟨y, x⟩` exactly. The inner-product distortion follows from the QJL variance
+bound as `D_prod = (π/2)·D_mse(b−1)·‖y‖²/d`, which reproduces the paper's quoted
+`{1.57, 0.56, 0.18, 0.047}/d` for b=1..4.
 
 **Bit accounting.** "b bits" for `prod` = `(b−1)` code bits + 1 sketch bit per coordinate,
 plus two f16 scalars per vector (`‖x‖`, `γ`) — 32 bits amortized over d, i.e. noise at d≥256.
@@ -375,7 +382,10 @@ The paper hands us an unusually good test oracle. We use all of it.
 
 ### 7.2 Distortion regression (gates the RHT deviation)
 Measured against the paper's numbers, for both the dense-QR reference and the RHT path:
-- `D_mse ≤ (√(3π)/2)·4^−b`, plus the finer per-bit-width values for b=1..4.
+- `D_mse ≤ (√3·π/2)·4^−b = 2.7207·4^−b`, plus the finer per-bit-width values for b=1..4.
+  Note `D(b)·4^b` approaches 2.7207 from below (1.45, 1.88, 2.21, 2.43, ...), so this is an
+  asymptotic bound and a test asserting "≈4× per bit" at low b would be wrong: the measured
+  ratios are 3.09, 3.40, 3.64, 3.79, climbing toward 4.
 - `D_prod ≈ {1.57, 0.56, 0.18, 0.047}/d` for b=1..4.
 
 If RHT misses these, the fast path is not shipped as the default — that decision is made on numbers.

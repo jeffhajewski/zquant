@@ -16,6 +16,7 @@ pub const prod = @import("quant/prod.zig");
 pub const packing = @import("quant/packing.zig");
 
 pub const simd_encode = @import("simd/encode.zig");
+pub const simd_scan = @import("simd/scan.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

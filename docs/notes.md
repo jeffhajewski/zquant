@@ -429,6 +429,43 @@ Tests cover b=1..5, not 1..8 — a b=8 Lloyd solve is ~27k iterations (see [8ff8
 b=5 already exercises both kernels. First version of these tests didn't think about that and made
 the suite take minutes.
 
+### <a name="scan"></a>`HEAD` — scan kernel, and a 14× one-line fix
+
+The kernel itself is unremarkable: mask nibbles, two table lookups, `smlal` into i16, widen to
+i32, reduce once per vector. What is worth recording is how nearly it shipped at a fifth of its
+speed.
+
+**LLVM lowers the portable lookup form to one instruction — until you inline it.**
+`inline for (0..16) |i| out[i] = table[idx[i]]` compiles to exactly `tbl` (aarch64), `pshufb`
+(SSSE3), or `vpshufb` (AVX2) when the result is *returned*. Inlined into this kernel, where the
+result immediately feeds a widening multiply, LLVM folds each `extractelement` into the consumer's
+`sext` and never forms the vector-build pattern — emitting **32 scalar `umov`/`bfxil` pairs per
+chunk instead of one `tbl`**.
+
+Fix is an empty `asm` with a vector-register constraint (`"+w"` on ARM, `"+x"` on x86). It emits no
+instruction and blocks the fold.
+
+| | before | after |
+|---|---|---|
+| throughput | 2.87M vec/s | **39.8M vec/s** |
+| code bandwidth | 1.5 GB/s | **20.4 GB/s** |
+| ns/vector (d=1024) | 349 | **25.1** |
+| vs unquantized f32 brute force | 1.2× | **17.7×** |
+
+**How it was caught, and how it nearly wasn't.** Every test passed both before and after — the
+kernel was always *correct*. What flagged it was the benchmark showing the int8 quantized scan
+barely beating an f32 brute-force loop, which is structurally implausible: 8× less memory traffic
+should not buy 1.2×. Disassembly then showed no `tbl` at all.
+
+**This is a fragile trick** — it depends on LLVM's fold behaviour and could regress on a compiler
+update, silently, at ~4× cost. `bench/scan_bench.zig` is the guard; there is no unit test that can
+see it. Worth re-checking on every Zig upgrade.
+
+**Remaining headroom.** 20.4 GB/s against a predicted 37. The gap is four `saddw` widenings per
+chunk, forced by widening i16→i32 every chunk. Products reach 127·127 = 16129 and two already sit
+at 32258, just inside i16's 32767, so no more can be batched at full range. Shrinking the centroid
+range to ±32 would allow four chunks per widen at some precision cost — measure before taking it.
+
 ---
 
 ## Open items for P1

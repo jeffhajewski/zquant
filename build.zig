@@ -20,7 +20,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_unit_tests.step);
 
     const bench_step = b.step("bench", "Run benchmarks");
-    for ([_][]const u8{"encode_bench"}) |name| {
+    for ([_][]const u8{ "encode_bench", "scan_bench" }) |name| {
         const exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{

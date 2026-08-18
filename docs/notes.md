@@ -383,6 +383,54 @@ passing simultaneously.
 
 ---
 
+## P1 (in progress)
+
+### <a name="becbc6a"></a>`becbc6a` → revised by `HEAD` — code layout
+
+**Landed a dimension-major FastScan block, then reversed it while writing the kernel.** Worth
+recording as a reasoning error rather than quietly rewriting history.
+
+The blocked layout was carried over from product quantization without checking whether its
+premise held. It does not. FastScan is dimension-major because PQ's per-subspace LUT is
+*query-dependent* (`LUT_m[k] = ⟨q_m, centroid_{m,k}⟩`), so applying it needs all vectors' codes
+for one subspace together. TurboQuant's codebook is scalar, so the table **factorizes** into
+`LUT_j[k] = p_j · c[k]` — a single 16-entry, query-independent table that lives in one register
+for the entire scan, times a scalar.
+
+Consequence: the scan is a per-vector dot product along dimensions, which is what `SDOT`/VNNI
+accelerate, and row-major storage is both faster and simpler (no transpose at insert).
+
+| layout | ops/dim at d=1024,b=4 | effective |
+|---|---|---|
+| row-major + SDOT | 0.19 | ~37 GB/s — memory-bound ✅ |
+| dimension-major + f32 widen | 0.56 | ~3× more — compute-bound ❌ |
+
+This also retroactively explains turbovec's reported `SDOT`/`SMMLA`, which never fit a
+dimension-major layout and should have been a clue at planning time.
+
+**Lesson:** "adopt the known-good layout from the adjacent problem" skipped checking whether the
+property that motivated it (query-dependent per-subspace LUTs) actually holds here. It doesn't,
+and a scalar codebook is a *simpler* problem than PQ, not merely a different one.
+
+### <a name="e5fbc1a"></a>`e5fbc1a` — vectorized threshold encoder
+
+Measured, 4M coordinates, ReleaseFast: **1.50 Gcoord/s at b=4 (11×)**, **6.87 Gcoord/s at b=2
+(36×)**. The multiples flatter it — the scalar baseline is a branchy early-break loop written for
+clarity, so much of the gap is misprediction. Absolute rates are the number to track.
+
+Two things dropped from the plan, both for the same underlying reason:
+- **The threshold binary search** (DESIGN.md §4.1, ~3b ops/element) does not vectorize: each round
+  probes `thresholds[idx]` at a *per-lane* runtime index — a gather. No portable spelling, and
+  slow where it exists. Linear compare-sum uses only broadcasts.
+- Full unrolling stops at b=4; b=8 is 255 broadcast constants and 255 compares per specialization,
+  which pushed compile time past two minutes.
+
+Tests cover b=1..5, not 1..8 — a b=8 Lloyd solve is ~27k iterations (see [8ff805c](#8ff805c)) and
+b=5 already exercises both kernels. First version of these tests didn't think about that and made
+the suite take minutes.
+
+---
+
 ## Open items for P1
 
 Ordered by how much I would want to resolve them before building on top:

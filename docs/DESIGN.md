@@ -241,34 +241,59 @@ kernels, both branch-free over `@Vector(N, f32)`:
 
 Both are implemented; `dispatch.zig` picks per `b` from measured numbers, not from intuition.
 
-### 4.2 Scan path — the blocked ADC kernel
+### 4.2 Scan path — row-major, factorized LUT, integer dot product
 
-Corpus stored in **blocks of 32 vectors, dimension-major within the block**:
+> **Revised during P1 implementation.** This section originally specified a 32-vector
+> dimension-major (FastScan) block. That was wrong for this quantizer — see below.
+
+The corpus is stored **row-major**: each vector's codes packed contiguously at `b` bits per
+coordinate, padded to a 16-byte stride.
+
+**Why not FastScan.** In product quantization each subspace has its own *query-dependent* lookup
+table `LUT_m[k] = ⟨q_m, centroid_{m,k}⟩`, and applying it needs every vector's code for subspace
+`m` at once — which is exactly what a dimension-major block delivers. TurboQuant's codebook is
+*scalar*, so the equivalent table **factorizes**:
 
 ```
-block layout:  dim 0 → [v0..v31 codes]  (32 nibbles = 16 bytes)
-               dim 1 → [v0..v31 codes]
-               ...
+LUT_j[k] = p_j · c[k]
 ```
 
-The kernel holds 32 accumulators (one per vector in the block) in registers and walks dimensions:
+`c[]` is a single 16-entry table at b≤4: query-independent, shared by every dimension, and
+resident in one SIMD register for the whole scan. Only the scalar `p_j` depends on the query.
+FastScan's entire justification evaporates, and the scan becomes a per-vector dot product with a
+reduction along `j` — the exact shape `SDOT` (ARM) and VNNI (x86) exist to accelerate. This is
+also why turbovec reports `SDOT`/`SMMLA`, which never fit a dimension-major layout.
+
+**The kernel**, per vector at d=1024, b=4 (512 B of codes):
 
 ```
-for j in 0..d:
-    codes  = load16(block + j*16)          # 32 packed 4-bit codes
-    cents  = shuffle(centroid_lut, codes)  # vpshufb / tbl / swizzle — 1 instruction
-    acc   += broadcast(p[j]) * widen(cents)
+for chunk in 0..32:                       # 16 bytes = 32 nibbles = 32 dims
+    codes = load16(v + chunk*16)
+    lo    = codes & 0x0F                  # even dimensions
+    hi    = codes >> 4                    # odd dimensions
+    acc   = sdot(acc, tbl(c8, lo), q_even[chunk])
+    acc   = sdot(acc, tbl(c8, hi), q_odd[chunk])
+horizontal_add(acc)
 ```
 
-Two variants:
-- **f32 accumulate** — exact estimator, ~1 FMA per (vector, dim).
-- **int8 · int8 → int32** — query uniformly quantized per-query to int8, centroids stored as int8.
-  Uses `vpmaddubsw`/VNNI on x86, `sdot` on ARM. ~4× the throughput; adds a bounded, measurable
-  query-side quantization error. Exposed as an opt-in precision knob, never a silent default.
+6 ops per 32 dimensions ≈ **0.19 ops/dimension**, ~192 ops/vector. At ~4 IPC that is ~48
+cycles/vector, i.e. **~37 GB/s of code traffic** — genuinely memory-bound, which is where we want
+to sit. The dimension-major form needs an int8→f32 widen per dimension and costs ~3× more,
+leaving the scan compute-bound.
 
-Memory traffic is `n·d·b/8` bytes streamed once — at d=1536, b=4 that's 768 B/vector. The kernel is
-deliberately **memory-bound**, which is the correct place to sit; the arithmetic hides under the load.
-Query state (`p`, `S'p`, LUT) is a few KB and stays resident in L1 across the whole scan.
+Because byte `i` holds dimensions `2i` and `2i+1`, the query is de-interleaved into even and odd
+streams once per query (not per vector) to line up with the nibble split.
+
+**Precision variants:**
+- **int8** — query uniformly quantized per-query to int8, centroids stored as int8. Fastest;
+  adds a bounded, measurable query-side error. Opt-in, never a silent default.
+- **exact f32** — four `tbl` lookups over the byte-planes of the 16 f32 centroids reconstruct
+  exact f32 values from codes, at more ops but no approximation.
+
+**Table lookup has no portable spelling.** Zig's `@shuffle` needs a comptime mask and `std.simd`
+has no runtime byte-table lookup, so `tbl`/`vpshufb` require per-architecture inline assembly
+behind `simd/dispatch.zig`, with a scalar fallback. The same obstacle already forced the encoder
+away from a threshold binary search (§4.1).
 
 ### 4.3 The QJL term
 

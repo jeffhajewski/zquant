@@ -12,6 +12,7 @@ pub const rotation = @import("math/rotation.zig");
 
 pub const codebook = @import("quant/codebook.zig");
 pub const mse = @import("quant/mse.zig");
+pub const prod = @import("quant/prod.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

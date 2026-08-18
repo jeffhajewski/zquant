@@ -26,7 +26,26 @@ pub const Codebook = struct {
         density: Density,
         bits: u6,
     ) (lloyd_max.Error)!Codebook {
-        std.debug.assert(bits >= 1 and bits <= max_bits);
+        std.debug.assert(bits <= max_bits);
+
+        // Zero bits: a single level at the density's mean, which is zero for both
+        // symmetric densities here. Not a degenerate case to guard against but a
+        // real configuration — `prod` at b=1 spends its whole budget on the QJL
+        // sketch and needs an MSE stage that reconstructs nothing.
+        if (bits == 0) {
+            const centroids = try allocator.alloc(f32, 1);
+            errdefer allocator.free(centroids);
+            const thresholds = try allocator.alloc(f32, 0);
+            centroids[0] = 0;
+            return .{
+                .bits = 0,
+                .centroids = centroids,
+                .thresholds = thresholds,
+                // Reconstructing zero leaves the entire variance as error.
+                .normalized_distortion = 1.0,
+                .allocator = allocator,
+            };
+        }
 
         var solution = try lloyd_max.solveBits(allocator, density, bits, .{});
         defer solution.deinit();
@@ -152,6 +171,16 @@ test "slice helpers match the scalar path" {
         try testing.expectEqual(cb.encode(v), code);
         try testing.expectEqual(cb.centroids[code], decoded);
     }
+}
+
+test "zero bits yields a single zero level" {
+    var cb = try Codebook.init(testing.allocator, Density.sphereCoord(256), 0);
+    defer cb.deinit();
+    try testing.expectEqual(@as(usize, 1), cb.levels());
+    try testing.expectEqual(@as(f32, 0), cb.centroids[0]);
+    try testing.expectEqual(@as(usize, 0), cb.thresholds.len);
+    try testing.expectEqual(@as(f64, 1.0), cb.normalized_distortion);
+    for ([_]f32{ -9, 0, 9 }) |v| try testing.expectEqual(@as(u8, 0), cb.encode(v));
 }
 
 test "codes always index a valid level" {

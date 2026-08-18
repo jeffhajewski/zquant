@@ -63,8 +63,29 @@ DeQuant(idx, qjl, γ):
 ```
 
 `E[⟨y, x̃⟩] = ⟨y, x⟩` exactly. The inner-product distortion follows from the QJL variance
-bound as `D_prod = (π/2)·D_mse(b−1)·‖y‖²/d`, which reproduces the paper's quoted
+bound as `D_prod = (π/2)·D_mse(b−1)·‖y‖²/d`, reproducing the paper's quoted
 `{1.57, 0.56, 0.18, 0.047}/d` for b=1..4.
+
+**We deviate here, and it is an improvement, not just a cheaper approximation.** We use an
+*orthogonal* `S'` (a second RHT) rather than a Gaussian one. Two consequences:
+
+1. *An exact constant instead of an asymptotic one.* Rows of a Haar-orthogonal matrix are uniform
+   unit vectors, and for such a row `r` and unit `x`, `E[sign(rᵀx)·(rᵀy)] = c_m·⟨x,y⟩` **exactly** —
+   decompose `y` along `x` plus a perpendicular part, whose contribution vanishes by symmetry. And
+   `c_m = E|rᵀx|` is just the mean absolute value of the sphere-coordinate density, available in
+   closed form from `density.moment`. The paper's `√(π/2)/√m` is the large-`m` limit of `1/(m·c_m)`.
+   Using the exact value matters most at small `m` — i.e. the KV path.
+2. *Roughly 2.7× lower distortion.* Orthonormal rows fix `Σᵢ(rᵢᵀq)² = ‖q‖²` exactly rather than
+   letting it fluctuate, and the removed variance shows up directly in the estimator.
+
+Measured, with the paper's own Gaussian construction implemented in the same harness on the same
+vectors: Gaussian sketch gives `Var·m = 1.55` (matching the published 1.57, which validates the
+harness); orthogonal gives `0.56`. Per bit-width our `D_prod·d` is `{0.567, 0.207, 0.068, 0.020}`
+against the paper's `{1.57, 0.56, 0.18, 0.047}`. Tests assert both the regression values and the
+strict inequality against the published ones.
+
+The measured `0.566 ± 0.003` sits near `π/2 − 1 = 0.5708` — suggestive of an exact constant, but
+1.5σ off, so it is not asserted as one.
 
 **Bit accounting.** "b bits" for `prod` = `(b−1)` code bits + 1 sketch bit per coordinate,
 plus two f16 scalars per vector (`‖x‖`, `γ`) — 32 bits amortized over d, i.e. noise at d≥256.

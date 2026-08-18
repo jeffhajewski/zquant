@@ -63,7 +63,6 @@ pub const Mse = struct {
 
     pub fn init(allocator: Allocator, params: Params) !Mse {
         std.debug.assert(params.dim >= 1);
-        std.debug.assert(params.bits >= 1);
 
         var rotation = try Rotation.init(
             allocator,

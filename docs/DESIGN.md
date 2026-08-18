@@ -3,7 +3,7 @@
 TurboQuant (Zandieh, Daliri, Hadian, Mirrokni — [arXiv:2504.19874](https://arxiv.org/abs/2504.19874), ICLR 2026)
 implemented in Zig, with first-class clients in Zig, Python, JS/TS, and Go.
 
-Status: planning. Zig toolchain pinned to **0.15.2**.
+Status: **P0 (reference core) complete**; P1 next. Zig toolchain pinned to **0.15.2**.
 
 ---
 
@@ -561,7 +561,7 @@ not a number this library can claim.
 
 | Phase | Deliverable | Done when |
 |---|---|---|
-| **P0** | Scalar reference core: RNG, dense-QR + RHT rotations, Lloyd–Max, `mse`, `prod` | §7.1 and §7.2 pass on the reference path |
+| **P0** ✅ | Scalar reference core: RNG, dense-QR + RHT rotations, Lloyd–Max, `mse`, `prod` | §7.1 and §7.2 pass on the reference path |
 | **P1** | SIMD kernels, blocked layout, `FlatIndex`, bench harness | §7.3 matches/beats PQ + RaBitQ; recall within noise of turbovec; scan is memory-bound on the bench box |
 | **P2** | C ABI, on-disk format, Python wheels | `pip install zquant` on 4 platforms; §7.4 passes for Python |
 | **P3** | JS/TS: N-API + wasm-simd, one TS surface | `npm i zquant` works in Node and browser; §7.4 passes for JS |

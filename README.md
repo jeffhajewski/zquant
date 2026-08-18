@@ -6,7 +6,9 @@ An implementation of [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh, Da
 Hadian, Mirrokni — ICLR 2026): a data-oblivious vector quantizer with near-optimal
 distortion rate, for vector search and LLM KV-cache compression.
 
-See [docs/DESIGN.md](docs/DESIGN.md) for the design and implementation plan.
+See [docs/DESIGN.md](docs/DESIGN.md) for the design and implementation plan, and
+[docs/notes.md](docs/notes.md) for a per-commit engineering log of what was built, measured,
+and got wrong along the way.
 
 ## Status
 

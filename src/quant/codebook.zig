@@ -7,6 +7,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const lloyd_max = @import("../math/lloyd_max.zig");
 const Density = @import("../math/density.zig").Density;
+const simd_encode = @import("../simd/encode.zig");
 
 pub const max_bits: u6 = 8;
 
@@ -100,7 +101,15 @@ pub const Codebook = struct {
         return self.centroids[code];
     }
 
+    /// Vectorized encode. Verified bit-for-bit against `encode` above, which is in
+    /// turn verified against a direct argmin.
     pub fn encodeSlice(self: Codebook, src: []const f32, dst: []u8) void {
+        std.debug.assert(src.len == dst.len);
+        simd_encode.encodeSlice(self.bits, self.thresholds, src, dst);
+    }
+
+    /// The scalar path, kept callable so tests can compare against it directly.
+    pub fn encodeSliceScalar(self: Codebook, src: []const f32, dst: []u8) void {
         std.debug.assert(src.len == dst.len);
         for (src, dst) |v, *c| c.* = self.encode(v);
     }
@@ -166,6 +175,10 @@ test "slice helpers match the scalar path" {
     var out: [6]f32 = undefined;
     cb.encodeSlice(&src, &codes);
     cb.decodeSlice(&codes, &out);
+
+    var scalar_codes: [6]u8 = undefined;
+    cb.encodeSliceScalar(&src, &scalar_codes);
+    try testing.expectEqualSlices(u8, &scalar_codes, &codes);
 
     for (src, codes, out) |v, code, decoded| {
         try testing.expectEqual(cb.encode(v), code);

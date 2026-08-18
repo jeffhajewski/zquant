@@ -18,4 +18,18 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+
+    const bench_step = b.step("bench", "Run benchmarks");
+    for ([_][]const u8{"encode_bench"}) |name| {
+        const exe = b.addExecutable(.{
+            .name = name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(b.fmt("bench/{s}.zig", .{name})),
+                .target = target,
+                .optimize = .ReleaseFast,
+                .imports = &.{.{ .name = "zquant", .module = zquant }},
+            }),
+        });
+        bench_step.dependOn(&b.addRunArtifact(exe).step);
+    }
 }

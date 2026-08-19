@@ -466,6 +466,49 @@ chunk, forced by widening i16→i32 every chunk. Products reach 127·127 = 16129
 at 32258, just inside i16's 32767, so no more can be batched at full range. Shrinking the centroid
 range to ±32 would allow four chunks per widen at some precision cost — measure before taking it.
 
+### <a name="tests"></a>`HEAD` — integration and property tests
+
+The unit tests each verify a module against its own oracle. Nothing verified that the modules agreed
+with *each other*, and nothing verified the property the library exists to provide: that top-k
+retrieval returns the right neighbours. Distortion bounds are a proxy for recall; recall is the
+thing itself.
+
+Added `tests/pipeline.zig` (seams + recall) and `tests/invariants.zig` (property sweeps +
+adversarial inputs), wired as separate build targets so they exercise the public API rather than
+reaching into internals. 117 tests total.
+
+**Found a real bug immediately.** The dimension sweep crashed at `dim < 3`: `padded` came out below
+3, and `Density.sphereCoord` asserts `dim ≥ 3` because `(1−t²)^((d−3)/2)` is unbounded below that.
+Failure mode was an assert three modules from the call site. Fixed by flooring `padded` at 4 —
+zero-padding a 1-D vector into R⁴ is well defined and costs three wasted codes, which is strictly
+better than crashing. Nothing in 101 prior tests touched `dim < 4`.
+
+**Measured recall (10k corpus, 200 queries, `prod` estimator):**
+
+| d | bits | data | 1@1 | 1@10 | 1@100 |
+|---|---|---|---|---|---|
+| 256 | 2 | uniform | 0.285 | 0.805 | 0.985 |
+| 256 | 3 | uniform | 0.525 | 0.975 | 1.000 |
+| 256 | 4 | uniform | 0.685 | 1.000 | 1.000 |
+| 256 | 4 | clustered | 0.410 | 0.940 | 1.000 |
+| 1024 | 4 | clustered | 0.515 | 0.960 | 1.000 |
+| 128 | 4 | clustered | 0.460 | 0.920 | 1.000 |
+
+Recall is monotone in both bits and k in every configuration, which is good evidence the pipeline is
+correct and that clustered data is genuinely harder rather than buggy.
+
+**Do not read these as a comparison against the paper.** The paper's numbers are on real embeddings
+(DBpedia/OpenAI, GloVe); "clustered" here is synthetic and deliberately adversarial — 32 tight
+clusters produce many near-ties. Comparable numbers require the real datasets, which is still an
+open P1 item.
+
+**Worth noting for the index design:** 1@1 on clustered data is only 0.41–0.52 even at b=4. Top-1
+retrieval will need a rerank stage; 1@10 ≥ 0.92 means a small candidate set suffices, which is
+exactly what rerank assumes.
+
+Test thresholds are set from measurement with ~3 standard errors of margin, and the measured value
+is written next to each so a future tightening does not have to re-derive it.
+
 ---
 
 ## Open items for P1

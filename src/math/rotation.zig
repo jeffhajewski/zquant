@@ -39,6 +39,9 @@ pub const Kind = enum {
 /// leaves margin.
 pub const default_rounds: u32 = 3;
 
+/// Smallest working dimension. See the note in `Rotation.init`.
+pub const min_padded_dim: u32 = 4;
+
 pub const Rotation = struct {
     /// Logical input dimension.
     dim: u32,
@@ -59,7 +62,13 @@ pub const Rotation = struct {
         purpose: rng.Purpose,
     ) Allocator.Error!Rotation {
         std.debug.assert(dim >= 1);
-        const padded = std.math.ceilPowerOfTwoAssert(u32, dim);
+        // Floored at 4 so the padded dimension is always a valid sphere dimension.
+        // The coordinate density (1−t²)^((d−3)/2) needs d ≥ 3 to be bounded, and
+        // below that the concentration argument the algorithm rests on is vacuous
+        // anyway. Zero-padding a 1- or 2-dimensional vector into R⁴ is well defined
+        // and costs three wasted codes; crashing on an assert three modules down is
+        // not. Useful guarantees still need d in the hundreds.
+        const padded = @max(min_padded_dim, std.math.ceilPowerOfTwoAssert(u32, dim));
         const rounds = default_rounds;
 
         const data = switch (kind) {
@@ -480,8 +489,18 @@ test "non-power-of-two dimensions are padded" {
     }
 }
 
+test "tiny dimensions are floored to the minimum" {
+    // Below this the coordinate density is not defined; padding up keeps the whole
+    // pipeline working rather than tripping an assert deep in density.zig.
+    for ([_]u32{ 1, 2, 3, 4 }) |dim| {
+        var rot = try Rotation.init(testing.allocator, dim, .hadamard, 1, .rht_signs);
+        defer rot.deinit();
+        try testing.expectEqual(min_padded_dim, rot.padded);
+    }
+}
+
 test "exact powers of two are not padded further" {
-    for ([_]u32{ 1, 2, 64, 128, 1024 }) |dim| {
+    for ([_]u32{ 8, 64, 128, 1024 }) |dim| {
         var rot = try Rotation.init(testing.allocator, dim, .hadamard, 1, .rht_signs);
         defer rot.deinit();
         try testing.expectEqual(dim, rot.padded);

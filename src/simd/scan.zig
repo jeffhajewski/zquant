@@ -43,9 +43,6 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Layout = @import("../quant/packing.zig").Layout;
 
-/// Bit-width the vectorized path handles. Others fall back to `scoreExact`.
-pub const simd_bits: u6 = 4;
-
 /// The 16 centroids, quantized to int8. Query-independent, built once per index.
 pub const Table = struct {
     values: @Vector(16, i8),
@@ -68,51 +65,57 @@ pub const Table = struct {
     }
 };
 
-/// A query, rotated and then de-interleaved by parity to match the nibble packing.
+/// A query, rotated and de-interleaved to match the code packing.
 ///
-/// Byte `i` of a code block holds dimension `2i` in its low nibble and `2i+1` in its
-/// high nibble, so masking a 16-byte load yields the even dimensions and shifting
-/// yields the odd ones. Splitting the query the same way is a fixed permutation done
-/// once per query rather than once per vector.
+/// Byte `i` of a code block holds `groups = 8/bits` consecutive dimensions, so
+/// extracting bit-field `k` from a 16-byte load yields the codes for dimensions
+/// congruent to `k` modulo `groups`. The query is split the same way — a fixed
+/// permutation applied once per query, not once per vector.
+///
+/// At bits=4 this is the even/odd split; at bits=2 it is four streams, at bits=1
+/// eight.
 pub const Query = struct {
-    even: []i8,
-    odd: []i8,
-    /// p_j ≈ (even|odd)[j/2] * scale
+    /// `groups` contiguous streams of `stride` values each.
+    data: []i8,
+    groups: usize,
+    stride: usize,
+    /// p_j ≈ data[(j % groups) * stride + j / groups] * scale
     scale: f32,
     allocator: Allocator,
 
-    pub fn init(allocator: Allocator, dim: u32) Allocator.Error!Query {
-        std.debug.assert(dim % 2 == 0);
-        const half = dim / 2;
-        const buf = try allocator.alloc(i8, dim);
+    pub fn init(allocator: Allocator, dim: u32, bits: u6) Allocator.Error!Query {
+        const groups = 8 / @as(usize, bits);
+        std.debug.assert(dim % groups == 0);
         return .{
-            .even = buf[0..half],
-            .odd = buf[half..],
+            .data = try allocator.alloc(i8, dim),
+            .groups = groups,
+            .stride = dim / groups,
             .scale = 1.0,
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *Query) void {
-        self.allocator.free(self.even.ptr[0 .. self.even.len + self.odd.len]);
+        self.allocator.free(self.data);
         self.* = undefined;
     }
 
-    /// Quantize and split a rotated query. Scale is chosen per query from its own
-    /// magnitude, so a small query does not lose precision to a fixed range.
+    /// Quantize and de-interleave a rotated query. Scale is chosen per query from its
+    /// own magnitude, so a small query does not lose precision to a fixed range.
     pub fn load(self: *Query, rotated: []const f32) void {
-        std.debug.assert(rotated.len == self.even.len + self.odd.len);
+        std.debug.assert(rotated.len == self.data.len);
 
         var magnitude: f32 = 0;
         for (rotated) |v| magnitude = @max(magnitude, @abs(v));
         self.scale = if (magnitude > 0) magnitude / 127.0 else 1.0;
         const inverse = 1.0 / self.scale;
 
-        for (self.even, 0..) |*dst, m| {
-            dst.* = @intFromFloat(@round(std.math.clamp(rotated[2 * m] * inverse, -127.0, 127.0)));
-        }
-        for (self.odd, 0..) |*dst, m| {
-            dst.* = @intFromFloat(@round(std.math.clamp(rotated[2 * m + 1] * inverse, -127.0, 127.0)));
+        for (0..self.groups) |k| {
+            const stream = self.data[k * self.stride ..][0..self.stride];
+            for (stream, 0..) |*dst, m| {
+                const v = rotated[m * self.groups + k] * inverse;
+                dst.* = @intFromFloat(@round(std.math.clamp(v, -127.0, 127.0)));
+            }
         }
     }
 };
@@ -139,36 +142,56 @@ inline fn lookup(table: @Vector(16, i8), idx: @Vector(16, u8)) @Vector(16, i8) {
     return optimizationBarrier(out);
 }
 
-/// Vectorized score for 4-bit codes. Returns the estimate of Σ p_j · c[code_j].
-pub fn scoreInt8(table: Table, query: Query, codes: []const u8, dim: u32) f32 {
-    std.debug.assert(dim % 32 == 0);
-    std.debug.assert(codes.len * 2 >= dim);
+/// Vectorized score for a comptime-known bit-width.
+///
+/// One 16-byte load carries `128/bits` codes: `groups` bit-fields of 16 lanes each.
+/// Products are accumulated two groups at a time in i16 (`smlal`) before widening —
+/// two products reach 2·127·127 = 32258, just inside i16's 32767, so pairs are the
+/// most that can be batched at full range.
+fn scoreBits(comptime bits: u6, table: Table, query: Query, codes: []const u8, dim: u32) f32 {
+    const groups = comptime 8 / @as(usize, bits);
+    const mask_value = comptime (@as(u8, 1) << @as(u3, @intCast(bits))) - 1;
+    const field_mask: @Vector(16, u8) = @splat(mask_value);
 
-    const nibble_mask: @Vector(16, u8) = @splat(0x0F);
+    const chunks = @as(usize, dim) * bits / 128;
     var acc: @Vector(16, i32) = @splat(0);
 
-    const chunks = dim / 32;
     for (0..chunks) |ch| {
         const packed_codes: @Vector(16, u8) = codes[ch * 16 ..][0..16].*;
-        const lo = packed_codes & nibble_mask;
-        const hi = packed_codes >> @as(@Vector(16, u3), @splat(4));
 
-        const even: @Vector(16, i8) = query.even[ch * 16 ..][0..16].*;
-        const odd: @Vector(16, i8) = query.odd[ch * 16 ..][0..16].*;
-
-        // Two products per chunk accumulate in i16 (`smlal`), then widen into i32.
-        // Widening every chunk rather than every few: products reach 127·127 = 16129
-        // and two of them already sit at 32258, just inside i16's 32767.
-        var chunk_acc: @Vector(16, i16) = @splat(0);
-        chunk_acc +%= @as(@Vector(16, i16), lookup(table.values, lo)) *%
-            @as(@Vector(16, i16), even);
-        chunk_acc +%= @as(@Vector(16, i16), lookup(table.values, hi)) *%
-            @as(@Vector(16, i16), odd);
-        acc += @as(@Vector(16, i32), chunk_acc);
+        comptime var pair: usize = 0;
+        inline while (pair < groups / 2) : (pair += 1) {
+            var chunk_acc: @Vector(16, i16) = @splat(0);
+            inline for (0..2) |half| {
+                const k = pair * 2 + half;
+                const shift: @Vector(16, u3) = @splat(@intCast(k * bits));
+                const idx = (packed_codes >> shift) & field_mask;
+                const w: @Vector(16, i8) =
+                    query.data[k * query.stride + ch * 16 ..][0..16].*;
+                chunk_acc +%= @as(@Vector(16, i16), lookup(table.values, idx)) *%
+                    @as(@Vector(16, i16), w);
+            }
+            acc += @as(@Vector(16, i32), chunk_acc);
+        }
     }
 
     const total: f32 = @floatFromInt(@reduce(.Add, acc));
     return total * table.scale * query.scale;
+}
+
+/// Vectorized score. `bits` must satisfy `canVectorize`.
+pub fn scoreInt8(bits: u6, table: Table, query: Query, codes: []const u8, dim: u32) f32 {
+    std.debug.assert(codes.len * 8 >= @as(usize, dim) * bits);
+    return switch (bits) {
+        1 => scoreBits(1, table, query, codes, dim),
+        2 => scoreBits(2, table, query, codes, dim),
+        4 => scoreBits(4, table, query, codes, dim),
+        // 3-bit codes do not divide a byte, so a 16-byte load carries a ragged
+        // number of them. Deliberately unsupported rather than approximated by
+        // padding into nibbles, which measurement showed is dominated by simply
+        // using one more bit of MSE (see docs/notes.md).
+        else => unreachable,
+    };
 }
 
 /// Exact f32 reference. Correct for any bit-width and dimension.
@@ -185,9 +208,14 @@ pub fn scoreExact(
     return @floatCast(acc);
 }
 
-/// Whether the vectorized path applies to this configuration.
+/// Whether the vectorized path applies.
+///
+/// Bit-widths that divide a byte (1, 2, 4) keep every code inside one byte, so
+/// extraction is a uniform shift-and-mask. 3, 5, 6, 7 do not and fall back to
+/// `scoreExact`.
 pub fn canVectorize(layout: Layout) bool {
-    return layout.bits == simd_bits and layout.dim % 32 == 0;
+    const divides_byte = layout.bits == 1 or layout.bits == 2 or layout.bits == 4;
+    return divides_byte and (@as(usize, layout.dim) * layout.bits) % 128 == 0;
 }
 
 // -- tests -------------------------------------------------------------------
@@ -238,12 +266,12 @@ test "int8 kernel tracks the exact reference" {
         var cb = try setup(dim, 4, 0x5EED + dim, codes, rotated);
         defer cb.deinit();
 
-        var query = try Query.init(testing.allocator, dim);
+        var query = try Query.init(testing.allocator, dim, 4);
         defer query.deinit();
         query.load(rotated);
 
         const table = Table.init(cb.centroids);
-        const fast = scoreInt8(table, query, codes, dim);
+        const fast = scoreInt8(4, table, query, codes, dim);
         const exact = scoreExact(layout, cb.centroids, rotated, codes);
 
         // Scores are ~N(0, ·) with magnitude around ‖p‖·‖c‖/√d; compare against the
@@ -265,7 +293,7 @@ test "int8 kernel error stays small in aggregate" {
     defer cb.deinit();
     const table = Table.init(cb.centroids);
 
-    var query = try Query.init(testing.allocator, dim);
+    var query = try Query.init(testing.allocator, dim, 4);
     defer query.deinit();
 
     const raw = try testing.allocator.alloc(f32, dim);
@@ -291,7 +319,7 @@ test "int8 kernel error stays small in aggregate" {
         for (rotated) |*v| v.* = random.floatNorm(f32) * sigma;
         query.load(rotated);
 
-        const fast = scoreInt8(table, query, codes, dim);
+        const fast = scoreInt8(4, table, query, codes, dim);
         const exact = scoreExact(layout, cb.centroids, rotated, codes);
         const err = @as(f64, fast) - exact;
         squared_error += err * err;
@@ -323,7 +351,7 @@ test "table quantization preserves ordering and sign" {
 
 test "query round trips through quantization and the parity split" {
     const dim: u32 = 64;
-    var query = try Query.init(testing.allocator, dim);
+    var query = try Query.init(testing.allocator, dim, 4);
     defer query.deinit();
 
     var rotated: [dim]f32 = undefined;
@@ -331,15 +359,11 @@ test "query round trips through quantization and the parity split" {
     for (&rotated) |*v| v.* = prng.random().floatNorm(f32);
     query.load(&rotated);
 
-    for (0..dim / 2) |m| {
+    for (0..dim) |j| {
+        const stored = query.data[(j % query.groups) * query.stride + j / query.groups];
         try testing.expectApproxEqAbs(
-            rotated[2 * m],
-            @as(f32, @floatFromInt(query.even[m])) * query.scale,
-            query.scale,
-        );
-        try testing.expectApproxEqAbs(
-            rotated[2 * m + 1],
-            @as(f32, @floatFromInt(query.odd[m])) * query.scale,
+            rotated[j],
+            @as(f32, @floatFromInt(stored)) * query.scale,
             query.scale,
         );
     }
@@ -366,7 +390,7 @@ test "zero query and zero codes score zero" {
     defer cb.deinit();
     const table = Table.init(cb.centroids);
 
-    var query = try Query.init(testing.allocator, dim);
+    var query = try Query.init(testing.allocator, dim, 4);
     defer query.deinit();
     const zeros = [_]f32{0} ** dim;
     query.load(&zeros);
@@ -376,14 +400,70 @@ test "zero query and zero codes score zero" {
     defer testing.allocator.free(codes);
     @memset(codes, 0);
 
-    try testing.expectEqual(@as(f32, 0), scoreInt8(table, query, codes, dim));
+    try testing.expectEqual(@as(f32, 0), scoreInt8(4, table, query, codes, dim));
 }
 
 test "canVectorize gates on bit-width and dimension" {
+    // Widths that divide a byte are supported...
     try testing.expect(canVectorize(Layout.init(1024, 4)));
+    try testing.expect(canVectorize(Layout.init(1024, 2)));
+    try testing.expect(canVectorize(Layout.init(1024, 1)));
     try testing.expect(canVectorize(Layout.init(32, 4)));
-    try testing.expect(!canVectorize(Layout.init(1024, 2)));
-    try testing.expect(!canVectorize(Layout.init(48, 4))); // not a multiple of 32
+    // ...and those that do not are rejected rather than approximated.
+    try testing.expect(!canVectorize(Layout.init(1024, 3)));
+    try testing.expect(!canVectorize(Layout.init(1024, 5)));
+    // A chunk is 16 bytes, so dim*bits must fill whole chunks.
+    try testing.expect(!canVectorize(Layout.init(48, 4)));
+    try testing.expect(!canVectorize(Layout.init(32, 2)));
+}
+
+test "every vectorizable bit-width tracks the exact reference" {
+    // Extends the b=4 agreement test across all supported widths. A wrong shift or
+    // stream mapping at b=1 or b=2 would produce plausible but consistently wrong
+    // scores, exactly the failure mode the parity split had at b=4.
+    const allocator = testing.allocator;
+    for ([_]u6{ 1, 2, 4 }) |bits| {
+        const dim: u32 = 1024;
+        const layout = Layout.init(dim, bits);
+        try testing.expect(canVectorize(layout));
+
+        var cb = try Codebook.init(allocator, Density.sphereCoord(dim), bits);
+        defer cb.deinit();
+        const table = Table.init(cb.centroids);
+
+        var query = try Query.init(allocator, dim, bits);
+        defer query.deinit();
+
+        const raw = try allocator.alloc(f32, dim);
+        defer allocator.free(raw);
+        const unpacked = try allocator.alloc(u8, dim);
+        defer allocator.free(unpacked);
+        const stored = try allocator.alloc(u8, layout.stride());
+        defer allocator.free(stored);
+        const rotated = try allocator.alloc(f32, dim);
+        defer allocator.free(rotated);
+
+        var prng = std.Random.DefaultPrng.init(0xB175 + @as(u64, bits));
+        const random = prng.random();
+        const sigma = 1.0 / @sqrt(@as(f32, @floatFromInt(dim)));
+
+        var squared_error: f64 = 0;
+        var squared_signal: f64 = 0;
+        for (0..100) |_| {
+            for (raw) |*v| v.* = random.floatNorm(f32) * sigma;
+            cb.encodeSlice(raw, unpacked);
+            layout.pack(unpacked, stored);
+            for (rotated) |*v| v.* = random.floatNorm(f32) * sigma;
+            query.load(rotated);
+
+            const fast = scoreInt8(bits, table, query, stored, dim);
+            const exact = scoreExact(layout, cb.centroids, rotated, stored);
+            const err = @as(f64, fast) - exact;
+            squared_error += err * err;
+            squared_signal += exact * exact;
+        }
+        try testing.expect(@sqrt(squared_error / squared_signal) < 0.02);
+    }
 }
 
 test "exact reference agrees with a naive unpacked dot product" {

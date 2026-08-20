@@ -21,7 +21,7 @@ pub fn build(b: *std.Build) void {
 
     // Integration tests live outside the module so they exercise the public API
     // across seams, rather than reaching into internals.
-    for ([_][]const u8{ "pipeline", "invariants" }) |name| {
+    for ([_][]const u8{ "pipeline", "invariants", "golden" }) |name| {
         const t = b.addTest(.{
             .name = b.fmt("{s}-test", .{name}),
             .root_module = b.createModule(.{

@@ -32,7 +32,7 @@ pub fn main() !void {
     defer a.free(rotated);
     for (rotated) |*v| v.* = prng.random().floatNorm(f32) * sigma;
 
-    var query = try zq.simd_scan.Query.init(a, dim);
+    var query = try zq.simd_scan.Query.init(a, dim, bits);
     defer query.deinit();
     query.load(rotated);
     const table = zq.simd_scan.Table.init(cb.centroids);
@@ -46,7 +46,7 @@ pub fn main() !void {
     var t = try std.time.Timer.start();
     const reps = 5;
     for (0..reps) |_| {
-        for (0..n) |i| sink += zq.simd_scan.scoreInt8(table, query, layout.vectorSlice(storage, i), dim);
+        for (0..n) |i| sink += zq.simd_scan.scoreInt8(bits, table, query, layout.vectorSlice(storage, i), dim);
     }
     const simd_ns = t.read() / reps;
 

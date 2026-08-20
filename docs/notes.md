@@ -625,6 +625,44 @@ storage — the earlier analysis compared *bytes* and correctly concluded paddin
 never asked what the fallback cost. A dominance argument over one axis says nothing about the axis
 you did not measure.
 
+### <a name="sift"></a>`HEAD` — first real-data benchmark (SIFT10K)
+
+Everything before this used synthetic corpora whose difficulty I chose, which proves little about
+embeddings. ANN_SIFT10K is 10,000 base vectors at 128d with 100 queries and published top-100 exact
+L2 ground truth — the standard small sanity corpus. `tools/fetch_datasets.sh` retrieves it; `data/`
+is gitignored.
+
+| bits | code B | total B | ratio | 1@1 | 1@10 | 1@100 | R@10 | QPS |
+|---|---|---|---|---|---|---|---|---|
+| 2 | 32 | 36 | 14.2× | 0.32 | 0.75 | **1.00** | 0.421 | 9498 |
+| 3 | 48 | 52 | 9.8× | 0.45 | 0.88 | **1.00** | 0.571 | 9656 |
+| 4 | 64 | 68 | 7.5× | 0.67 | **1.00** | **1.00** | 0.740 | 6363 |
+| 5 | 80 | 84 | 6.1× | 0.74 | **1.00** | **1.00** | 0.839 | 9845 |
+| 6 | 96 | 100 | 5.1× | 0.86 | 1.00 | 1.00 | 0.902 | 294 |
+
+**The most useful line is `1@100 = 1.00` everywhere** — including b=2 at 14× compression. The true
+nearest neighbour is always inside the first 100 results. That is precisely the precondition a
+rerank stage needs: scan quantized, rescore 100 candidates exactly, get exact top-1 at 14×
+compression. Rerank was a plausible idea before; it is now a measured one, and it should move up
+the queue.
+
+**R@10 is the harder metric and the honest one.** Retrieving the *whole* true top-10 sits at 0.740
+at b=4 — the estimator finds the best neighbour reliably but reorders the near-ties behind it.
+Consistent with the synthetic clustered results.
+
+**b=6 at 294 QPS** is `max_table_bits` showing up in production: 5-bit codes exceed the 16-entry
+shuffle table, so it takes the exact scan. The documented cliff, visible in real numbers.
+
+**A reporting error, corrected.** `bytesPerVector` excluded the per-vector `norm` and `gamma`, which
+were f32. Overstated compression by 11% at d=128 — the KV regime. Two fixes: scalars are now f16 as
+DESIGN.md always specified, and the accessor includes them (`codeBytesPerVector` reports the part
+that scales with the bit budget). b=4 is 7.5×, not 8×. Recall unchanged, so f16 costs nothing;
+there is a test comparing retrieval across widely varying norms rather than assuming it.
+
+**What these numbers are not.** There is still no PQ, RaBitQ, or turbovec baseline run here, so
+nothing above supports a claim of parity with the paper. SIFT10K is also only 10k vectors — recall
+at 10k is markedly easier than at 1M, so these are optimistic relative to SIFT1M.
+
 ---
 
 ## Open items for P1

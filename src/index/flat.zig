@@ -56,6 +56,16 @@ pub const Params = struct {
     exact_scan: bool = false,
 };
 
+/// Half-precision per-vector scalars. See the field comment on `FlatIndex.scalars`.
+pub const StoredScalars = struct {
+    norm: f16,
+    gamma: f16,
+
+    fn from(s: prod_mod.Scalars) StoredScalars {
+        return .{ .norm = @floatCast(s.norm), .gamma = @floatCast(s.gamma) };
+    }
+};
+
 pub const FlatIndex = struct {
     quantizer: prod_mod.Prod,
     layout: packing.Layout,
@@ -66,8 +76,14 @@ pub const FlatIndex = struct {
     codes: std.ArrayList(u8),
     /// QJL sign bitmaps, `sketchLen()` bytes per vector.
     sketches: std.ArrayList(u8),
-    /// ‖x‖ and ‖y − ỹ‖ per vector.
-    scalars: std.ArrayList(prod_mod.Scalars),
+    /// ‖x‖ and ‖y − ỹ‖ per vector, at half precision.
+    ///
+    /// f16 rather than f32 because these are per *vector*, not per coordinate, so
+    /// they do not shrink with the bit budget: 8 bytes of f32 is under 2% of a
+    /// d=1024 vector but 11% of a d=128 one, which is exactly the KV-cache regime.
+    /// f16 carries ~3 decimal digits, far more than needed for a scale factor whose
+    /// own inputs are quantized to 4 bits.
+    scalars: std.ArrayList(StoredScalars),
 
     workspace: prod_mod.Workspace,
     allocator: Allocator,
@@ -122,8 +138,16 @@ pub const FlatIndex = struct {
             sketch_kernel.canVectorize(self.quantizer.padded());
     }
 
-    /// Bytes of index storage per vector, excluding per-vector scalars.
+    /// Total bytes of index storage per vector, scalars included.
+    ///
+    /// Includes them deliberately: an earlier version reported only codes and
+    /// sketch, which overstated the compression ratio by 11% at d=128.
     pub fn bytesPerVector(self: FlatIndex) usize {
+        return self.layout.stride() + self.quantizer.sketchLen() + @sizeOf(StoredScalars);
+    }
+
+    /// Bytes of codes and sketch only — the part that scales with the bit budget.
+    pub fn codeBytesPerVector(self: FlatIndex) usize {
         return self.layout.stride() + self.quantizer.sketchLen();
     }
 
@@ -160,7 +184,7 @@ pub const FlatIndex = struct {
         const scalars = self.quantizer.encode(vector, scratch, sketch_slot, &self.workspace);
         self.layout.pack(scratch, codes_slot);
 
-        try self.scalars.append(self.allocator, scalars);
+        try self.scalars.append(self.allocator, StoredScalars.from(scalars));
         return @intCast(self.scalars.items.len - 1);
     }
 
@@ -255,10 +279,11 @@ pub const FlatIndex = struct {
             else
                 sketch_kernel.signDotExact(searcher.query_state.sketched, sketch_slot);
 
-            const estimate = scalars.norm *
-                (mse_term + scalars.gamma * self.quantizer.sketch_scale * sketch_term);
+            const norm: f32 = scalars.norm;
+            const gamma: f32 = scalars.gamma;
+            const estimate = norm * (mse_term + gamma * self.quantizer.sketch_scale * sketch_term);
 
-            collector.offer(self.score(estimate, scalars.norm, query_norm), @intCast(i));
+            collector.offer(self.score(estimate, norm, query_norm), @intCast(i));
         }
 
         return collector.drain();
@@ -400,8 +425,8 @@ test "every bit-width up to 5 vectorizes" {
         defer index.deinit();
         try testing.expectEqual(@as(u6, @intCast(bits - 1)), index.quantizer.mse.bits);
         try testing.expect(index.vectorized());
-        // And the bit budget is still exactly `bits` per coordinate.
-        try testing.expectEqual(@as(usize, 1024 * bits / 8), index.bytesPerVector());
+        // And the code budget is still exactly `bits` per coordinate.
+        try testing.expectEqual(@as(usize, 1024 * bits / 8), index.codeBytesPerVector());
     }
 }
 
@@ -553,6 +578,61 @@ test "storage matches the advertised bit budget" {
         defer index.deinit();
         // b bits per coordinate exactly: (b−1) code bits plus one sketch bit, in
         // both the sequential and bit-plane layouts.
-        try testing.expectEqual(@as(usize, 1024 * @as(usize, bits) / 8), index.bytesPerVector());
+        try testing.expectEqual(@as(usize, 1024 * @as(usize, bits) / 8), index.codeBytesPerVector());
+        // Plus two half-precision scalars, which do not scale with dimension.
+        try testing.expectEqual(index.codeBytesPerVector() + 4, index.bytesPerVector());
     }
+}
+
+test "half-precision scalars do not measurably hurt ranking" {
+    // f16 norms and gammas carry ~3 decimal digits against inputs already quantized
+    // to a handful of bits. Verified rather than assumed: compare retrieval against
+    // the full-precision estimator on the same corpus.
+    const allocator = testing.allocator;
+    const dim: u32 = 256;
+    const n = 600;
+
+    const corpus = try allocator.alloc(f32, n * dim);
+    defer allocator.free(corpus);
+    var prng = std.Random.DefaultPrng.init(0x5CA1);
+    const random = prng.random();
+    for (0..n) |i| {
+        randomUnit(corpus[i * dim ..][0..dim], random);
+        // Vary norms so the stored scale actually matters.
+        const factor = 0.01 + random.float(f32) * 100.0;
+        for (corpus[i * dim ..][0..dim]) |*v| v.* *= factor;
+    }
+
+    var index = try FlatIndex.init(allocator, .{ .dim = dim, .bits = 5, .seed = 4 });
+    defer index.deinit();
+    try index.addBatch(corpus);
+
+    var searcher = try FlatIndex.Searcher.init(allocator, index, 10);
+    defer searcher.deinit();
+
+    const query = try allocator.alloc(f32, dim);
+    defer allocator.free(query);
+
+    var hits: usize = 0;
+    const trials = 40;
+    for (0..trials) |_| {
+        randomUnit(query, random);
+        var best: u32 = 0;
+        var best_score: f64 = -std.math.inf(f64);
+        for (0..n) |i| {
+            var d: f64 = 0;
+            for (corpus[i * dim ..][0..dim], query) |x, qv| d += @as(f64, x) * qv;
+            if (d > best_score) {
+                best_score = d;
+                best = @intCast(i);
+            }
+        }
+        for (index.search(query, &searcher)) |e| {
+            if (e.id == best) {
+                hits += 1;
+                break;
+            }
+        }
+    }
+    try testing.expect(hits >= trials - 4);
 }

@@ -77,12 +77,13 @@ pub fn main() !void {
     for (ks) |k| std.debug.print("  1@{d:<4}", .{k});
     std.debug.print("\n", .{});
 
-    for ([_]u32{ 128, 256, 1024 }) |dim| {
-        for ([_]u6{ 2, 3, 4 }) |bits| {
+    for ([_]u32{ 1024 }) |dim| {
+        for ([_]u6{ 2, 3, 4, 5, 6 }) |bits| {
             for ([_]bool{ false, true }) |cl| {
                 const r = try recall(a, dim, bits, 10_000, 200, &ks, cl);
                 defer a.free(r);
                 std.debug.print("{d:>6} {d:>5} {s:>10}", .{ dim, bits, if (cl) "clustered" else "uniform" });
+                _ = &cl;
                 for (r) |v| std.debug.print("  {d:>5.3}", .{v});
                 std.debug.print("\n", .{});
             }

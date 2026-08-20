@@ -509,6 +509,47 @@ exactly what rerank assumes.
 Test thresholds are set from measurement with ~3 standard errors of margin, and the measured value
 is written next to each so a future tightening does not have to re-derive it.
 
+### <a name="sketch"></a>`HEAD` — QJL sign-dot kernel, and a bit-width mismatch
+
+The scan kernel computed only `⟨p, ỹ⟩`. The full `prod` estimator is
+`‖x‖·[⟨p,ỹ⟩ + γ·scale·⟨S'p, qjl⟩]`, so the fast path was returning exactly the MSE-only estimate
+that `prod` exists to correct — the one measured biased by 2/π. Wiring an index to it would have
+silently reintroduced that bias while every test still passed. `simd/sketch.zig` closes it: bit
+expansion by broadcast + selector + compare (3 ops, and `@shuffle` with a comptime mask is portable
+where a runtime-indexed lookup is not), then `@select` and i16 accumulation.
+
+**Discovered while doing it: `prod` at total width `b` uses `b−1` MSE bits, so the headline 4-bit
+configuration produces 3-bit codes — and the scan kernel only handles 4-bit nibbles.**
+
+| prod b | mse bits | bits/coord | canVectorize |
+|---|---|---|---|
+| 2 | 1 | 2.00 | ✗ |
+| 3 | 2 | 3.00 | ✗ |
+| 4 | 3 | 4.00 | ✗ |
+| 5 | 4 | 5.00 | ✓ |
+
+Only `b=5` vectorized. The obvious fix — pad 3-bit codes into nibbles — is **strictly dominated**,
+and measurement says so plainly (clustered, d=1024):
+
+| prod b | bytes/vec | 1@10 |
+|---|---|---|
+| 3 | 384 | 0.690 |
+| 4 | 512 | 0.960 |
+| 5 | 640 | 0.995 |
+
+Padding `b=4` costs 640 B for the same 0.960, where `b=5` already gives 0.995 at that size. So
+padding is off the table. But `b=4` is genuinely on the Pareto frontier (8× compression, 0.96), so
+it earns a real 3-bit kernel — deferred to its own commit rather than bolted on here.
+
+Next kernel work should extend `scan` to the byte-divisor widths {1, 2, 4}, which are a uniform
+shift-and-mask and cover prod b ∈ {2, 3, 5}, leaving only b=4 on the scalar path.
+
+**Test-tolerance note, twice now.** Two sketch tests failed at a 0.05 absolute tolerance. Not bugs:
+int8 error over a `dim`-term signed sum grows as √(dim/12)·step, which is ~0.13 at d=256, so 0.05 was
+never achievable. Replaced with a derived `quantizationTolerance(dim, scale)`. Same mistake as the
+Lloyd-Max table tolerance in [8ff805c](#8ff805c) — when a tolerance is a guess rather than a bound,
+it tests the guess.
+
 ---
 
 ## Open items for P1

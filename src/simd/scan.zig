@@ -41,7 +41,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
-const Layout = @import("../quant/packing.zig").Layout;
+const packing = @import("../quant/packing.zig");
+const Layout = packing.Layout;
+const bitmask = @import("bitmask.zig");
 
 /// The 16 centroids, quantized to int8. Query-independent, built once per index.
 pub const Table = struct {
@@ -83,8 +85,15 @@ pub const Query = struct {
     scale: f32,
     allocator: Allocator,
 
-    pub fn init(allocator: Allocator, dim: u32, bits: u6) Allocator.Error!Query {
-        const groups = 8 / @as(usize, bits);
+    /// `groups` follows the layout: a sequential layout interleaves the query by
+    /// `8/bits`, while a bit-plane layout stores 16 consecutive dimensions per group
+    /// and needs no interleaving at all.
+    pub fn init(allocator: Allocator, layout: Layout) Allocator.Error!Query {
+        const dim = layout.dim;
+        const groups: usize = switch (layout.kind()) {
+            .sequential => 8 / @as(usize, layout.bits),
+            .bit_plane => 1,
+        };
         std.debug.assert(dim % groups == 0);
         return .{
             .data = try allocator.alloc(i8, dim),
@@ -179,18 +188,58 @@ fn scoreBits(comptime bits: u6, table: Table, query: Query, codes: []const u8, d
     return total * table.scale * query.scale;
 }
 
+/// Assemble 16 code indices from `bits` bit-planes.
+///
+/// Each plane contributes its weight where its bit is set. Roughly 3 ops per plane
+/// against 2 for a whole sequential extraction, which is why bit-plane is used only
+/// where shift-and-mask cannot reach — a 3-bit code straddles a byte.
+inline fn planeIndex(comptime bits: u6, planes: []const u8) @Vector(16, u8) {
+    var idx: @Vector(16, u8) = @splat(0);
+    inline for (0..bits) |p| {
+        idx |= bitmask.expandWeighted(planes[p * 2 ..][0..2].*, 1 << p);
+    }
+    return idx;
+}
+
+/// Vectorized score over a bit-plane layout.
+fn scorePlanes(comptime bits: u6, table: Table, query: Query, codes: []const u8, dim: u32) f32 {
+    const group_bytes = comptime @as(usize, bits) * (packing.plane_group / 8);
+    const groups = dim / packing.plane_group;
+    var acc: @Vector(16, i32) = @splat(0);
+
+    // Two groups per i16 batch, for the same reason as the sequential kernel: two
+    // products reach 32258, just inside i16.
+    var g: usize = 0;
+    while (g + 2 <= groups) : (g += 2) {
+        var chunk: @Vector(16, i16) = @splat(0);
+        inline for (0..2) |half| {
+            const gi = g + half;
+            const idx = planeIndex(bits, codes[gi * group_bytes ..][0..group_bytes]);
+            const w: @Vector(16, i8) = query.data[gi * 16 ..][0..16].*;
+            chunk +%= @as(@Vector(16, i16), lookup(table.values, idx)) *%
+                @as(@Vector(16, i16), w);
+        }
+        acc += @as(@Vector(16, i32), chunk);
+    }
+
+    const total: f32 = @floatFromInt(@reduce(.Add, acc));
+    return total * table.scale * query.scale;
+}
+
 /// Vectorized score. `bits` must satisfy `canVectorize`.
-pub fn scoreInt8(bits: u6, table: Table, query: Query, codes: []const u8, dim: u32) f32 {
-    std.debug.assert(codes.len * 8 >= @as(usize, dim) * bits);
-    return switch (bits) {
-        1 => scoreBits(1, table, query, codes, dim),
-        2 => scoreBits(2, table, query, codes, dim),
-        4 => scoreBits(4, table, query, codes, dim),
-        // 3-bit codes do not divide a byte, so a 16-byte load carries a ragged
-        // number of them. Deliberately unsupported rather than approximated by
-        // padding into nibbles, which measurement showed is dominated by simply
-        // using one more bit of MSE (see docs/notes.md).
-        else => unreachable,
+pub fn scoreInt8(layout: Layout, table: Table, query: Query, codes: []const u8, dim: u32) f32 {
+    std.debug.assert(codes.len * 8 >= @as(usize, dim) * layout.bits);
+    return switch (layout.kind()) {
+        .sequential => switch (layout.bits) {
+            1 => scoreBits(1, table, query, codes, dim),
+            2 => scoreBits(2, table, query, codes, dim),
+            4 => scoreBits(4, table, query, codes, dim),
+            else => unreachable,
+        },
+        .bit_plane => switch (layout.bits) {
+            3 => scorePlanes(3, table, query, codes, dim),
+            else => unreachable,
+        },
     };
 }
 
@@ -208,14 +257,25 @@ pub fn scoreExact(
     return @floatCast(acc);
 }
 
+/// Largest codebook a single byte-shuffle can hold.
+///
+/// `tbl`/`pshufb` index a 16-byte register, so 16 levels — four bits — is a hard
+/// ceiling on the vectorized path, independent of how codes are laid out. Wider
+/// codebooks need multiple shuffles and a blend, which has not been shown to be
+/// worth it: `prod` at b=5 (four code bits) already reaches 0.995 recall.
+pub const max_table_bits: u6 = 4;
+
 /// Whether the vectorized path applies.
 ///
-/// Bit-widths that divide a byte (1, 2, 4) keep every code inside one byte, so
-/// extraction is a uniform shift-and-mask. 3, 5, 6, 7 do not and fall back to
-/// `scoreExact`.
+/// Two independent conditions: the codebook must fit one shuffle table, and the
+/// dimension must divide into whole units of work. Sequential needs whole 16-byte
+/// chunks; bit-plane needs an even number of 16-code groups.
 pub fn canVectorize(layout: Layout) bool {
-    const divides_byte = layout.bits == 1 or layout.bits == 2 or layout.bits == 4;
-    return divides_byte and (@as(usize, layout.dim) * layout.bits) % 128 == 0;
+    if (layout.bits > max_table_bits) return false;
+    return switch (layout.kind()) {
+        .sequential => (@as(usize, layout.dim) * layout.bits) % 128 == 0,
+        .bit_plane => layout.dim % (2 * packing.plane_group) == 0,
+    };
 }
 
 // -- tests -------------------------------------------------------------------
@@ -266,12 +326,12 @@ test "int8 kernel tracks the exact reference" {
         var cb = try setup(dim, 4, 0x5EED + dim, codes, rotated);
         defer cb.deinit();
 
-        var query = try Query.init(testing.allocator, dim, 4);
+        var query = try Query.init(testing.allocator, Layout.init(dim, 4));
         defer query.deinit();
         query.load(rotated);
 
         const table = Table.init(cb.centroids);
-        const fast = scoreInt8(4, table, query, codes, dim);
+        const fast = scoreInt8(Layout.init(dim, 4), table, query, codes, dim);
         const exact = scoreExact(layout, cb.centroids, rotated, codes);
 
         // Scores are ~N(0, ·) with magnitude around ‖p‖·‖c‖/√d; compare against the
@@ -293,7 +353,7 @@ test "int8 kernel error stays small in aggregate" {
     defer cb.deinit();
     const table = Table.init(cb.centroids);
 
-    var query = try Query.init(testing.allocator, dim, 4);
+    var query = try Query.init(testing.allocator, Layout.init(dim, 4));
     defer query.deinit();
 
     const raw = try testing.allocator.alloc(f32, dim);
@@ -319,7 +379,7 @@ test "int8 kernel error stays small in aggregate" {
         for (rotated) |*v| v.* = random.floatNorm(f32) * sigma;
         query.load(rotated);
 
-        const fast = scoreInt8(4, table, query, codes, dim);
+        const fast = scoreInt8(Layout.init(dim, 4), table, query, codes, dim);
         const exact = scoreExact(layout, cb.centroids, rotated, codes);
         const err = @as(f64, fast) - exact;
         squared_error += err * err;
@@ -351,7 +411,7 @@ test "table quantization preserves ordering and sign" {
 
 test "query round trips through quantization and the parity split" {
     const dim: u32 = 64;
-    var query = try Query.init(testing.allocator, dim, 4);
+    var query = try Query.init(testing.allocator, Layout.init(dim, 4));
     defer query.deinit();
 
     var rotated: [dim]f32 = undefined;
@@ -390,7 +450,7 @@ test "zero query and zero codes score zero" {
     defer cb.deinit();
     const table = Table.init(cb.centroids);
 
-    var query = try Query.init(testing.allocator, dim, 4);
+    var query = try Query.init(testing.allocator, Layout.init(dim, 4));
     defer query.deinit();
     const zeros = [_]f32{0} ** dim;
     query.load(&zeros);
@@ -400,7 +460,7 @@ test "zero query and zero codes score zero" {
     defer testing.allocator.free(codes);
     @memset(codes, 0);
 
-    try testing.expectEqual(@as(f32, 0), scoreInt8(4, table, query, codes, dim));
+    try testing.expectEqual(@as(f32, 0), scoreInt8(Layout.init(dim, 4), table, query, codes, dim));
 }
 
 test "canVectorize gates on bit-width and dimension" {
@@ -409,12 +469,17 @@ test "canVectorize gates on bit-width and dimension" {
     try testing.expect(canVectorize(Layout.init(1024, 2)));
     try testing.expect(canVectorize(Layout.init(1024, 1)));
     try testing.expect(canVectorize(Layout.init(32, 4)));
-    // ...and those that do not are rejected rather than approximated.
-    try testing.expect(!canVectorize(Layout.init(1024, 3)));
+    // ...and so are those that do not, via the bit-plane layout.
+    try testing.expect(canVectorize(Layout.init(1024, 3)));
+    // Beyond four bits the codebook no longer fits one 16-byte shuffle table, so
+    // the fast path stops regardless of layout.
     try testing.expect(!canVectorize(Layout.init(1024, 5)));
-    // A chunk is 16 bytes, so dim*bits must fill whole chunks.
+    try testing.expect(!canVectorize(Layout.init(1024, 8)));
+    // Dimension constraints differ by layout: sequential needs whole 16-byte
+    // chunks, bit-plane needs an even number of 16-code groups.
     try testing.expect(!canVectorize(Layout.init(48, 4)));
     try testing.expect(!canVectorize(Layout.init(32, 2)));
+    try testing.expect(!canVectorize(Layout.init(16, 3)));
 }
 
 test "every vectorizable bit-width tracks the exact reference" {
@@ -422,7 +487,9 @@ test "every vectorizable bit-width tracks the exact reference" {
     // stream mapping at b=1 or b=2 would produce plausible but consistently wrong
     // scores, exactly the failure mode the parity split had at b=4.
     const allocator = testing.allocator;
-    for ([_]u6{ 1, 2, 4 }) |bits| {
+    // Covers both layouts: sequential at 1/2/4, bit-plane at 3. Four bits is the
+    // ceiling — a 16-entry shuffle table cannot address more levels.
+    for ([_]u6{ 1, 2, 3, 4 }) |bits| {
         const dim: u32 = 1024;
         const layout = Layout.init(dim, bits);
         try testing.expect(canVectorize(layout));
@@ -431,7 +498,7 @@ test "every vectorizable bit-width tracks the exact reference" {
         defer cb.deinit();
         const table = Table.init(cb.centroids);
 
-        var query = try Query.init(allocator, dim, bits);
+        var query = try Query.init(allocator, layout);
         defer query.deinit();
 
         const raw = try allocator.alloc(f32, dim);
@@ -456,7 +523,7 @@ test "every vectorizable bit-width tracks the exact reference" {
             for (rotated) |*v| v.* = random.floatNorm(f32) * sigma;
             query.load(rotated);
 
-            const fast = scoreInt8(bits, table, query, stored, dim);
+            const fast = scoreInt8(layout, table, query, stored, dim);
             const exact = scoreExact(layout, cb.centroids, rotated, stored);
             const err = @as(f64, fast) - exact;
             squared_error += err * err;

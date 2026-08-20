@@ -586,6 +586,45 @@ Also worth noting: index QPS of ~190 at n=100k is 19M vec/s, against the raw sca
 index adds the sketch term, which roughly doubles per-vector work. Consistent, and a useful check
 that nothing unexpected is being paid.
 
+### <a name="bitplane"></a>`HEAD` — 3-bit kernel via bit-planes
+
+Closes the 25× gap at `bits=4`.
+
+**Layout.** 3-bit codes straddle bytes, so shift-and-mask cannot reach them. Instead they are
+stored as *bit-planes*: for each group of 16 codes, three 2-byte planes holding bit 0, bit 1, and
+bit 2. Unpacking is then three bit expansions (the same primitive the QJL sketch already needed,
+now factored into `simd/bitmask.zig`) recombined by weight. Costs `bits` per coordinate exactly —
+grouping by 16 rather than rounding to bytes means no waste at any dimension that is a multiple of
+16, which every padded dimension is.
+
+**Result** (d=1024, n=100k, k=10):
+
+| bits | B/vec | before | after | 1@10 |
+|---|---|---|---|---|
+| 3 | 384 | 192.9 | 193.1 | 0.980 |
+| **4** | **512** | **7.8** | **110.1** | **1.000** |
+| 5 | 640 | 197.1 | 198.1 | 1.000 |
+
+**14×**, and better than the ~3×-slower-per-code estimate predicted. b=4 is now 1.8× behind b=5
+rather than 25×, which makes 8× compression at 0.96 clustered recall a usable operating point
+rather than a theoretical one. Encode cost rose (24.6 µs/vector against ~16) because the bit-plane
+writer is a scalar bit loop; encoding is not the hot path, and it is vectorizable if it ever
+matters.
+
+**A real bug the sweep caught.** The first dispatch routed 5-, 6-, and 7-bit codes into
+`scorePlanes` too. But `tbl`/`pshufb` index a **16-byte** register, so the shuffle table holds 16
+levels — **four bits is a hard ceiling on the vectorized path**, independent of layout. Codes above
+15 indexed past the end of the table. This is a property of the instruction, not of the packing,
+and it now has a name (`max_table_bits`) and a test rather than being implicit in "b ≤ 4 works".
+
+Practical effect: prod b ∈ {2,3,4,5} vectorize; b ≥ 6 uses the exact scan. No loss worth chasing,
+since b=5 already reaches 0.995 recall.
+
+**On reversing the earlier deferral.** The measurement that changed the call was QPS, not recall or
+storage — the earlier analysis compared *bytes* and correctly concluded padding was dominated, but
+never asked what the fallback cost. A dominance argument over one axis says nothing about the axis
+you did not measure.
+
 ---
 
 ## Open items for P1

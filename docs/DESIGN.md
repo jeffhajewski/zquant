@@ -290,10 +290,17 @@ streams once per query (not per vector) to line up with the nibble split.
 - **exact f32** — four `tbl` lookups over the byte-planes of the 16 f32 centroids reconstruct
   exact f32 values from codes, at more ops but no approximation.
 
-**Table lookup has no portable spelling.** Zig's `@shuffle` needs a comptime mask and `std.simd`
-has no runtime byte-table lookup, so `tbl`/`vpshufb` require per-architecture inline assembly
-behind `simd/dispatch.zig`, with a scalar fallback. The same obstacle already forced the encoder
-away from a threshold binary search (§4.1).
+**Table lookup needs no per-architecture assembly** — LLVM pattern-matches the portable elementwise
+form into `tbl`/`pshufb`/`vpshufb`, provided an optimization barrier stops it folding the result
+into the consumer's `sext`. There is no `simd/dispatch.zig`.
+
+**Four bits is a hard ceiling on the vectorized path.** The shuffle instructions index a 16-byte
+register, so the codebook must fit 16 levels. Wider codebooks fall back to the exact f32 scan.
+
+**Bit-widths that straddle bytes use a bit-plane layout.** 3-bit codes cannot be shift-and-masked,
+so they are stored as one plane per code bit in groups of 16 and reassembled by weight. Costs the
+same `bits` per coordinate; roughly 1.8× slower than nibbles, against 25× for the scalar fallback
+it replaced.
 
 ### 4.3 The QJL term
 

@@ -122,7 +122,7 @@ test "int8 kernel agrees with the exact path on real quantizer output" {
     try testing.expect(zq.simd_scan.canVectorize(layout));
 
     const table = zq.simd_scan.Table.init(q.codebook.centroids);
-    var query = try zq.simd_scan.Query.init(allocator, q.padded, 4);
+    var query = try zq.simd_scan.Query.init(allocator, layout);
     defer query.deinit();
 
     const x = try allocator.alloc(f32, dim);
@@ -147,7 +147,7 @@ test "int8 kernel agrees with the exact path on real quantizer output" {
         for (rotated_query) |*v| v.* = random.floatNorm(f32) / @sqrt(@as(f32, @floatFromInt(dim)));
         query.load(rotated_query);
 
-        const fast = zq.simd_scan.scoreInt8(4, table, query, stored, q.padded);
+        const fast = zq.simd_scan.scoreInt8(layout, table, query, stored, q.padded);
         const exact = zq.simd_scan.scoreExact(layout, q.codebook.centroids, rotated_query, stored);
         const err = @as(f64, fast) - exact;
         squared_error += err * err;

@@ -43,6 +43,30 @@
 
 const std = @import("std");
 
+/// How codes are arranged within a vector's block.
+pub const Kind = enum {
+    /// Codes laid end to end, little-endian. Extraction is one shift and one mask,
+    /// because a code never straddles a byte.
+    sequential,
+    /// Codes split across `bits` bit-planes, in groups of `plane_group`. Used where
+    /// a code *does* straddle a byte, so shift-and-mask cannot reach it: the planes
+    /// are expanded with `simd/bitmask.zig` and recombined by weight.
+    bit_plane,
+};
+
+/// Codes per bit-plane group. 16 to match the SIMD lane count, so one group is
+/// exactly one vector register's worth of codes.
+pub const plane_group: usize = 16;
+
+/// Sequential where a code fits inside a byte, bit-plane otherwise.
+///
+/// The split is by whether `bits` divides 8, not by which is faster in general:
+/// sequential is markedly cheaper (≈2 ops per 16 codes against ≈17) and is used
+/// wherever it is available at all.
+pub fn kindFor(bits: u6) Kind {
+    return if (8 % @as(usize, bits) == 0) .sequential else .bit_plane;
+}
+
 /// Vectors' code blocks are padded to this multiple so every vector starts aligned
 /// and the kernel's 16-byte chunk loop never straddles a vector boundary.
 pub const alignment: usize = 16;
@@ -58,9 +82,24 @@ pub const Layout = struct {
         return .{ .dim = dim, .bits = bits };
     }
 
+    pub fn kind(self: Layout) Kind {
+        return kindFor(self.bits);
+    }
+
+    fn groups(self: Layout) usize {
+        return (@as(usize, self.dim) + plane_group - 1) / plane_group;
+    }
+
     /// Bytes of code actually used by one vector, before alignment padding.
+    ///
+    /// Both layouts cost `bits` per coordinate; bit-plane rounds up to whole groups
+    /// of 16 rather than whole bytes, so it wastes nothing at any dimension that is
+    /// a multiple of 16.
     pub fn codeBytes(self: Layout) usize {
-        return (@as(usize, self.dim) * self.bits + 7) / 8;
+        return switch (self.kind()) {
+            .sequential => (@as(usize, self.dim) * self.bits + 7) / 8,
+            .bit_plane => self.groups() * self.bits * (plane_group / 8),
+        };
     }
 
     /// Stride between consecutive vectors, including alignment padding.
@@ -76,22 +115,54 @@ pub const Layout = struct {
         std.debug.assert(codes.len == self.dim);
         std.debug.assert(dst.len >= self.codeBytes());
         @memset(dst[0..self.stride()], 0);
-        for (codes, 0..) |code, j| {
-            std.debug.assert(code < (@as(u16, 1) << @as(u4, @intCast(self.bits))));
-            writeBits(dst, j * self.bits, self.bits, code);
+
+        const limit = @as(u16, 1) << @as(u4, @intCast(self.bits));
+        switch (self.kind()) {
+            .sequential => for (codes, 0..) |code, j| {
+                std.debug.assert(code < limit);
+                writeBits(dst, j * self.bits, self.bits, code);
+            },
+            .bit_plane => for (codes, 0..) |code, j| {
+                std.debug.assert(code < limit);
+                const group = j / plane_group;
+                const slot = j % plane_group;
+                const base = group * self.bits * (plane_group / 8);
+                for (0..self.bits) |plane| {
+                    if ((code >> @intCast(plane)) & 1 == 1) {
+                        dst[base + plane * 2 + (slot >> 3)] |= @as(u8, 1) << @intCast(slot & 7);
+                    }
+                }
+            },
         }
     }
 
     pub fn unpack(self: Layout, src: []const u8, codes: []u8) void {
         std.debug.assert(codes.len == self.dim);
         std.debug.assert(src.len >= self.codeBytes());
-        for (codes, 0..) |*code, j| {
-            code.* = readBits(src, j * self.bits, self.bits);
-        }
+        for (codes, 0..) |*code, j| code.* = self.codeAt(src, j);
     }
 
     pub fn codeAt(self: Layout, src: []const u8, dim_index: usize) u8 {
-        return readBits(src, dim_index * self.bits, self.bits);
+        return switch (self.kind()) {
+            .sequential => readBits(src, dim_index * self.bits, self.bits),
+            .bit_plane => blk: {
+                const group = dim_index / plane_group;
+                const slot = dim_index % plane_group;
+                const base = group * self.bits * (plane_group / 8);
+                var code: u8 = 0;
+                for (0..self.bits) |plane| {
+                    const bit = (src[base + plane * 2 + (slot >> 3)] >> @intCast(slot & 7)) & 1;
+                    code |= bit << @intCast(plane);
+                }
+                break :blk code;
+            },
+        };
+    }
+
+    /// Byte offset of a bit-plane group's planes within a vector's block.
+    pub fn planeBase(self: Layout, group: usize) usize {
+        std.debug.assert(self.kind() == .bit_plane);
+        return group * self.bits * (plane_group / 8);
     }
 
     /// One vector's code block within packed storage.
@@ -148,6 +219,21 @@ fn readBits(src: []const u8, offset: usize, bits: u6) u8 {
 
 const testing = std.testing;
 
+test "kind is chosen by whether a code fits in a byte" {
+    for ([_]u6{ 1, 2, 4, 8 }) |bits| try testing.expectEqual(Kind.sequential, kindFor(bits));
+    for ([_]u6{ 3, 5, 6, 7 }) |bits| try testing.expectEqual(Kind.bit_plane, kindFor(bits));
+}
+
+test "bit-plane layout costs exactly bits per coordinate" {
+    // The point of grouping by 16 rather than rounding to bytes: no waste at any
+    // dimension that is a multiple of 16, which every padded dimension is.
+    for ([_]u6{ 3, 5, 6, 7 }) |bits| {
+        const layout = Layout.init(1024, bits);
+        try testing.expectEqual(Kind.bit_plane, layout.kind());
+        try testing.expectEqual(@as(usize, 1024 * @as(usize, bits) / 8), layout.codeBytes());
+    }
+}
+
 test "sizing and alignment" {
     for ([_]struct { dim: u32, bits: u6, code: usize, stride: usize }{
         .{ .dim = 1024, .bits = 4, .code = 512, .stride = 512 },
@@ -171,6 +257,47 @@ test "b=4 packs dimension 2i in the low nibble, 2i+1 in the high" {
     layout.pack(&[_]u8{ 0x3, 0xA, 0x5, 0xC }, &buf);
     try testing.expectEqual(@as(u8, 0xA3), buf[0]);
     try testing.expectEqual(@as(u8, 0xC5), buf[1]);
+}
+
+test "bit-plane round trip and plane structure" {
+    var prng = std.Random.DefaultPrng.init(0xB17);
+    const random = prng.random();
+
+    for ([_]u6{ 3, 5, 6, 7 }) |bits| {
+        for ([_]u32{ 16, 64, 768, 1024 }) |dim| {
+            const layout = Layout.init(dim, bits);
+            const max: u8 = @intCast((@as(u16, 1) << @as(u4, @intCast(bits))) - 1);
+
+            const codes = try testing.allocator.alloc(u8, dim);
+            defer testing.allocator.free(codes);
+            const back = try testing.allocator.alloc(u8, dim);
+            defer testing.allocator.free(back);
+            const stored = try testing.allocator.alloc(u8, layout.stride());
+            defer testing.allocator.free(stored);
+
+            for (codes) |*c| c.* = random.uintAtMost(u8, max);
+            layout.pack(codes, stored);
+            layout.unpack(stored, back);
+            try testing.expectEqualSlices(u8, codes, back);
+        }
+    }
+}
+
+test "bit-plane places each code bit in its own plane" {
+    // Pins the layout the SIMD unpacker reads: plane p, byte slot>>3, bit slot&7.
+    const layout = Layout.init(16, 3);
+    var stored = [_]u8{0} ** 16;
+
+    var codes = [_]u8{0} ** 16;
+    codes[0] = 0b101; // planes 0 and 2 set for slot 0
+    codes[9] = 0b010; // plane 1 set for slot 9 (byte 1, bit 1)
+    layout.pack(&codes, &stored);
+
+    try testing.expectEqual(@as(u8, 0b0000_0001), stored[0]); // plane 0, byte 0
+    try testing.expectEqual(@as(u8, 0), stored[1]);
+    try testing.expectEqual(@as(u8, 0), stored[2]); // plane 1, byte 0
+    try testing.expectEqual(@as(u8, 0b0000_0010), stored[3]); // plane 1, byte 1 -> slot 9
+    try testing.expectEqual(@as(u8, 0b0000_0001), stored[4]); // plane 2, byte 0
 }
 
 test "round trip at every supported bit-width" {

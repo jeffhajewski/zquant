@@ -23,9 +23,10 @@
 //! dimension this library will see.
 
 const std = @import("std");
+const bitmask = @import("bitmask.zig");
 
 /// Coordinates handled per iteration.
-pub const lanes: usize = 16;
+pub const lanes: usize = bitmask.lanes;
 
 /// Iterations between i16 → i32 widenings. 128 × 127 = 16256, half of i16's range.
 const widen_interval: usize = 128;
@@ -65,22 +66,6 @@ pub const Query = struct {
     }
 };
 
-const selector: @Vector(lanes, u8) = .{
-    1, 2, 4, 8, 16, 32, 64, 128,
-    1, 2, 4, 8, 16, 32, 64, 128,
-};
-
-/// Expand 16 bitmap bits into a lane mask. Bit `i&7` of byte `i>>3` selects
-/// coordinate `i`, matching `quant/prod.zig`'s `packSigns`.
-inline fn expand(pair: [2]u8) @Vector(lanes, bool) {
-    const two: @Vector(2, u8) = pair;
-    const spread = @shuffle(u8, two, undefined, @Vector(lanes, i32){
-        0, 0, 0, 0, 0, 0, 0, 0,
-        1, 1, 1, 1, 1, 1, 1, 1,
-    });
-    return (spread & selector) == selector;
-}
-
 /// `⟨S'p, qjl⟩`, with `qjl` read as ±1 from `bitmap`.
 pub fn signDot(query: Query, bitmap: []const u8, dim: u32) f32 {
     std.debug.assert(dim % lanes == 0);
@@ -92,7 +77,7 @@ pub fn signDot(query: Query, bitmap: []const u8, dim: u32) f32 {
 
     const iterations = dim / lanes;
     for (0..iterations) |i| {
-        const set = expand(bitmap[i * 2 ..][0..2].*);
+        const set = bitmask.expand16(bitmap[i * 2 ..][0..2].*);
         const w: @Vector(lanes, i8) = query.values[i * lanes ..][0..lanes].*;
         const signed = @select(i8, set, w, -w);
         acc +%= @as(@Vector(lanes, i16), signed);
@@ -137,13 +122,12 @@ fn fill(values: []f32, bitmap: []u8, random: std.Random) void {
     for (bitmap) |*b| b.* = random.int(u8);
 }
 
-test "bit expansion matches the packing in prod" {
-    // The two must agree exactly or every sign is wrong. `packSigns` writes
-    // coordinate i to bit (i&7) of byte (i>>3).
+test "expansion ordering matches packSigns in prod" {
+    // The bitmask module and `packSigns` must agree exactly or every sign is wrong.
     var prng = std.Random.DefaultPrng.init(1);
     for (0..200) |_| {
         const pair = [2]u8{ prng.random().int(u8), prng.random().int(u8) };
-        const got = expand(pair);
+        const got = bitmask.expand16(pair);
         for (0..lanes) |i| {
             const want = ((pair[i >> 3] >> @intCast(i & 7)) & 1) == 1;
             try testing.expectEqual(want, got[i]);

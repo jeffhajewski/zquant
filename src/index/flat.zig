@@ -15,11 +15,11 @@
 //!
 //! ## Bit-widths
 //!
-//! `prod` at total width `b` spends `b−1` bits on codes, and the vectorized scan
-//! handles widths that divide a byte. So b ∈ {2, 3, 5} vectorize and b=4 — an
-//! otherwise attractive operating point at 8× compression — runs the exact f32 scan
-//! instead. `vectorized()` reports which, and `bench/index_bench.zig` measures what
-//! it costs, so the gap is visible rather than implied.
+//! `prod` at total width `b` spends `b−1` bits on codes, and every width from 2 to 5
+//! vectorizes: those dividing a byte use sequential packing, 3-bit codes use
+//! bit-planes (`quant/packing.zig`). Beyond that the codebook outgrows the 16-entry
+//! shuffle table and the exact f32 scan takes over — no loss in practice, since b=5
+//! already reaches 0.995 recall.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -186,11 +186,7 @@ pub const FlatIndex = struct {
         pub fn init(allocator: Allocator, index: FlatIndex, k: usize) !Searcher {
             var query_state = try prod_mod.QueryState.init(allocator, index.quantizer);
             errdefer query_state.deinit();
-            var scan_query = try scan.Query.init(
-                allocator,
-                index.quantizer.padded(),
-                @max(index.quantizer.mse.bits, 1),
-            );
+            var scan_query = try scan.Query.init(allocator, index.layout);
             errdefer scan_query.deinit();
             var sketch_query = try sketch_kernel.Query.init(allocator, index.quantizer.padded());
             errdefer sketch_query.deinit();
@@ -243,7 +239,6 @@ pub const FlatIndex = struct {
         const stride = self.layout.stride();
         const sketch_len = self.quantizer.sketchLen();
         const padded = self.quantizer.padded();
-        const bits = self.quantizer.mse.bits;
         const centroids = self.quantizer.mse.codebook.centroids;
 
         for (self.scalars.items, 0..) |scalars, i| {
@@ -251,7 +246,7 @@ pub const FlatIndex = struct {
             const sketch_slot = self.sketches.items[i * sketch_len ..][0..sketch_len];
 
             const mse_term = if (use_simd)
-                scan.scoreInt8(bits, searcher.table, searcher.scan_query, code_slot, padded)
+                scan.scoreInt8(self.layout, searcher.table, searcher.scan_query, code_slot, padded)
             else
                 scan.scoreExact(self.layout, centroids, searcher.query_state.rotated, code_slot);
 
@@ -395,16 +390,19 @@ test "vectorized and exact scans agree on ranking" {
     try testing.expect(agreement > 0.95);
 }
 
-test "bits=4 falls back to the exact scan" {
-    // Pins the known gap: 3-bit codes do not divide a byte. If a 3-bit kernel lands,
-    // this test is the thing that should change.
+test "every bit-width up to 5 vectorizes" {
+    // bits=4 produces 3-bit codes, which straddle bytes; it reaches the fast path
+    // through the bit-plane layout rather than by wasting a bit on nibble padding.
+    // bits=5 is the last that fits: its 4-bit codes fill the 16-entry shuffle table.
     const allocator = testing.allocator;
-    var index = try FlatIndex.init(allocator, .{ .dim = 1024, .bits = 4 });
-    defer index.deinit();
-    try testing.expectEqual(@as(u6, 3), index.quantizer.mse.bits);
-    try testing.expect(!index.vectorized());
-    // But it still answers queries correctly — see the metric tests below.
-    try testing.expectEqual(@as(usize, 512), index.bytesPerVector());
+    for (2..6) |bits| {
+        var index = try FlatIndex.init(allocator, .{ .dim = 1024, .bits = @intCast(bits) });
+        defer index.deinit();
+        try testing.expectEqual(@as(u6, @intCast(bits - 1)), index.quantizer.mse.bits);
+        try testing.expect(index.vectorized());
+        // And the bit budget is still exactly `bits` per coordinate.
+        try testing.expectEqual(@as(usize, 1024 * bits / 8), index.bytesPerVector());
+    }
 }
 
 test "every metric ranks correctly" {
@@ -550,10 +548,11 @@ test "searcher is reusable and allocation-free per query" {
 
 test "storage matches the advertised bit budget" {
     const allocator = testing.allocator;
-    for ([_]u6{ 2, 3, 4, 5 }) |bits| {
+    for ([_]u6{ 2, 3, 4, 5, 6, 7 }) |bits| {
         var index = try FlatIndex.init(allocator, .{ .dim = 1024, .bits = bits });
         defer index.deinit();
-        // b bits per coordinate exactly: (b−1) code bits plus one sketch bit.
+        // b bits per coordinate exactly: (b−1) code bits plus one sketch bit, in
+        // both the sequential and bit-plane layouts.
         try testing.expectEqual(@as(usize, 1024 * @as(usize, bits) / 8), index.bytesPerVector());
     }
 }

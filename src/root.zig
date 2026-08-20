@@ -19,6 +19,9 @@ pub const simd_encode = @import("simd/encode.zig");
 pub const simd_scan = @import("simd/scan.zig");
 pub const simd_sketch = @import("simd/sketch.zig");
 
+pub const topk = @import("index/topk.zig");
+pub const flat = @import("index/flat.zig");
+
 test {
     @import("std").testing.refAllDecls(@This());
 }

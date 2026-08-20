@@ -550,6 +550,42 @@ never achievable. Replaced with a derived `quantizationTolerance(dim, scale)`. S
 Lloyd-Max table tolerance in [8ff805c](#8ff805c) — when a tolerance is a guess rather than a bound,
 it tests the guess.
 
+### <a name="flat"></a>`HEAD` — FlatIndex, top-k, and the cost of the 3-bit gap
+
+`index/topk.zig` and `index/flat.zig` compose the quantizer, packing, and both kernels into
+something callable. 143 tests, all passing first run.
+
+**The design's SIMD top-k gate is gone.** §4.4 specified comparing 32 block scores against a
+broadcast threshold and `movemask`-ing survivors — a shape that only existed because
+dimension-major blocks produced 32 scores at once. Row-major produces one at a time, so the gate is
+a scalar compare. No loss: the win was never the compare, it was avoiding the heap, and a bounded
+min-heap with a single-compare reject does that either way.
+
+**Measured the b=4 fallback, and it overturns the earlier decision to defer a 3-bit kernel**
+(d=1024, n=100k, k=10):
+
+| bits | B/vec | vectorized | QPS | µs/query | 1@10 (uniform) |
+|---|---|---|---|---|---|
+| 2 | 256 | yes | 189.8 | 5,267 | 0.700 |
+| 3 | 384 | yes | 192.9 | 5,185 | 0.980 |
+| **4** | **512** | **no** | **7.8** | **127,776** | **1.000** |
+| 5 | 640 | yes | 197.1 | 5,075 | 1.000 |
+
+**25× slower**, not a mild degradation — the scalar path makes b=4 unusable. Earlier I judged the
+3-bit kernel deferrable because padding-to-nibbles was dominated by b=5. That reasoning was about
+*storage*, and it was fine as far as it went; it simply did not price the fallback. With clustered
+recall at b=4 = 0.960 against b=3 = 0.690, b=4 is the best realistic-data operating point at 8×
+compression, and it currently cannot be used.
+
+Sketch of the fix: 3-bit codes cannot be extracted by shift-and-mask because they straddle bytes,
+but a bit-plane layout (3 planes of 16 bits per 16 codes) can reuse `sketch.zig`'s bit expansion —
+roughly 17 ops per 16 codes against b=4's ~6, so ~3× slower per code rather than 25×. Not parity,
+but usable.
+
+Also worth noting: index QPS of ~190 at n=100k is 19M vec/s, against the raw scan bench's 40M. The
+index adds the sketch term, which roughly doubles per-vector work. Consistent, and a useful check
+that nothing unexpected is being paid.
+
 ---
 
 ## Open items for P1

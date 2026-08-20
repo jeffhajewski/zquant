@@ -1,0 +1,559 @@
+//! Exhaustive-scan index over quantized codes.
+//!
+//! Owns a `Prod` quantizer and the packed corpus, and answers top-k queries by
+//! scoring every vector. No partitioning — that is `index/ivf.zig` later. The point
+//! of this layer is that the quantizer, packing, and both kernels compose into
+//! something callable, and that the full estimator is used rather than half of it.
+//!
+//! ## The score
+//!
+//!     ⟨q, x⟩ ≈ ‖x‖ · [ ⟨p, ỹ⟩ + γ·sketch_scale·⟨S'p, qjl⟩ ]
+//!                     └ simd/scan ┘         └ simd/sketch ┘
+//!
+//! Both terms, always. The first alone is the MSE-only estimate that `prod` exists to
+//! correct, biased by 2/π at one MSE bit.
+//!
+//! ## Bit-widths
+//!
+//! `prod` at total width `b` spends `b−1` bits on codes, and the vectorized scan
+//! handles widths that divide a byte. So b ∈ {2, 3, 5} vectorize and b=4 — an
+//! otherwise attractive operating point at 8× compression — runs the exact f32 scan
+//! instead. `vectorized()` reports which, and `bench/index_bench.zig` measures what
+//! it costs, so the gap is visible rather than implied.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+const prod_mod = @import("../quant/prod.zig");
+const packing = @import("../quant/packing.zig");
+const scan = @import("../simd/scan.zig");
+const sketch_kernel = @import("../simd/sketch.zig");
+const topk = @import("topk.zig");
+const RotationKind = @import("../math/rotation.zig").Kind;
+
+pub const Entry = topk.Entry;
+
+pub const Metric = enum {
+    /// Raw ⟨q, x⟩. Larger is better.
+    inner_product,
+    /// ⟨q, x⟩ / (‖q‖·‖x‖). Larger is better.
+    cosine,
+    /// Negated squared Euclidean distance, so larger is still better and one
+    /// comparison rule serves every metric.
+    l2,
+};
+
+pub const Params = struct {
+    dim: u32,
+    /// Total bits per coordinate: `bits − 1` for codes plus one sketch bit.
+    bits: u6,
+    metric: Metric = .inner_product,
+    seed: u64 = 0,
+    rotation: RotationKind = .hadamard,
+    /// Force the exact f32 scan even where the int8 kernel applies. The int8 path
+    /// adds bounded query-side error (docs/DESIGN.md §4.2) and is the default only
+    /// because that error is measured; this is the escape hatch.
+    exact_scan: bool = false,
+};
+
+pub const FlatIndex = struct {
+    quantizer: prod_mod.Prod,
+    layout: packing.Layout,
+    metric: Metric,
+    exact_scan: bool,
+
+    /// Packed codes, `layout.stride()` bytes per vector.
+    codes: std.ArrayList(u8),
+    /// QJL sign bitmaps, `sketchLen()` bytes per vector.
+    sketches: std.ArrayList(u8),
+    /// ‖x‖ and ‖y − ỹ‖ per vector.
+    scalars: std.ArrayList(prod_mod.Scalars),
+
+    workspace: prod_mod.Workspace,
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator, params: Params) !FlatIndex {
+        var quantizer = try prod_mod.Prod.init(allocator, .{
+            .dim = params.dim,
+            .bits = params.bits,
+            .seed = params.seed,
+            .rotation = params.rotation,
+        });
+        errdefer quantizer.deinit();
+
+        var workspace = try prod_mod.Workspace.init(allocator, quantizer);
+        errdefer workspace.deinit();
+
+        return .{
+            .quantizer = quantizer,
+            .layout = packing.Layout.init(quantizer.padded(), quantizer.mse.bits),
+            .metric = params.metric,
+            .exact_scan = params.exact_scan,
+            .codes = .empty,
+            .sketches = .empty,
+            .scalars = .empty,
+            .workspace = workspace,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *FlatIndex) void {
+        self.codes.deinit(self.allocator);
+        self.sketches.deinit(self.allocator);
+        self.scalars.deinit(self.allocator);
+        self.workspace.deinit();
+        self.quantizer.deinit();
+        self.* = undefined;
+    }
+
+    pub fn count(self: FlatIndex) usize {
+        return self.scalars.items.len;
+    }
+
+    pub fn dim(self: FlatIndex) u32 {
+        return self.quantizer.dim();
+    }
+
+    /// Whether queries take the vectorized path. False when the MSE stage's
+    /// bit-width does not divide a byte — notably `bits = 4`.
+    pub fn vectorized(self: FlatIndex) bool {
+        return !self.exact_scan and
+            scan.canVectorize(self.layout) and
+            sketch_kernel.canVectorize(self.quantizer.padded());
+    }
+
+    /// Bytes of index storage per vector, excluding per-vector scalars.
+    pub fn bytesPerVector(self: FlatIndex) usize {
+        return self.layout.stride() + self.quantizer.sketchLen();
+    }
+
+    pub fn reserve(self: *FlatIndex, additional: usize) !void {
+        try self.codes.ensureUnusedCapacity(self.allocator, additional * self.layout.stride());
+        try self.sketches.ensureUnusedCapacity(self.allocator, additional * self.quantizer.sketchLen());
+        try self.scalars.ensureUnusedCapacity(self.allocator, additional);
+    }
+
+    /// Encode and append one vector. Returns its id.
+    ///
+    /// Ids are sequential and stable; nothing here removes or reorders. Encoding is
+    /// data-oblivious, so a vector's codes never depend on what was added before it.
+    pub fn add(self: *FlatIndex, vector: []const f32) !u32 {
+        std.debug.assert(vector.len == self.dim());
+
+        const stride = self.layout.stride();
+        const sketch_len = self.quantizer.sketchLen();
+        const code_len = self.quantizer.codeLen();
+
+        // Encode into scratch, then pack. The quantizer emits one byte per
+        // coordinate; storage wants them bit-packed.
+        const scratch = try self.allocator.alloc(u8, code_len);
+        defer self.allocator.free(scratch);
+
+        try self.codes.appendNTimes(self.allocator, 0, stride);
+        errdefer self.codes.shrinkRetainingCapacity(self.codes.items.len - stride);
+        try self.sketches.appendNTimes(self.allocator, 0, sketch_len);
+        errdefer self.sketches.shrinkRetainingCapacity(self.sketches.items.len - sketch_len);
+
+        const codes_slot = self.codes.items[self.codes.items.len - stride ..];
+        const sketch_slot = self.sketches.items[self.sketches.items.len - sketch_len ..];
+
+        const scalars = self.quantizer.encode(vector, scratch, sketch_slot, &self.workspace);
+        self.layout.pack(scratch, codes_slot);
+
+        try self.scalars.append(self.allocator, scalars);
+        return @intCast(self.scalars.items.len - 1);
+    }
+
+    /// Append `n` vectors from a row-major buffer.
+    pub fn addBatch(self: *FlatIndex, vectors: []const f32) !void {
+        const d = self.dim();
+        std.debug.assert(vectors.len % d == 0);
+        const n = vectors.len / d;
+        try self.reserve(n);
+        for (0..n) |i| _ = try self.add(vectors[i * d ..][0..d]);
+    }
+
+    /// Per-query state. Held by the caller so repeated searches allocate nothing.
+    pub const Searcher = struct {
+        query_state: prod_mod.QueryState,
+        scan_query: scan.Query,
+        sketch_query: sketch_kernel.Query,
+        table: scan.Table,
+        heap: []Entry,
+        workspace: prod_mod.Workspace,
+        allocator: Allocator,
+
+        pub fn init(allocator: Allocator, index: FlatIndex, k: usize) !Searcher {
+            var query_state = try prod_mod.QueryState.init(allocator, index.quantizer);
+            errdefer query_state.deinit();
+            var scan_query = try scan.Query.init(
+                allocator,
+                index.quantizer.padded(),
+                @max(index.quantizer.mse.bits, 1),
+            );
+            errdefer scan_query.deinit();
+            var sketch_query = try sketch_kernel.Query.init(allocator, index.quantizer.padded());
+            errdefer sketch_query.deinit();
+            var workspace = try prod_mod.Workspace.init(allocator, index.quantizer);
+            errdefer workspace.deinit();
+            const heap = try allocator.alloc(Entry, k);
+
+            return .{
+                .query_state = query_state,
+                .scan_query = scan_query,
+                .sketch_query = sketch_query,
+                .table = scan.Table.init(index.quantizer.mse.codebook.centroids),
+                .heap = heap,
+                .workspace = workspace,
+                .allocator = allocator,
+            };
+        }
+
+        pub fn deinit(self: *Searcher) void {
+            self.allocator.free(self.heap);
+            self.workspace.deinit();
+            self.sketch_query.deinit();
+            self.scan_query.deinit();
+            self.query_state.deinit();
+            self.* = undefined;
+        }
+    };
+
+    /// Top-k search. Results are written into `searcher`'s heap and returned as a
+    /// slice into it, valid until the next search.
+    pub fn search(self: *FlatIndex, query: []const f32, searcher: *Searcher) []Entry {
+        std.debug.assert(query.len == self.dim());
+        std.debug.assert(searcher.heap.len > 0);
+
+        // One rotation and one sketch for the whole corpus — the point of staying in
+        // the rotated basis (docs/DESIGN.md §1.3).
+        self.quantizer.prepareQuery(query, &searcher.query_state, &searcher.workspace);
+        const use_simd = self.vectorized();
+        if (use_simd) {
+            searcher.scan_query.load(searcher.query_state.rotated);
+            searcher.sketch_query.load(searcher.query_state.sketched);
+        }
+
+        const query_norm = if (self.metric == .cosine or self.metric == .l2)
+            euclideanNorm(query)
+        else
+            0;
+
+        var collector = topk.TopK.init(searcher.heap);
+        const stride = self.layout.stride();
+        const sketch_len = self.quantizer.sketchLen();
+        const padded = self.quantizer.padded();
+        const bits = self.quantizer.mse.bits;
+        const centroids = self.quantizer.mse.codebook.centroids;
+
+        for (self.scalars.items, 0..) |scalars, i| {
+            const code_slot = self.codes.items[i * stride ..][0..stride];
+            const sketch_slot = self.sketches.items[i * sketch_len ..][0..sketch_len];
+
+            const mse_term = if (use_simd)
+                scan.scoreInt8(bits, searcher.table, searcher.scan_query, code_slot, padded)
+            else
+                scan.scoreExact(self.layout, centroids, searcher.query_state.rotated, code_slot);
+
+            const sketch_term = if (use_simd)
+                sketch_kernel.signDot(searcher.sketch_query, sketch_slot, padded)
+            else
+                sketch_kernel.signDotExact(searcher.query_state.sketched, sketch_slot);
+
+            const estimate = scalars.norm *
+                (mse_term + scalars.gamma * self.quantizer.sketch_scale * sketch_term);
+
+            collector.offer(self.score(estimate, scalars.norm, query_norm), @intCast(i));
+        }
+
+        return collector.drain();
+    }
+
+    /// Map an inner-product estimate onto the metric, always larger-is-better.
+    fn score(self: FlatIndex, estimate: f32, norm: f32, query_norm: f32) f32 {
+        return switch (self.metric) {
+            .inner_product => estimate,
+            // A zero vector has no direction; give it the worst possible score
+            // rather than a NaN that would corrupt the heap ordering.
+            .cosine => if (norm > 0 and query_norm > 0)
+                estimate / (norm * query_norm)
+            else
+                -std.math.inf(f32),
+            // ‖q−x‖² = ‖q‖² + ‖x‖² − 2⟨q,x⟩, negated so larger is better. The ‖q‖²
+            // term is constant per query but kept so scores are meaningful values
+            // rather than only comparable ones.
+            .l2 => -(query_norm * query_norm + norm * norm - 2.0 * estimate),
+        };
+    }
+};
+
+fn euclideanNorm(x: []const f32) f32 {
+    var sum: f64 = 0;
+    for (x) |v| sum += @as(f64, v) * v;
+    return @floatCast(@sqrt(sum));
+}
+
+// -- tests -------------------------------------------------------------------
+
+const testing = std.testing;
+
+fn randomUnit(buf: []f32, random: std.Random) void {
+    var norm: f64 = 0;
+    for (buf) |*v| {
+        const g = random.floatNorm(f32);
+        v.* = g;
+        norm += @as(f64, g) * g;
+    }
+    const inv: f32 = @floatCast(1.0 / @sqrt(norm));
+    for (buf) |*v| v.* *= inv;
+}
+
+test "search finds exact matches from the corpus" {
+    // The sharpest end-to-end check available: query with a vector that is in the
+    // corpus. Its own entry should come back first, since it maximizes the true
+    // inner product by a wide margin.
+    const allocator = testing.allocator;
+    const dim: u32 = 256;
+    const n = 500;
+
+    var index = try FlatIndex.init(allocator, .{ .dim = dim, .bits = 5, .seed = 0x5EED });
+    defer index.deinit();
+    try testing.expect(index.vectorized());
+
+    const corpus = try allocator.alloc(f32, n * dim);
+    defer allocator.free(corpus);
+    var prng = std.Random.DefaultPrng.init(1);
+    for (0..n) |i| randomUnit(corpus[i * dim ..][0..dim], prng.random());
+    try index.addBatch(corpus);
+    try testing.expectEqual(@as(usize, n), index.count());
+
+    var searcher = try Searcher10.init(allocator, index);
+    defer searcher.deinit();
+
+    var found: usize = 0;
+    for (0..50) |i| {
+        const results = index.search(corpus[i * dim ..][0..dim], &searcher.inner);
+        if (results[0].id == @as(u32, @intCast(i))) found += 1;
+    }
+    // Self-retrieval should be near-perfect even at 4 code bits.
+    try testing.expect(found >= 48);
+}
+
+const Searcher10 = struct {
+    inner: FlatIndex.Searcher,
+    fn init(allocator: Allocator, index: FlatIndex) !Searcher10 {
+        return .{ .inner = try FlatIndex.Searcher.init(allocator, index, 10) };
+    }
+    fn deinit(self: *Searcher10) void {
+        self.inner.deinit();
+    }
+};
+
+test "vectorized and exact scans agree on ranking" {
+    // The int8 path is an approximation; it must not reorder results relative to the
+    // exact path often enough to matter. Run both over the same corpus and compare.
+    const allocator = testing.allocator;
+    const dim: u32 = 512;
+    const n = 800;
+
+    const corpus = try allocator.alloc(f32, n * dim);
+    defer allocator.free(corpus);
+    var prng = std.Random.DefaultPrng.init(7);
+    for (0..n) |i| randomUnit(corpus[i * dim ..][0..dim], prng.random());
+
+    var fast = try FlatIndex.init(allocator, .{ .dim = dim, .bits = 5, .seed = 3 });
+    defer fast.deinit();
+    var exact = try FlatIndex.init(allocator, .{ .dim = dim, .bits = 5, .seed = 3, .exact_scan = true });
+    defer exact.deinit();
+    try fast.addBatch(corpus);
+    try exact.addBatch(corpus);
+    try testing.expect(fast.vectorized());
+    try testing.expect(!exact.vectorized());
+
+    var fast_searcher = try FlatIndex.Searcher.init(allocator, fast, 10);
+    defer fast_searcher.deinit();
+    var exact_searcher = try FlatIndex.Searcher.init(allocator, exact, 10);
+    defer exact_searcher.deinit();
+
+    const query = try allocator.alloc(f32, dim);
+    defer allocator.free(query);
+
+    var overlap: usize = 0;
+    var total: usize = 0;
+    for (0..40) |_| {
+        randomUnit(query, prng.random());
+        const a = fast.search(query, &fast_searcher);
+        var ids: [10]u32 = undefined;
+        for (a, 0..) |e, j| ids[j] = e.id;
+        const b = exact.search(query, &exact_searcher);
+        for (b) |e| {
+            total += 1;
+            if (std.mem.indexOfScalar(u32, &ids, e.id) != null) overlap += 1;
+        }
+    }
+    const agreement = @as(f64, @floatFromInt(overlap)) / @as(f64, @floatFromInt(total));
+    try testing.expect(agreement > 0.95);
+}
+
+test "bits=4 falls back to the exact scan" {
+    // Pins the known gap: 3-bit codes do not divide a byte. If a 3-bit kernel lands,
+    // this test is the thing that should change.
+    const allocator = testing.allocator;
+    var index = try FlatIndex.init(allocator, .{ .dim = 1024, .bits = 4 });
+    defer index.deinit();
+    try testing.expectEqual(@as(u6, 3), index.quantizer.mse.bits);
+    try testing.expect(!index.vectorized());
+    // But it still answers queries correctly — see the metric tests below.
+    try testing.expectEqual(@as(usize, 512), index.bytesPerVector());
+}
+
+test "every metric ranks correctly" {
+    const allocator = testing.allocator;
+    const dim: u32 = 128;
+    const n = 300;
+
+    const corpus = try allocator.alloc(f32, n * dim);
+    defer allocator.free(corpus);
+    var prng = std.Random.DefaultPrng.init(11);
+    const random = prng.random();
+    for (0..n) |i| {
+        randomUnit(corpus[i * dim ..][0..dim], random);
+        // Vary the norms so inner product, cosine, and L2 genuinely differ.
+        const factor = 0.5 + random.float(f32) * 2.0;
+        for (corpus[i * dim ..][0..dim]) |*v| v.* *= factor;
+    }
+
+    for ([_]Metric{ .inner_product, .cosine, .l2 }) |metric| {
+        var index = try FlatIndex.init(allocator, .{
+            .dim = dim,
+            .bits = 5,
+            .metric = metric,
+            .seed = 5,
+        });
+        defer index.deinit();
+        try index.addBatch(corpus);
+
+        var searcher = try FlatIndex.Searcher.init(allocator, index, 5);
+        defer searcher.deinit();
+
+        const query = try allocator.alloc(f32, dim);
+        defer allocator.free(query);
+
+        var hits: usize = 0;
+        const trials = 30;
+        for (0..trials) |_| {
+            randomUnit(query, random);
+
+            // Exact best under this metric.
+            var best: u32 = 0;
+            var best_score: f64 = -std.math.inf(f64);
+            for (0..n) |i| {
+                const row = corpus[i * dim ..][0..dim];
+                var d: f64 = 0;
+                var rn: f64 = 0;
+                var qn: f64 = 0;
+                for (row, query) |x, qv| {
+                    d += @as(f64, x) * qv;
+                    rn += @as(f64, x) * x;
+                    qn += @as(f64, qv) * qv;
+                }
+                const s: f64 = switch (metric) {
+                    .inner_product => d,
+                    .cosine => d / (@sqrt(rn) * @sqrt(qn)),
+                    .l2 => -(qn + rn - 2.0 * d),
+                };
+                if (s > best_score) {
+                    best_score = s;
+                    best = @intCast(i);
+                }
+            }
+
+            const results = index.search(query, &searcher);
+            for (results) |e| {
+                if (e.id == best) {
+                    hits += 1;
+                    break;
+                }
+            }
+        }
+        // The true best must land in the top 5 nearly always.
+        try testing.expect(hits >= trials - 3);
+    }
+}
+
+test "results are sorted and ids are in range" {
+    const allocator = testing.allocator;
+    const dim: u32 = 64;
+    var index = try FlatIndex.init(allocator, .{ .dim = dim, .bits = 3, .seed = 2 });
+    defer index.deinit();
+
+    var prng = std.Random.DefaultPrng.init(13);
+    const vector = try allocator.alloc(f32, dim);
+    defer allocator.free(vector);
+    for (0..100) |_| {
+        randomUnit(vector, prng.random());
+        _ = try index.add(vector);
+    }
+
+    var searcher = try FlatIndex.Searcher.init(allocator, index, 7);
+    defer searcher.deinit();
+    randomUnit(vector, prng.random());
+    const results = index.search(vector, &searcher);
+
+    try testing.expectEqual(@as(usize, 7), results.len);
+    for (1..results.len) |i| try testing.expect(results[i - 1].score >= results[i].score);
+    for (results) |e| try testing.expect(e.id < 100);
+}
+
+test "empty index and k larger than the corpus" {
+    const allocator = testing.allocator;
+    const dim: u32 = 64;
+    var index = try FlatIndex.init(allocator, .{ .dim = dim, .bits = 3 });
+    defer index.deinit();
+
+    var searcher = try FlatIndex.Searcher.init(allocator, index, 10);
+    defer searcher.deinit();
+
+    const query = [_]f32{0.1} ** dim;
+    try testing.expectEqual(@as(usize, 0), index.search(&query, &searcher).len);
+
+    const vector = [_]f32{0.5} ** dim;
+    _ = try index.add(&vector);
+    _ = try index.add(&vector);
+    try testing.expectEqual(@as(usize, 2), index.search(&query, &searcher).len);
+}
+
+test "searcher is reusable and allocation-free per query" {
+    const allocator = testing.allocator;
+    const dim: u32 = 128;
+    var index = try FlatIndex.init(allocator, .{ .dim = dim, .bits = 5, .seed = 1 });
+    defer index.deinit();
+
+    var prng = std.Random.DefaultPrng.init(17);
+    const vector = try allocator.alloc(f32, dim);
+    defer allocator.free(vector);
+    for (0..200) |_| {
+        randomUnit(vector, prng.random());
+        _ = try index.add(vector);
+    }
+
+    var searcher = try FlatIndex.Searcher.init(allocator, index, 5);
+    defer searcher.deinit();
+
+    // Repeated searches must not leak; testing.allocator would catch it.
+    for (0..50) |_| {
+        randomUnit(vector, prng.random());
+        const results = index.search(vector, &searcher);
+        try testing.expectEqual(@as(usize, 5), results.len);
+    }
+}
+
+test "storage matches the advertised bit budget" {
+    const allocator = testing.allocator;
+    for ([_]u6{ 2, 3, 4, 5 }) |bits| {
+        var index = try FlatIndex.init(allocator, .{ .dim = 1024, .bits = bits });
+        defer index.deinit();
+        // b bits per coordinate exactly: (b−1) code bits plus one sketch bit.
+        try testing.expectEqual(@as(usize, 1024 * @as(usize, bits) / 8), index.bytesPerVector());
+    }
+}

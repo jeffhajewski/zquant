@@ -6,6 +6,12 @@
 //! This is the first measurement here on real data. Everything before it used
 //! synthetic corpora — uniform-on-sphere or synthetic clusters — whose difficulty was
 //! chosen by me and therefore proves little about behaviour on embeddings.
+//!
+//! **Reports the rank distribution of the true nearest neighbour, not just 1@k.**
+//! An earlier version reported 1@10 and 1@100, both of which saturate at 1.00 here,
+//! and a saturated metric says nothing about margin: at b=4 the worst query sits at
+//! rank 9, so "1@10 = 1.00" was true by exactly one position. Percentiles show the
+//! headroom that a ceiling hides. `bench/sift_verify.zig` validates this harness.
 
 const std = @import("std");
 const zq = @import("zquant");
@@ -74,10 +80,10 @@ pub fn main() !void {
 
     std.debug.print("\nSIFT10K: {d} base x {d}d, {d} queries, top-{d} exact L2 ground truth\n",
         .{ base.count, base.dim, queries.count, truth.width });
-    std.debug.print("{s:>5} {s:>7} {s:>8} {s:>7} {s:>7} {s:>7} {s:>7} {s:>8} {s:>8}\n",
-        .{ "bits", "codeB", "totalB", "ratio", "1@1", "1@10", "1@100", "R@10", "QPS" });
-
-    const ks = [_]usize{ 1, 10, 100 };
+    // Rank of the true nearest neighbour in our results: median, p90, and worst.
+    // The worst case is what a rerank candidate count has to be sized against.
+    std.debug.print("{s:>5} {s:>7} {s:>7} {s:>6} {s:>6} {s:>7} {s:>7} {s:>7} {s:>8}\n",
+        .{ "bits", "totalB", "ratio", "med", "p90", "worst", "1@10", "R@10", "QPS" });
 
     for ([_]u6{ 2, 3, 4, 5, 6 }) |bits| {
         var index = try zq.flat.FlatIndex.init(a, .{
@@ -89,29 +95,31 @@ pub fn main() !void {
         defer index.deinit();
         try index.addBatch(base.data);
 
-        var searcher = try zq.flat.FlatIndex.Searcher.init(a, index, 100);
+        // Two searchers. Ranks need the whole corpus ordered, which makes the heap
+        // enormous and is not how anyone queries; timing uses a realistic k. Sharing
+        // one searcher between them reported QPS 7x low.
+        var rank_searcher = try zq.flat.FlatIndex.Searcher.init(a, index, base.count);
+        defer rank_searcher.deinit();
+        var searcher = try zq.flat.FlatIndex.Searcher.init(a, index, 10);
         defer searcher.deinit();
 
-        var found = [_]usize{0} ** ks.len;
+        const ranks = try a.alloc(usize, queries.count);
+        defer a.free(ranks);
         var recall_at_10: f64 = 0;
 
-        // Warm, then time.
-        _ = index.search(queries.row(0), &searcher);
-        var timer = try std.time.Timer.start();
-
         for (0..queries.count) |qi| {
-            const results = index.search(queries.row(qi), &searcher);
+            const results = index.search(queries.row(qi), &rank_searcher);
             const gt = truth.data[qi * truth.width ..][0..truth.width];
 
-            // 1@k: is the true nearest neighbour within the first k returned?
-            for (ks, 0..) |k, ki| {
-                for (results[0..@min(k, results.len)]) |e| {
-                    if (e.id == gt[0]) {
-                        found[ki] += 1;
-                        break;
-                    }
+            // Where did the true nearest neighbour actually land?
+            ranks[qi] = results.len;
+            for (results, 0..) |e, r| {
+                if (e.id == gt[0]) {
+                    ranks[qi] = r;
+                    break;
                 }
             }
+
             // R@10: overlap between our top-10 and the true top-10.
             var overlap: usize = 0;
             for (results[0..@min(10, results.len)]) |e| {
@@ -124,18 +132,30 @@ pub fn main() !void {
             }
             recall_at_10 += @as(f64, @floatFromInt(overlap)) / 10.0;
         }
+
+        // Timed pass at a realistic k.
+        _ = index.search(queries.row(0), &searcher);
+        var timer = try std.time.Timer.start();
+        for (0..queries.count) |qi| std.mem.doNotOptimizeAway(index.search(queries.row(qi), &searcher));
         const elapsed = timer.read();
 
         const nq: f64 = @floatFromInt(queries.count);
         const raw_bytes = base.dim * @sizeOf(f32);
-        std.debug.print("{d:>5} {d:>7} {d:>8} {d:>6.1}x {d:>7.2} {d:>7.2} {d:>7.2} {d:>8.3} {d:>8.0}\n", .{
+
+        var within_10: usize = 0;
+        for (ranks) |r| {
+            if (r < 10) within_10 += 1;
+        }
+        std.mem.sort(usize, ranks, {}, std.sort.asc(usize));
+
+        std.debug.print("{d:>5} {d:>7} {d:>6.1}x {d:>6} {d:>6} {d:>7} {d:>7.2} {d:>7.3} {d:>8.0}\n", .{
             bits,
-            index.codeBytesPerVector(),
             index.bytesPerVector(),
             @as(f64, @floatFromInt(raw_bytes)) / @as(f64, @floatFromInt(index.bytesPerVector())),
-            @as(f64, @floatFromInt(found[0])) / nq,
-            @as(f64, @floatFromInt(found[1])) / nq,
-            @as(f64, @floatFromInt(found[2])) / nq,
+            ranks[queries.count / 2],
+            ranks[queries.count * 9 / 10],
+            ranks[queries.count - 1],
+            @as(f64, @floatFromInt(within_10)) / nq,
             recall_at_10 / nq,
             nq / (@as(f64, @floatFromInt(elapsed)) / 1e9),
         });

@@ -86,6 +86,10 @@ pub const FlatIndex = struct {
     scalars: std.ArrayList(StoredScalars),
 
     workspace: prod_mod.Workspace,
+    /// Reusable unpacked-code buffer for `add`. Held here rather than allocated per
+    /// call: `add` runs once per vector, and a transient allocation per vector is
+    /// both wasteful and needless pressure on the allocator during a bulk load.
+    encode_scratch: []u8,
     allocator: Allocator,
 
     pub fn init(allocator: Allocator, params: Params) !FlatIndex {
@@ -100,6 +104,9 @@ pub const FlatIndex = struct {
         var workspace = try prod_mod.Workspace.init(allocator, quantizer);
         errdefer workspace.deinit();
 
+        const encode_scratch = try allocator.alloc(u8, quantizer.codeLen());
+        errdefer allocator.free(encode_scratch);
+
         return .{
             .quantizer = quantizer,
             .layout = packing.Layout.init(quantizer.padded(), quantizer.mse.bits),
@@ -109,11 +116,13 @@ pub const FlatIndex = struct {
             .sketches = .empty,
             .scalars = .empty,
             .workspace = workspace,
+            .encode_scratch = encode_scratch,
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *FlatIndex) void {
+        self.allocator.free(self.encode_scratch);
         self.codes.deinit(self.allocator);
         self.sketches.deinit(self.allocator);
         self.scalars.deinit(self.allocator);
@@ -166,12 +175,10 @@ pub const FlatIndex = struct {
 
         const stride = self.layout.stride();
         const sketch_len = self.quantizer.sketchLen();
-        const code_len = self.quantizer.codeLen();
 
         // Encode into scratch, then pack. The quantizer emits one byte per
         // coordinate; storage wants them bit-packed.
-        const scratch = try self.allocator.alloc(u8, code_len);
-        defer self.allocator.free(scratch);
+        const scratch = self.encode_scratch;
 
         try self.codes.appendNTimes(self.allocator, 0, stride);
         errdefer self.codes.shrinkRetainingCapacity(self.codes.items.len - stride);
@@ -222,7 +229,14 @@ pub const FlatIndex = struct {
                 .query_state = query_state,
                 .scan_query = scan_query,
                 .sketch_query = sketch_query,
-                .table = scan.Table.init(index.quantizer.mse.codebook.centroids),
+                // Only build the shuffle table when it will actually be used. A
+                // codebook wider than 16 levels does not fit one, and building it
+                // anyway overran a 16-entry array — silently, in ReleaseFast, where
+                // the bounds assert is compiled out.
+                .table = if (index.vectorized())
+                    scan.Table.init(index.quantizer.mse.codebook.centroids)
+                else
+                    scan.unusedTable(),
                 .heap = heap,
                 .workspace = workspace,
                 .allocator = allocator,
@@ -568,6 +582,49 @@ test "searcher is reusable and allocation-free per query" {
         randomUnit(vector, prng.random());
         const results = index.search(vector, &searcher);
         try testing.expectEqual(@as(usize, 5), results.len);
+    }
+}
+
+test "search works at every bit-width, vectorized or not" {
+    // Constructing a Searcher above the shuffle-table limit used to overrun a
+    // 16-entry array: the vectorization test stopped at b=5 and the wider-bit test
+    // only checked storage sizing, so nothing ever built a Searcher at b=6. Debug
+    // caught it as an assert; ReleaseFast corrupted memory instead.
+    const allocator = testing.allocator;
+    const dim: u32 = 128;
+    const n = 200;
+
+    const corpus = try allocator.alloc(f32, n * dim);
+    defer allocator.free(corpus);
+    var prng = std.Random.DefaultPrng.init(0x5A5E);
+    const random = prng.random();
+    for (0..n) |i| randomUnit(corpus[i * dim ..][0..dim], random);
+
+    for (2..8) |bits| {
+        var index = try FlatIndex.init(allocator, .{
+            .dim = dim,
+            .bits = @intCast(bits),
+            .seed = 9,
+        });
+        defer index.deinit();
+        try index.addBatch(corpus);
+
+        var searcher = try FlatIndex.Searcher.init(allocator, index, 10);
+        defer searcher.deinit();
+
+        // Self-retrieval must work whichever scan path is taken.
+        var hits: usize = 0;
+        for (0..20) |i| {
+            const results = index.search(corpus[i * dim ..][0..dim], &searcher);
+            try testing.expectEqual(@as(usize, 10), results.len);
+            for (results) |e| {
+                if (e.id == @as(u32, @intCast(i))) {
+                    hits += 1;
+                    break;
+                }
+            }
+        }
+        try testing.expect(hits >= 19);
     }
 }
 

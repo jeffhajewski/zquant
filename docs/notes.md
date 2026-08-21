@@ -625,43 +625,71 @@ storage — the earlier analysis compared *bytes* and correctly concluded paddin
 never asked what the fallback cost. A dominance argument over one axis says nothing about the axis
 you did not measure.
 
-### <a name="sift"></a>`HEAD` — first real-data benchmark (SIFT10K)
+### <a name="sift"></a>`HEAD` — first real-data benchmark (SIFT10K), and a buffer overrun
 
-Everything before this used synthetic corpora whose difficulty I chose, which proves little about
-embeddings. ANN_SIFT10K is 10,000 base vectors at 128d with 100 queries and published top-100 exact
-L2 ground truth — the standard small sanity corpus. `tools/fetch_datasets.sh` retrieves it; `data/`
-is gitignored.
+Everything before this used synthetic corpora whose difficulty I chose. ANN_SIFT10K is 10,000 base
+vectors at 128d with 100 queries and published top-100 exact L2 ground truth.
+`tools/fetch_datasets.sh` retrieves it; `data/` is gitignored.
 
-| bits | code B | total B | ratio | 1@1 | 1@10 | 1@100 | R@10 | QPS |
+| bits | total B | ratio | median rank | p90 | worst | 1@10 | R@10 | QPS |
 |---|---|---|---|---|---|---|---|---|
-| 2 | 32 | 36 | 14.2× | 0.32 | 0.75 | **1.00** | 0.421 | 9498 |
-| 3 | 48 | 52 | 9.8× | 0.45 | 0.88 | **1.00** | 0.571 | 9656 |
-| 4 | 64 | 68 | 7.5× | 0.67 | **1.00** | **1.00** | 0.740 | 6363 |
-| 5 | 80 | 84 | 6.1× | 0.74 | **1.00** | **1.00** | 0.839 | 9845 |
-| 6 | 96 | 100 | 5.1× | 0.86 | 1.00 | 1.00 | 0.902 | 294 |
+| 2 | 36 | 14.2× | 2 | 31 | **92** | 0.75 | 0.421 | 11939 |
+| 3 | 52 | 9.8× | 1 | 14 | **81** | 0.88 | 0.571 | 12159 |
+| 4 | 68 | 7.5× | 0 | 3 | **9** | 1.00 | 0.740 | 7665 |
+| 5 | 84 | 6.1× | 0 | 2 | 8 | 1.00 | 0.839 | 12449 |
+| 6 | 100 | 5.1× | 0 | 1 | 3 | 1.00 | 0.902 | 299 |
 
-**The most useful line is `1@100 = 1.00` everywhere** — including b=2 at 14× compression. The true
-nearest neighbour is always inside the first 100 results. That is precisely the precondition a
-rerank stage needs: scan quantized, rescore 100 candidates exactly, get exact top-1 at 14×
-compression. Rerank was a plausible idea before; it is now a measured one, and it should move up
-the queue.
+#### Reporting `1@k` was hiding the margin
 
-**R@10 is the harder metric and the honest one.** Retrieving the *whole* true top-10 sits at 0.740
-at b=4 — the estimator finds the best neighbour reliably but reorders the near-ties behind it.
-Consistent with the synthetic clustered results.
+The first version of this table reported `1@10` and `1@100`, both saturated at 1.00, and I read that
+as a strong result — going as far as recommending a rerank stage sized at 100 candidates on the
+strength of it. Jeff pushed back that 1.00 looked like a testing error. The harness turned out to be
+correct, but the reading was wrong in a way that matters more:
 
-**b=6 at 294 QPS** is `max_table_bits` showing up in production: 5-bit codes exceed the 16-entry
-shuffle table, so it takes the exact scan. The documented cliff, visible in real numbers.
+- b=2's worst query lands at rank **92 of 100**. `1@100 = 1.00` is true by eight places.
+- b=4's worst lands at rank **9**. `1@10 = 1.00` is true by *exactly one position*.
 
-**A reporting error, corrected.** `bytesPerVector` excluded the per-vector `norm` and `gamma`, which
-were f32. Overstated compression by 11% at d=128 — the KV regime. Two fixes: scalars are now f16 as
-DESIGN.md always specified, and the accessor includes them (`codeBytesPerVector` reports the part
-that scales with the bit budget). b=4 is 7.5×, not 8×. Recall unchanged, so f16 costs nothing;
-there is a test comparing retrieval across widely varying norms rather than assuming it.
+**A saturated metric carries no information about margin.** Both numbers are one unlucky query from
+reading 0.99, and a rerank depth chosen from them would have been fitted to a cliff edge. The table
+now reports the rank distribution, which is what a candidate count actually has to be sized against.
 
-**What these numbers are not.** There is still no PQ, RaBitQ, or turbovec baseline run here, so
-nothing above supports a claim of parity with the paper. SIFT10K is also only 10k vectors — recall
-at 10k is markedly easier than at 1M, so these are optimistic relative to SIFT1M.
+`bench/sift_verify.zig` is the harness validation, kept permanently:
+
+| check | result |
+|---|---|
+| ground truth vs. brute force | 100/100 agree — parsing and id mapping correct |
+| shuffled-corpus control | 1@100 = 0.00 — the metric is not trivially satisfied |
+| dist(NN)/dist(100th) | 0.617 mean, 0.176 worst — SIFT's NN is genuinely well separated |
+
+That last row is the real explanation: `1@100` saturates because SIFT10K's nearest neighbour is
+38% closer than its 100th on average. That is a property of the corpus, not evidence about the
+quantizer.
+
+#### The buffer overrun this uncovered
+
+Chasing an `OutOfMemory` at b=6 found a genuine memory-safety bug. `Searcher.init` built the int8
+shuffle table unconditionally, but `Table.init` asserts `centroids.len <= 16` — the hard
+`max_table_bits` limit. At b=6 the MSE stage has 5 bits, so **32 centroids were written into a
+16-entry array**. Debug catches it as an assert; ReleaseFast compiles the check out and corrupts
+adjacent memory, which surfaced as a spurious allocation failure and then a crash.
+
+Missed because the vectorization test stopped at b=5 and the wider-bit test only checked storage
+sizing without ever constructing a `Searcher`. There is now a test that actually searches at every
+width from 2 to 7.
+
+Two lessons worth keeping. **Benchmarks run in ReleaseFast, so a bug they trigger appears as
+nonsense rather than as a panic** — `-Dbench-opt=Debug` now exists for exactly this, and each bench
+has its own step so one can be run alone. And **an assert only protects the builds that keep it**:
+this one was correct, documented, and useless in the configuration that mattered.
+
+#### What these numbers are not
+
+Still no PQ, RaBitQ, or turbovec baseline run here, so nothing above supports a parity claim. And
+SIFT10K at 10k vectors is much easier than SIFT1M.
+
+Also corrected here: `bytesPerVector` excluded the per-vector `norm` and `gamma`, which were f32 —
+under 2% of a d=1024 vector but 11% of a d=128 one, the KV regime. They are f16 now as DESIGN.md
+always specified, and the accessor includes them. b=4 is 7.5×, not the 8× reported earlier.
 
 ---
 

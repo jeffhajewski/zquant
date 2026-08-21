@@ -34,17 +34,28 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
 
-    const bench_step = b.step("bench", "Run benchmarks");
-    for ([_][]const u8{ "encode_bench", "scan_bench", "recall_bench", "index_bench", "sift_bench" }) |name| {
+    // Benches default to ReleaseFast; `-Dbench-opt=Debug` turns on safety checks,
+    // which is how a crash in a bench gets a usable panic message.
+    const bench_optimize = b.option(
+        std.builtin.OptimizeMode,
+        "bench-opt",
+        "Optimization mode for benchmarks (default ReleaseFast)",
+    ) orelse .ReleaseFast;
+
+    const bench_step = b.step("bench", "Run all benchmarks");
+    for ([_][]const u8{ "encode_bench", "scan_bench", "recall_bench", "index_bench", "sift_bench", "sift_verify" }) |name| {
         const exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{
                 .root_source_file = b.path(b.fmt("bench/{s}.zig", .{name})),
                 .target = target,
-                .optimize = .ReleaseFast,
+                .optimize = bench_optimize,
                 .imports = &.{.{ .name = "zquant", .module = zquant }},
             }),
         });
-        bench_step.dependOn(&b.addRunArtifact(exe).step);
+        const run = b.addRunArtifact(exe);
+        bench_step.dependOn(&run.step);
+        // Each bench is also its own step, so one can be run alone.
+        b.step(name, b.fmt("Run {s}", .{name})).dependOn(&run.step);
     }
 }

@@ -51,6 +51,11 @@ pub const Table = struct {
     /// centroid ≈ values[k] * scale
     scale: f32,
 
+    /// Build from a codebook of at most 16 levels.
+    ///
+    /// The caller must check `canVectorize` first — a wider codebook has no
+    /// representation here, and this is only reachable at all because the shuffle
+    /// instruction indexes 16 bytes (`max_table_bits`).
     pub fn init(centroids: []const f32) Table {
         std.debug.assert(centroids.len <= 16);
 
@@ -66,6 +71,12 @@ pub const Table = struct {
         return .{ .values = values, .scale = scale };
     }
 };
+
+/// Placeholder for indexes that will not take the vectorized path, so callers need
+/// not make the field optional. Never read: the scalar scan does not consult it.
+pub fn unusedTable() Table {
+    return .{ .values = @splat(0), .scale = 1.0 };
+}
 
 /// A query, rotated and de-interleaved to match the code packing.
 ///

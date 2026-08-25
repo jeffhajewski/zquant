@@ -68,8 +68,9 @@ fn recall(a: std.mem.Allocator, dim: u32, bits: u6, n: usize, nq: usize, ks: []c
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const a = gpa.allocator();
+    // smp_allocator: 0.16 dropped GeneralPurposeAllocator, and benchmarks want
+    // throughput rather than leak tracking.
+    const a = std.heap.smp_allocator;
     const ks = [_]usize{ 1, 5, 10, 20, 50, 100 };
 
     std.debug.print("\nrecall 1@k, 10k corpus, 200 queries\n", .{});

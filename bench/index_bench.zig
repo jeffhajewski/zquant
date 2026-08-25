@@ -1,5 +1,6 @@
 const std = @import("std");
 const zq = @import("zquant");
+const Timer = @import("timer.zig").Timer;
 
 fn randomUnit(buf: []f32, r: std.Random) void {
     var n: f64 = 0;
@@ -12,8 +13,9 @@ fn dot(a: []const f32, b: []const f32) f64 {
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const a = gpa.allocator();
+    // smp_allocator: 0.16 dropped GeneralPurposeAllocator, and benchmarks want
+    // throughput rather than leak tracking.
+    const a = std.heap.smp_allocator;
 
     const dim: u32 = 1024;
     const n: usize = 100_000;
@@ -49,7 +51,7 @@ pub fn main() !void {
         var index = try zq.flat.FlatIndex.init(a, .{ .dim = dim, .bits = bits, .seed = 0x5EED });
         defer index.deinit();
 
-        var t = try std.time.Timer.start();
+        var t = Timer.start();
         try index.addBatch(corpus);
         const build_ns = t.read();
 

@@ -1,9 +1,11 @@
 const std = @import("std");
 const zq = @import("zquant");
+const Timer = @import("timer.zig").Timer;
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const a = gpa.allocator();
+    // smp_allocator: 0.16 dropped GeneralPurposeAllocator, and benchmarks want
+    // throughput rather than leak tracking.
+    const a = std.heap.smp_allocator;
 
     const dim: u32 = 1024;
     const n: usize = 200_000;
@@ -43,7 +45,7 @@ pub fn main() !void {
 
     // --- int8 SIMD kernel
     var sink: f32 = 0;
-    var t = try std.time.Timer.start();
+    var t = Timer.start();
     const reps = 5;
     for (0..reps) |_| {
         for (0..n) |i| sink += zq.simd_scan.scoreInt8(layout, table, query, layout.vectorSlice(storage, i), dim);

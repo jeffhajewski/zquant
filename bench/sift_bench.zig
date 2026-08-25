@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const zq = @import("zquant");
+const Timer = @import("timer.zig").Timer;
 
 const Vectors = struct {
     data: []f32,
@@ -26,8 +27,8 @@ const Vectors = struct {
 };
 
 /// .fvecs: each record is an i32 dimension followed by that many f32.
-fn readFvecs(allocator: std.mem.Allocator, path: []const u8) !Vectors {
-    const bytes = try std.fs.cwd().readFileAlloc(allocator, path, 1 << 31);
+fn readFvecs(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Vectors {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1 << 31));
     defer allocator.free(bytes);
 
     const dim = std.mem.readInt(u32, bytes[0..4], .little);
@@ -46,8 +47,8 @@ fn readFvecs(allocator: std.mem.Allocator, path: []const u8) !Vectors {
 }
 
 /// .ivecs: same framing, i32 payload.
-fn readIvecs(allocator: std.mem.Allocator, path: []const u8) !struct { data: []u32, width: usize, count: usize } {
-    const bytes = try std.fs.cwd().readFileAlloc(allocator, path, 1 << 31);
+fn readIvecs(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !struct { data: []u32, width: usize, count: usize } {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1 << 31));
     defer allocator.free(bytes);
 
     const width = std.mem.readInt(u32, bytes[0..4], .little);
@@ -65,17 +66,24 @@ fn readIvecs(allocator: std.mem.Allocator, path: []const u8) !struct { data: []u
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const a = gpa.allocator();
+    // smp_allocator: 0.16 dropped GeneralPurposeAllocator, and benchmarks want
+    // throughput rather than leak tracking.
+    const a = std.heap.smp_allocator;
 
-    const base = readFvecs(a, "data/siftsmall/siftsmall_base.fvecs") catch |err| {
+    // 0.16 routes file I/O through the Io interface; benches need one only
+    // to read the dataset.
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const base = readFvecs(a, io, "data/siftsmall/siftsmall_base.fvecs") catch |err| {
         std.debug.print("could not read SIFT10K ({s}). Run tools/fetch_datasets.sh\n", .{@errorName(err)});
         return;
     };
     defer a.free(base.data);
-    const queries = try readFvecs(a, "data/siftsmall/siftsmall_query.fvecs");
+    const queries = try readFvecs(a, io, "data/siftsmall/siftsmall_query.fvecs");
     defer a.free(queries.data);
-    const truth = try readIvecs(a, "data/siftsmall/siftsmall_groundtruth.ivecs");
+    const truth = try readIvecs(a, io, "data/siftsmall/siftsmall_groundtruth.ivecs");
     defer a.free(truth.data);
 
     std.debug.print("\nSIFT10K: {d} base x {d}d, {d} queries, top-{d} exact L2 ground truth\n",
@@ -135,7 +143,7 @@ pub fn main() !void {
 
         // Timed pass at a realistic k.
         _ = index.search(queries.row(0), &searcher);
-        var timer = try std.time.Timer.start();
+        var timer = Timer.start();
         for (0..queries.count) |qi| std.mem.doNotOptimizeAway(index.search(queries.row(qi), &searcher));
         const elapsed = timer.read();
 

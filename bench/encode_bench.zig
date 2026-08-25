@@ -1,9 +1,11 @@
 const std = @import("std");
 const zq = @import("zquant");
+const Timer = @import("timer.zig").Timer;
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const a = gpa.allocator();
+    // smp_allocator: 0.16 dropped GeneralPurposeAllocator, and benchmarks want
+    // throughput rather than leak tracking.
+    const a = std.heap.smp_allocator;
 
     const n = 1 << 22; // 4M coordinates
     const src = try a.alloc(f32, n);
@@ -17,7 +19,7 @@ pub fn main() !void {
         var cb = try zq.codebook.Codebook.init(a, zq.density.Density.gauss(1.0), bits);
         defer cb.deinit();
 
-        var t = try std.time.Timer.start();
+        var t = Timer.start();
         for (0..5) |_| cb.encodeSliceScalar(src, dst);
         const scalar_ns = t.read() / 5;
 

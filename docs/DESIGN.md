@@ -3,7 +3,7 @@
 TurboQuant (Zandieh, Daliri, Hadian, Mirrokni — [arXiv:2504.19874](https://arxiv.org/abs/2504.19874), ICLR 2026)
 implemented in Zig, with first-class clients in Zig, Python, JS/TS, and Go.
 
-Status: **P0 (reference core) complete**; P1 next. Zig toolchain pinned to **0.15.2**.
+Status: **P0 (reference core) complete**; P1 next. Zig toolchain pinned to **0.16.0**.
 
 ---
 
@@ -290,9 +290,10 @@ streams once per query (not per vector) to line up with the nibble split.
 - **exact f32** — four `tbl` lookups over the byte-planes of the 16 f32 centroids reconstruct
   exact f32 values from codes, at more ops but no approximation.
 
-**Table lookup needs no per-architecture assembly** — LLVM pattern-matches the portable elementwise
-form into `tbl`/`pshufb`/`vpshufb`, provided an optimization barrier stops it folding the result
-into the consumer's `sext`. There is no `simd/dispatch.zig`.
+**Table lookup is per-architecture inline assembly** (`simd/shuffle.zig`), as this section
+originally specified. Under Zig 0.15 it was portable source that LLVM pattern-matched; 0.16 removed
+runtime vector indexing and the construct no longer compiles. Staging through an array compiles but
+loses the instruction, so the assembly is back — with a scalar fallback for targets without one.
 
 **Four bits is a hard ceiling on the vectorized path.** The shuffle instructions index a 16-byte
 register, so the codebook must fit 16 levels. Wider codebooks fall back to the exact f32 scan.

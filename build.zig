@@ -51,6 +51,8 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = bench_optimize,
                 .imports = &.{.{ .name = "zquant", .module = zquant }},
+                // libc for the monotonic clock; see bench/timer.zig.
+                .link_libc = true,
             }),
         });
         const run = b.addRunArtifact(exe);

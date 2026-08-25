@@ -41,7 +41,7 @@ Next: P1 — SIMD kernels, blocked layout, flat index, benchmarks.
 
 ## Building
 
-Requires Zig 0.15.2.
+Requires Zig 0.16.0.
 
 ```sh
 zig build test

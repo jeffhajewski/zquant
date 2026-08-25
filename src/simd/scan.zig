@@ -7,25 +7,12 @@
 //! table sits in one SIMD register for the whole scan and the work is a dot product
 //! reducing along dimensions.
 //!
-//! ## Table lookup needs no inline assembly, but does need a barrier
+//! ## Table lookup
 //!
-//! docs/DESIGN.md §4.2 assumed `tbl`/`vpshufb` would require per-architecture asm
-//! behind a dispatch layer. It does not: LLVM pattern-matches the obvious elementwise
-//! form — `inline for (0..16) |i| out[i] = table[idx[i]]` — into exactly one
-//! instruction on every target that has one (`tbl` on aarch64, `pshufb` on SSSE3,
-//! `vpshufb` on AVX2), and into scalar loads where none exists.
-//!
-//! **But only if the result is not immediately widened.** Inlined into this kernel,
-//! LLVM folds each `extractelement` into the consumer's `sext` and never forms the
-//! vector-build pattern it needs to recognize — producing 32 scalar `umov`/`bfxil`
-//! pairs per chunk instead of one `tbl`. Measured cost of getting this wrong: the
-//! whole kernel ran at 1.5 GB/s, only 1.2× faster than an unquantized f32 brute-force
-//! scan.
-//!
-//! `optimizationBarrier` is an empty `asm` with a vector register constraint. It
-//! emits no instruction and blocks the fold. This is a fragile,
-//! compiler-version-dependent trick: `bench/scan_bench.zig` is what guards it, since
-//! a regression is silent and costs ~4× rather than breaking a test.
+//! `simd/shuffle.zig` owns the one-instruction byte-table lookup this kernel is built
+//! on. Under Zig 0.15 that was portable source LLVM pattern-matched; under 0.16 it is
+//! inline assembly again. Either way the cost of getting it wrong is large — when the
+//! lookup failed to vectorize, the kernel ran at 1.5 GB/s against 20.9.
 //!
 //! One semantic caveat: `pshufb` zeroes a lane whose index has bit 7 set, `tbl`
 //! zeroes for index ≥ 16, and the scalar form would index out of bounds. All three
@@ -44,6 +31,7 @@ const Allocator = std.mem.Allocator;
 const packing = @import("../quant/packing.zig");
 const Layout = packing.Layout;
 const bitmask = @import("bitmask.zig");
+const shuffle = @import("shuffle.zig");
 
 /// The 16 centroids, quantized to int8. Query-independent, built once per index.
 pub const Table = struct {
@@ -140,34 +128,17 @@ pub const Query = struct {
     }
 };
 
-/// Forces `v` to be materialized in a vector register, blocking the `sext` fold that
-/// otherwise destroys the shuffle pattern (see the module comment). Emits nothing.
-///
-/// Architectures without a known vector-register constraint simply skip it and get
-/// the scalar lookup — correct, just slower.
-inline fn optimizationBarrier(v: @Vector(16, i8)) @Vector(16, i8) {
-    var x = v;
-    switch (builtin.cpu.arch) {
-        .aarch64, .aarch64_be => asm ("" : [x] "+w" (x)),
-        .x86_64, .x86 => asm ("" : [x] "+x" (x)),
-        else => {},
-    }
-    return x;
-}
-
-/// 16-byte table lookup. One `tbl`/`pshufb`/`vpshufb`; scalar loads where absent.
+/// 16-byte table lookup. See `simd/shuffle.zig` for why this is assembly.
 inline fn lookup(table: @Vector(16, i8), idx: @Vector(16, u8)) @Vector(16, i8) {
-    var out: @Vector(16, i8) = @splat(0);
-    inline for (0..16) |i| out[i] = table[idx[i]];
-    return optimizationBarrier(out);
+    return shuffle.table16(table, idx);
 }
 
-/// Vectorized score for a comptime-known bit-width.
+/// Vectorized score over a sequential layout, for a comptime-known bit-width.
 ///
 /// One 16-byte load carries `128/bits` codes: `groups` bit-fields of 16 lanes each.
-/// Products are accumulated two groups at a time in i16 (`smlal`) before widening —
-/// two products reach 2·127·127 = 32258, just inside i16's 32767, so pairs are the
-/// most that can be batched at full range.
+/// Products accumulate two groups at a time in i16 (`smlal`) before widening — two
+/// reach 2·127·127 = 32258, just inside i16's 32767, so pairs are the most that can
+/// be batched at full range.
 fn scoreBits(comptime bits: u6, table: Table, query: Query, codes: []const u8, dim: u32) f32 {
     const groups = comptime 8 / @as(usize, bits);
     const mask_value = comptime (@as(u8, 1) << @as(u3, @intCast(bits))) - 1;
@@ -407,14 +378,15 @@ test "table quantization preserves ordering and sign" {
         defer cb.deinit();
         const table = Table.init(cb.centroids);
 
+        const values: [16]i8 = table.values;
         // Ascending centroids must stay ascending after int8 rounding, or the
         // codebook's monotonicity is broken and encode/score disagree.
         for (1..cb.levels()) |k| {
-            try testing.expect(table.values[k] >= table.values[k - 1]);
+            try testing.expect(values[k] >= values[k - 1]);
         }
         // And reconstruct to something close.
         for (cb.centroids, 0..) |c, k| {
-            const back = @as(f32, @floatFromInt(table.values[k])) * table.scale;
+            const back = @as(f32, @floatFromInt(values[k])) * table.scale;
             try testing.expectApproxEqAbs(c, back, table.scale);
         }
     }
@@ -450,8 +422,8 @@ test "lookup matches a scalar table index" {
         for (&table_values) |*v| v.* = random.intRangeAtMost(i8, -128, 127);
         for (&indices) |*v| v.* = random.uintAtMost(u8, 15);
 
-        const got = lookup(table_values, indices);
-        for (0..16) |i| try testing.expectEqual(table_values[indices[i]], got[i]);
+        const got: [16]i8 = lookup(table_values, indices);
+        for (got, indices) |g, i| try testing.expectEqual(table_values[i], g);
     }
 }
 

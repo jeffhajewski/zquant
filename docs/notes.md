@@ -691,6 +691,51 @@ Also corrected here: `bytesPerVector` excluded the per-vector `norm` and `gamma`
 under 2% of a d=1024 vector but 11% of a d=128 one, the KV regime. They are f16 now as DESIGN.md
 always specified, and the accessor includes them. b=4 is 7.5×, not the 8× reported earlier.
 
+### <a name="zig016"></a>`HEAD` — port to Zig 0.16
+
+The toolchain on this machine moved to 0.16.0 and 0.15.2 was removed, so this was forced rather
+than chosen. Two breaking changes mattered.
+
+**Runtime vector indexing is gone**, and it was the basis of the byte-table lookup:
+
+```zig
+inline for (0..16) |i| out[i] = table[idx[i]];  // idx[i] is runtime → error in 0.16
+```
+
+Five sites, but only one in production code (`scan.lookup`); the rest were tests indexing a vector
+with a loop variable, fixed by coercing to an array first.
+
+The obvious port — stage the vector through an array, where runtime indexing is still legal —
+compiles and **loses the instruction**: it spills to the stack and issues scalar loads. Measured
+previously at ~14× slower. So `simd/shuffle.zig` now holds per-architecture inline assembly (`tbl`
+on aarch64, `pshufb` on SSSE3) with a scalar fallback.
+
+**This vindicates the original design and refutes a simplification I made.** DESIGN.md §4.2
+specified exactly this dispatch layer; during P1 I deleted it on the grounds that LLVM
+pattern-matched the portable form, which was true and did not survive one minor release. The
+[scan-kernel note](#scan) called the barrier trick "fragile, compiler-version-dependent" and
+predicted a silent 4× regression on upgrade. The prediction was right about fragility and wrong
+about the failure mode: it broke as a **compile error**, which is the good outcome. A silent
+slowdown would have needed the benchmark to catch it.
+
+**Other 0.16 removals hit only benchmarks:** `std.heap.GeneralPurposeAllocator` (→ `smp_allocator`),
+`std.time.Timer` (→ a small `bench/timer.zig` over the C monotonic clock), and `std.fs.cwd()` (file
+I/O now needs an `Io` instance, constructed via `std.Io.Threaded`).
+
+**Verification that the port preserved behaviour**, which matters more than the port compiling:
+
+- 155/155 tests pass in Debug *and* ReleaseFast.
+- **Golden vectors pass unchanged** — encodings are bit-identical across a compiler major version.
+  This is the first real payoff from pinning them by hash rather than recomputing.
+- Disassembly shows the hot loop unchanged: `tbl.16b` ×2, `smull`/`smlal`, `saddw`.
+- SIFT10K reproduces exactly: same ranks, same recall at every bit-width.
+- Index QPS within noise: 189/183/110/196 against 190/193/110/197.
+
+The raw scan bench reads 18.4 GB/s against 20.9 before, but the f32 brute-force baseline in the same
+run dropped from 9.2 to 5.5 GB/s, so the machine is slower right now rather than the kernel having
+regressed — the *ratio* improved from 17.7× to 26.6×. Worth remembering that absolute throughput
+numbers across sessions are not comparable; ratios measured in the same run are.
+
 ---
 
 ## Open items for P1

@@ -127,10 +127,10 @@ test "expansion ordering matches packSigns in prod" {
     var prng = std.Random.DefaultPrng.init(1);
     for (0..200) |_| {
         const pair = [2]u8{ prng.random().int(u8), prng.random().int(u8) };
-        const got = bitmask.expand16(pair);
-        for (0..lanes) |i| {
+        const got: [lanes]bool = bitmask.expand16(pair);
+        for (got, 0..) |g, i| {
             const want = ((pair[i >> 3] >> @intCast(i & 7)) & 1) == 1;
-            try testing.expectEqual(want, got[i]);
+            try testing.expectEqual(want, g);
         }
     }
 }

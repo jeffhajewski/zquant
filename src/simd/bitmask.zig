@@ -45,10 +45,10 @@ test "expand16 matches scalar bit extraction" {
     var prng = std.Random.DefaultPrng.init(1);
     for (0..500) |_| {
         const pair = [2]u8{ prng.random().int(u8), prng.random().int(u8) };
-        const got = expand16(pair);
-        for (0..lanes) |i| {
+        const got: [lanes]bool = expand16(pair);
+        for (got, 0..) |g, i| {
             const want = ((pair[i >> 3] >> @intCast(i & 7)) & 1) == 1;
-            try testing.expectEqual(want, got[i]);
+            try testing.expectEqual(want, g);
         }
     }
 }
@@ -58,23 +58,30 @@ test "expandWeighted yields zero or the weight" {
     for (0..200) |_| {
         const pair = [2]u8{ prng.random().int(u8), prng.random().int(u8) };
         inline for ([_]u8{ 1, 2, 4 }) |weight| {
-            const got = expandWeighted(pair, weight);
-            for (0..lanes) |i| {
+            const got: [lanes]u8 = expandWeighted(pair, weight);
+            for (got, 0..) |g, i| {
                 const set = ((pair[i >> 3] >> @intCast(i & 7)) & 1) == 1;
-                try testing.expectEqual(@as(u8, if (set) weight else 0), got[i]);
+                try testing.expectEqual(@as(u8, if (set) weight else 0), g);
             }
         }
     }
 }
 
 test "edge patterns" {
-    try testing.expectEqual(@as(u8, 0), expandWeighted(.{ 0x00, 0x00 }, 4)[0]);
-    for (0..lanes) |i| {
-        try testing.expect(expand16(.{ 0xFF, 0xFF })[i]);
-        try testing.expect(!expand16(.{ 0x00, 0x00 })[i]);
+    const zeros: [lanes]u8 = expandWeighted(.{ 0x00, 0x00 }, 4);
+    try testing.expectEqual(@as(u8, 0), zeros[0]);
+
+    const all_set: [lanes]bool = expand16(.{ 0xFF, 0xFF });
+    const none_set: [lanes]bool = expand16(.{ 0x00, 0x00 });
+    for (all_set, none_set) |a, b| {
+        try testing.expect(a);
+        try testing.expect(!b);
     }
+
     // Lane 0 is the low bit of byte 0; lane 15 the high bit of byte 1.
-    try testing.expect(expand16(.{ 0x01, 0x00 })[0]);
-    try testing.expect(expand16(.{ 0x00, 0x80 })[15]);
-    try testing.expect(!expand16(.{ 0x01, 0x00 })[1]);
+    const low: [lanes]bool = expand16(.{ 0x01, 0x00 });
+    const high: [lanes]bool = expand16(.{ 0x00, 0x80 });
+    try testing.expect(low[0]);
+    try testing.expect(!low[1]);
+    try testing.expect(high[15]);
 }

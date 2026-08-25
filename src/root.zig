@@ -18,6 +18,7 @@ pub const packing = @import("quant/packing.zig");
 pub const simd_encode = @import("simd/encode.zig");
 pub const simd_scan = @import("simd/scan.zig");
 pub const simd_bitmask = @import("simd/bitmask.zig");
+pub const simd_shuffle = @import("simd/shuffle.zig");
 pub const simd_sketch = @import("simd/sketch.zig");
 
 pub const topk = @import("index/topk.zig");

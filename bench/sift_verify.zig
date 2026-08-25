@@ -3,8 +3,8 @@
 const std = @import("std");
 const zq = @import("zquant");
 
-fn readFvecs(a: std.mem.Allocator, path: []const u8) !struct { data: []f32, dim: u32, count: usize } {
-    const bytes = try std.fs.cwd().readFileAlloc(a, path, 1 << 31);
+fn readFvecs(a: std.mem.Allocator, io: std.Io, path: []const u8) !struct { data: []f32, dim: u32, count: usize } {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 31));
     defer a.free(bytes);
     const dim = std.mem.readInt(u32, bytes[0..4], .little);
     const record = 4 + 4 * @as(usize, dim);
@@ -16,8 +16,8 @@ fn readFvecs(a: std.mem.Allocator, path: []const u8) !struct { data: []f32, dim:
     };
     return .{ .data = data, .dim = dim, .count = count };
 }
-fn readIvecs(a: std.mem.Allocator, path: []const u8) !struct { data: []u32, width: usize, count: usize } {
-    const bytes = try std.fs.cwd().readFileAlloc(a, path, 1 << 31);
+fn readIvecs(a: std.mem.Allocator, io: std.Io, path: []const u8) !struct { data: []u32, width: usize, count: usize } {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 31));
     defer a.free(bytes);
     const width = std.mem.readInt(u32, bytes[0..4], .little);
     const record = 4 + 4 * @as(usize, width);
@@ -36,14 +36,21 @@ fn l2sq(a: []const f32, b: []const f32) f64 {
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const a = gpa.allocator();
+    // smp_allocator: 0.16 dropped GeneralPurposeAllocator, and benchmarks want
+    // throughput rather than leak tracking.
+    const a = std.heap.smp_allocator;
 
-    const base = try readFvecs(a, "data/siftsmall/siftsmall_base.fvecs");
+    // 0.16 routes file I/O through the Io interface; benches need one only
+    // to read the dataset.
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const base = try readFvecs(a, io, "data/siftsmall/siftsmall_base.fvecs");
     defer a.free(base.data);
-    const q = try readFvecs(a, "data/siftsmall/siftsmall_query.fvecs");
+    const q = try readFvecs(a, io, "data/siftsmall/siftsmall_query.fvecs");
     defer a.free(q.data);
-    const gt = try readIvecs(a, "data/siftsmall/siftsmall_groundtruth.ivecs");
+    const gt = try readIvecs(a, io, "data/siftsmall/siftsmall_groundtruth.ivecs");
     defer a.free(gt.data);
     const d = base.dim;
 

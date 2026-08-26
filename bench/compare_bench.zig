@@ -105,8 +105,9 @@ pub fn main() !void {
     }
 
     for ([_]u6{ 2, 3, 4, 5 }) |bits| {
-        for ([_]bool{ true, false }) |sketch| {
+        for ([_]zq.flat.Correction{ .qjl_sketch, .scalar }) |correction| {
             const exact = false;
+            const sketch = true;
             var index = try zq.flat.FlatIndex.init(a, .{
                 .dim = d,
                 .bits = bits,
@@ -114,6 +115,7 @@ pub fn main() !void {
                 .seed = 0x5EED,
                 .exact_scan = exact,
                 .use_sketch = sketch,
+                .correction = correction,
             });
             defer index.deinit();
             try index.addBatch(base.data);
@@ -157,7 +159,7 @@ pub fn main() !void {
 
             try out.print(a, "zquant,bits={d}{s},{d},{d:.4},{d},{d},{d},{d:.1}\n", .{
                 bits,
-                if (sketch) "" else " no-sketch",
+                if (correction == .scalar) " scalar-corr" else "",
                 index.bytesPerVector(),
                 recall / fnq,
                 ranks[nq / 2],
@@ -167,7 +169,7 @@ pub fn main() !void {
             });
             std.debug.print("  bits={d}{s:<12} {d:>3}B  R@10={d:.3}  med={d} p90={d} worst={d}  {d:.0} QPS\n", .{
                 bits,
-                if (sketch) "" else " no-sketch",
+                if (correction == .scalar) " scalar-corr" else "",
                 index.bytesPerVector(),
                 recall / fnq,
                 ranks[nq / 2],

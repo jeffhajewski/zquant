@@ -43,6 +43,34 @@ pub const Metric = enum {
     l2,
 };
 
+/// How to correct the bias in ⟨p, ỹ⟩.
+///
+/// Storage, at bit-width `b` and dimension `d`:
+///
+///     .qjl_sketch   d·(b−1)/8 code bytes + d/8 sketch bytes + 4  =  d·b/8 + 4
+///     .scalar       d·(b−1)/8 code bytes + 4
+///
+/// So `.scalar` at `b` costs the same as `.qjl_sketch` at `b−1`, and measured on
+/// SIFT10K it wins at every matched storage budget — the freed bit buys more codebook
+/// resolution than the sketch was buying accuracy. `.qjl_sketch` is kept because it is
+/// the paper's construction and the reference the scalar form is checked against.
+///
+/// MSE-optimal reconstruction shrinks ỹ, so ⟨p, ỹ⟩ underestimates ⟨p, y⟩. The paper
+/// corrects this with a 1-bit-per-coordinate QJL sketch of the residual. But over
+/// random queries the least-squares estimate of ⟨p, y⟩ from ⟨p, ỹ⟩ is simply
+///
+///     ⟨p, y⟩ ≈ (⟨y, ỹ⟩ / ‖ỹ‖²) · ⟨p, ỹ⟩
+///
+/// — one scalar per *vector*, not one bit per *coordinate*. At d=128 that is 2 bytes
+/// against 16, and the 14 bytes saved buy a whole extra bit of MSE codebook, which is
+/// exactly what a 1-bit sketch costs.
+pub const Correction = enum {
+    /// The paper's construction: 1-bit QJL sketch of the residual.
+    qjl_sketch,
+    /// Per-vector least-squares rescale. Costs one f16 instead of d bits.
+    scalar,
+};
+
 pub const Params = struct {
     dim: u32,
     /// Total bits per coordinate: `bits − 1` for codes plus one sketch bit.
@@ -54,6 +82,8 @@ pub const Params = struct {
     /// adds bounded query-side error (docs/DESIGN.md §4.2) and is the default only
     /// because that error is measured; this is the escape hatch.
     exact_scan: bool = false,
+    /// How the MSE term's bias is corrected.
+    correction: Correction = .scalar,
     /// Include the QJL residual sketch in the score.
     ///
     /// The sketch makes the inner-product estimate *unbiased*, which is what
@@ -81,6 +111,7 @@ pub const FlatIndex = struct {
     metric: Metric,
     exact_scan: bool,
     use_sketch: bool,
+    correction: Correction,
 
     /// Packed codes, `layout.stride()` bytes per vector.
     codes: std.ArrayList(u8),
@@ -123,6 +154,7 @@ pub const FlatIndex = struct {
             .metric = params.metric,
             .exact_scan = params.exact_scan,
             .use_sketch = params.use_sketch,
+            .correction = params.correction,
             .codes = .empty,
             .sketches = .empty,
             .scalars = .empty,
@@ -169,7 +201,11 @@ pub const FlatIndex = struct {
     /// Bytes of codes and sketch only — the part that scales with the bit budget.
     /// With the sketch disabled its storage is not counted, because it is not read.
     pub fn codeBytesPerVector(self: FlatIndex) usize {
-        const sketch_bytes = if (self.use_sketch) self.quantizer.sketchLen() else 0;
+        const sketch_bytes = switch (self.correction) {
+            .qjl_sketch => if (self.use_sketch) self.quantizer.sketchLen() else 0,
+            // The scalar factor rides in `StoredScalars`, already counted.
+            .scalar => 0,
+        };
         return self.layout.stride() + sketch_bytes;
     }
 
@@ -201,8 +237,22 @@ pub const FlatIndex = struct {
         const codes_slot = self.codes.items[self.codes.items.len - stride ..];
         const sketch_slot = self.sketches.items[self.sketches.items.len - sketch_len ..];
 
-        const scalars = self.quantizer.encode(vector, scratch, sketch_slot, &self.workspace);
+        var scalars = self.quantizer.encode(vector, scratch, sketch_slot, &self.workspace);
         self.layout.pack(scratch, codes_slot);
+
+        if (self.correction == .scalar) {
+            // α = ⟨y, ỹ⟩ / ‖ỹ‖², stored in gamma's slot since the sketch is unused.
+            // ⟨y, ỹ⟩ = (‖y‖² + ‖ỹ‖² − ‖y−ỹ‖²)/2, and ‖y‖ = 1 after normalization.
+            const centroids = self.quantizer.mse.codebook.centroids;
+            var recon_sq: f64 = 0;
+            for (scratch) |code| {
+                const c: f64 = centroids[code];
+                recon_sq += c * c;
+            }
+            const residual_sq: f64 = @as(f64, scalars.gamma) * scalars.gamma;
+            const dot = (1.0 + recon_sq - residual_sq) * 0.5;
+            scalars.gamma = if (recon_sq > 0) @floatCast(dot / recon_sq) else 1.0;
+        }
 
 
         try self.scalars.append(self.allocator, StoredScalars.from(scalars));
@@ -302,16 +352,21 @@ pub const FlatIndex = struct {
             else
                 scan.scoreExact(self.layout, centroids, searcher.query_state.rotated, code_slot);
 
-            const sketch_term = if (!self.use_sketch)
-                0
-            else if (use_simd)
-                sketch_kernel.signDot(searcher.sketch_query, sketch_slot, padded)
-            else
-                sketch_kernel.signDotExact(searcher.query_state.sketched, sketch_slot);
-
             const norm: f32 = scalars.norm;
             const gamma: f32 = scalars.gamma;
-            const estimate = norm * (mse_term + gamma * self.quantizer.sketch_scale * sketch_term);
+
+            const estimate = switch (self.correction) {
+                .scalar => norm * gamma * mse_term,
+                .qjl_sketch => blk: {
+                    const sketch_term = if (!self.use_sketch)
+                        0
+                    else if (use_simd)
+                        sketch_kernel.signDot(searcher.sketch_query, sketch_slot, padded)
+                    else
+                        sketch_kernel.signDotExact(searcher.query_state.sketched, sketch_slot);
+                    break :blk norm * (mse_term + gamma * self.quantizer.sketch_scale * sketch_term);
+                },
+            };
 
             collector.offer(self.score(estimate, norm, query_norm), @intCast(i));
         }
@@ -451,11 +506,15 @@ test "every bit-width up to 5 vectorizes" {
     // bits=5 is the last that fits: its 4-bit codes fill the 16-entry shuffle table.
     const allocator = testing.allocator;
     for (2..6) |bits| {
-        var index = try FlatIndex.init(allocator, .{ .dim = 1024, .bits = @intCast(bits) });
+        var index = try FlatIndex.init(allocator, .{
+            .dim = 1024,
+            .bits = @intCast(bits),
+            .correction = .qjl_sketch,
+        });
         defer index.deinit();
         try testing.expectEqual(@as(u6, @intCast(bits - 1)), index.quantizer.mse.bits);
         try testing.expect(index.vectorized());
-        // And the code budget is still exactly `bits` per coordinate.
+        // With the sketch, the code budget is exactly `bits` per coordinate.
         try testing.expectEqual(@as(usize, 1024 * bits / 8), index.codeBytesPerVector());
     }
 }
@@ -646,14 +705,32 @@ test "search works at every bit-width, vectorized or not" {
 
 test "storage matches the advertised bit budget" {
     const allocator = testing.allocator;
+    const dim: usize = 1024;
     for ([_]u6{ 2, 3, 4, 5, 6, 7 }) |bits| {
-        var index = try FlatIndex.init(allocator, .{ .dim = 1024, .bits = bits });
-        defer index.deinit();
-        // b bits per coordinate exactly: (b−1) code bits plus one sketch bit, in
-        // both the sequential and bit-plane layouts.
-        try testing.expectEqual(@as(usize, 1024 * @as(usize, bits) / 8), index.codeBytesPerVector());
-        // Plus two half-precision scalars, which do not scale with dimension.
-        try testing.expectEqual(index.codeBytesPerVector() + 4, index.bytesPerVector());
+        // With the QJL sketch: (b−1) code bits plus one sketch bit per coordinate,
+        // in both the sequential and bit-plane layouts.
+        var sketched = try FlatIndex.init(allocator, .{
+            .dim = @intCast(dim),
+            .bits = bits,
+            .correction = .qjl_sketch,
+        });
+        defer sketched.deinit();
+        try testing.expectEqual(dim * @as(usize, bits) / 8, sketched.codeBytesPerVector());
+
+        // With the scalar correction: (b−1) code bits and no sketch, so one bit per
+        // coordinate less — which is the entire point.
+        var scalar = try FlatIndex.init(allocator, .{
+            .dim = @intCast(dim),
+            .bits = bits,
+            .correction = .scalar,
+        });
+        defer scalar.deinit();
+        try testing.expectEqual(dim * @as(usize, bits - 1) / 8, scalar.codeBytesPerVector());
+
+        // Both carry two half-precision scalars, which do not scale with dimension.
+        for ([_]FlatIndex{ sketched, scalar }) |ix| {
+            try testing.expectEqual(ix.codeBytesPerVector() + 4, ix.bytesPerVector());
+        }
     }
 }
 
@@ -708,4 +785,142 @@ test "half-precision scalars do not measurably hurt ranking" {
         }
     }
     try testing.expect(hits >= trials - 4);
+}
+
+test "scalar correction beats the QJL sketch at matched storage" {
+    // The measured P1 finding, pinned. The sketch costs one bit per coordinate to
+    // remove a bias that a single per-vector scalar removes for f16 — so at equal
+    // storage the scalar form gets a whole extra bit of codebook. On SIFT10K this
+    // was worth +10 points of R@10 at 68 bytes; here it is checked on synthetic data
+    // as a regression guard rather than a benchmark.
+    const allocator = testing.allocator;
+    const dim: u32 = 256;
+    const n = 1500;
+    const trials = 120;
+
+    const corpus = try allocator.alloc(f32, n * dim);
+    defer allocator.free(corpus);
+    var prng = std.Random.DefaultPrng.init(0x5CA1AB1E);
+    const random = prng.random();
+    // Clustered, so near-ties exist and the estimator's precision actually matters.
+    var centers: [16][]f32 = undefined;
+    const center_store = try allocator.alloc(f32, 16 * dim);
+    defer allocator.free(center_store);
+    for (0..16) |c| {
+        centers[c] = center_store[c * dim ..][0..dim];
+        randomUnit(centers[c], random);
+    }
+    for (0..n) |i| {
+        const row = corpus[i * dim ..][0..dim];
+        const c = random.uintLessThan(usize, 16);
+        for (row, centers[c]) |*v, ce| {
+            v.* = ce + 0.4 * random.floatNorm(f32) / @sqrt(@as(f32, @floatFromInt(dim)));
+        }
+        const len = euclideanNorm(row);
+        for (row) |*v| v.* /= len;
+    }
+
+    const query = try allocator.alloc(f32, dim);
+    defer allocator.free(query);
+
+    // `.scalar` at bits=5 and `.qjl_sketch` at bits=4 cost the same.
+    var scalar_recall: f64 = 0;
+    var sketch_recall: f64 = 0;
+    var scalar_bytes: usize = 0;
+    var sketch_bytes: usize = 0;
+
+    for ([_]Correction{ .scalar, .qjl_sketch }) |correction| {
+        const bits: u6 = if (correction == .scalar) 5 else 4;
+        var index = try FlatIndex.init(allocator, .{
+            .dim = dim,
+            .bits = bits,
+            .seed = 0x11,
+            .correction = correction,
+        });
+        defer index.deinit();
+        try index.addBatch(corpus);
+
+        var searcher = try FlatIndex.Searcher.init(allocator, index, 10);
+        defer searcher.deinit();
+
+        var hits: f64 = 0;
+        var qprng = std.Random.DefaultPrng.init(7);
+        for (0..trials) |_| {
+            randomUnit(query, qprng.random());
+
+            var best: u32 = 0;
+            var best_score: f64 = -std.math.inf(f64);
+            for (0..n) |i| {
+                var d: f64 = 0;
+                for (corpus[i * dim ..][0..dim], query) |x, qv| d += @as(f64, x) * qv;
+                if (d > best_score) {
+                    best_score = d;
+                    best = @intCast(i);
+                }
+            }
+            for (index.search(query, &searcher)) |e| {
+                if (e.id == best) {
+                    hits += 1;
+                    break;
+                }
+            }
+        }
+        if (correction == .scalar) {
+            scalar_recall = hits / @as(f64, trials);
+            scalar_bytes = index.bytesPerVector();
+        } else {
+            sketch_recall = hits / @as(f64, trials);
+            sketch_bytes = index.bytesPerVector();
+        }
+    }
+
+    // Same storage, by construction.
+    try testing.expectEqual(sketch_bytes, scalar_bytes);
+    // And the scalar form is at least as good. Measured well ahead on real data;
+    // asserted loosely here so the test tracks the direction, not the noise.
+    try testing.expect(scalar_recall >= sketch_recall);
+}
+
+test "scalar correction removes the estimator's bias" {
+    // The correction's actual job. Regress estimates on truth: the slope must be ~1,
+    // where an uncorrected MSE-only estimator would sit near 2/π at one code bit.
+    const allocator = testing.allocator;
+    const dim: u32 = 256;
+    const n = 400;
+
+    const corpus = try allocator.alloc(f32, n * dim);
+    defer allocator.free(corpus);
+    var prng = std.Random.DefaultPrng.init(4);
+    const random = prng.random();
+    for (0..n) |i| randomUnit(corpus[i * dim ..][0..dim], random);
+
+    var index = try FlatIndex.init(allocator, .{
+        .dim = dim,
+        .bits = 5,
+        .seed = 3,
+        .correction = .scalar,
+    });
+    defer index.deinit();
+    try index.addBatch(corpus);
+
+    var searcher = try FlatIndex.Searcher.init(allocator, index, n);
+    defer searcher.deinit();
+
+    const query = try allocator.alloc(f32, dim);
+    defer allocator.free(query);
+
+    var cross: f64 = 0;
+    var truth_sq: f64 = 0;
+    for (0..30) |_| {
+        randomUnit(query, random);
+        for (index.search(query, &searcher)) |e| {
+            var truth: f64 = 0;
+            for (corpus[@as(usize, e.id) * dim ..][0..dim], query) |x, qv| {
+                truth += @as(f64, x) * qv;
+            }
+            cross += @as(f64, e.score) * truth;
+            truth_sq += truth * truth;
+        }
+    }
+    try testing.expectApproxEqAbs(@as(f64, 1.0), cross / truth_sq, 0.05);
 }

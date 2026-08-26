@@ -44,6 +44,15 @@ def main():
     base = read_fvecs(f"{SRC}/siftsmall_base.fvecs")
     query = read_fvecs(f"{SRC}/siftsmall_query.fvecs")
 
+    # 100 queries gives a binomial standard error near 1 point of R@10, which is the
+    # same size as the differences between systems. Top up from the learn split —
+    # held out from base, so it is still a fair query distribution — until the error
+    # bar is small enough to distinguish them.
+    learn = read_fvecs(f"{SRC}/siftsmall_learn.fvecs")
+    rng = np.random.default_rng(0)
+    extra = learn[rng.choice(len(learn), size=900, replace=False)]
+    query = np.vstack([query, extra])
+
     def unit(a):
         n = np.linalg.norm(a, axis=1, keepdims=True)
         n[n == 0] = 1.0
@@ -64,6 +73,8 @@ def main():
     # where this is near 1.0 makes every method look identical.
     top = np.take_along_axis(sims, gt, axis=1)
     print(f"base {base_n.shape}  query {query_n.shape}  gt {gt.shape}")
+    se = np.sqrt(0.9 * 0.1 / (len(query_n) * 10))
+    print(f"binomial se on R@10 at ~0.9: {se:.4f} ({se*100:.2f} points)")
     print(f"sim(NN) mean {top[:,0].mean():.4f}   sim(100th) mean {top[:,99].mean():.4f}")
     print(f"separation (NN-100th) mean {np.mean(top[:,0]-top[:,99]):.4f}")
     print(f"wrote -> {DST}")

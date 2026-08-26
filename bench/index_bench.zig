@@ -18,7 +18,7 @@ pub fn main() !void {
     const a = std.heap.smp_allocator;
 
     const dim: u32 = 1024;
-    const n: usize = 100_000;
+    const n: usize = 200_000;
     const nq = 100;
     const k = 10;
 
@@ -44,8 +44,8 @@ pub fn main() !void {
     }
 
     std.debug.print("\nFlatIndex: d={d} n={d} k={d}, {d} queries\n", .{ dim, n, k, nq });
-    std.debug.print("{s:>5} {s:>8} {s:>7} {s:>10} {s:>11} {s:>9} {s:>7}\n",
-        .{ "bits", "B/vector", "simd", "build/vec", "QPS", "us/query", "1@10" });
+    std.debug.print("{s:>5} {s:>8} {s:>7} {s:>9} {s:>9} {s:>9} {s:>7} {s:>7}\n",
+        .{ "bits", "B/vector", "simd", "corpus", "QPS", "batched", "gain", "1@10" });
 
     for ([_]u6{ 2, 3, 4, 5 }) |bits| {
         var index = try zq.flat.FlatIndex.init(a, .{ .dim = dim, .bits = bits, .seed = 0x5EED });
@@ -53,10 +53,12 @@ pub fn main() !void {
 
         var t = Timer.start();
         try index.addBatch(corpus);
-        const build_ns = t.read();
+        _ = t.read(); // build time no longer reported
 
         var searcher = try zq.flat.FlatIndex.Searcher.init(a, index, k);
         defer searcher.deinit();
+        var batch_searcher = try zq.flat.FlatIndex.BatchSearcher.init(a, index, 32, k);
+        defer batch_searcher.deinit();
 
         // warm
         _ = index.search(queries[0..dim], &searcher);
@@ -69,11 +71,28 @@ pub fn main() !void {
         }
         const search_ns = t.read();
 
+        // Batched: the corpus is read once per batch instead of once per query.
+        _ = index.searchBatch(queries[0 .. 32 * dim], &batch_searcher);
+        t.reset();
+        {
+            var off: usize = 0;
+            while (off < nq) : (off += 32) {
+                const take = @min(32, nq - off);
+                std.mem.doNotOptimizeAway(
+                    index.searchBatch(queries[off * dim ..][0 .. take * dim], &batch_searcher),
+                );
+            }
+        }
+        const batch_ns = t.read();
+
         const qps = @as(f64, @floatFromInt(nq)) / (@as(f64,@floatFromInt(search_ns))/1e9);
-        std.debug.print("{d:>5} {d:>8} {s:>7} {d:>8.1}us {d:>11.1} {d:>9.0} {d:>7.3}\n", .{
+        const corpus_mb = @as(f64, @floatFromInt(n * index.bytesPerVector())) / 1e6;
+        std.debug.print("{d:>5} {d:>8} {s:>7} {d:>7.0}MB {d:>9.1} {d:>9.1} {d:>6.2}x {d:>7.3}\n", .{
             bits, index.bytesPerVector(), if (index.vectorized()) "yes" else "no",
-            @as(f64,@floatFromInt(build_ns))/@as(f64,@floatFromInt(n))/1000.0,
-            qps, @as(f64,@floatFromInt(search_ns))/@as(f64,@floatFromInt(nq))/1000.0,
+            corpus_mb,
+            qps,
+            @as(f64, @floatFromInt(nq)) / (@as(f64,@floatFromInt(batch_ns))/1e9),
+            (@as(f64, @floatFromInt(nq)) / (@as(f64,@floatFromInt(batch_ns))/1e9)) / qps,
             @as(f64,@floatFromInt(hits))/@as(f64,@floatFromInt(nq)),
         });
     }

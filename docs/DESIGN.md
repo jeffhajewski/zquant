@@ -276,10 +276,15 @@ for chunk in 0..32:                       # 16 bytes = 32 nibbles = 32 dims
 horizontal_add(acc)
 ```
 
-6 ops per 32 dimensions ≈ **0.19 ops/dimension**, ~192 ops/vector. At ~4 IPC that is ~48
-cycles/vector, i.e. **~37 GB/s of code traffic** — genuinely memory-bound, which is where we want
-to sit. The dimension-major form needs an int8→f32 widen per dimension and costs ~3× more,
-leaving the scan compute-bound.
+6 ops per 32 dimensions ≈ **0.19 ops/dimension**, ~192 ops/vector. The dimension-major form needs
+an int8→f32 widen per dimension and costs ~3× more.
+
+> **Correction (measured).** This section originally claimed the scan is "deliberately
+> memory-bound", inferred from ~21 GB/s of code traffic. That was never tested and is **wrong**.
+> Batching 32 queries so the corpus is read once per batch rather than once per query gives
+> **1.01×** — even on a 103 MB corpus that far exceeds cache. A memory-bound scan would have gained
+> close to the batch size. The kernel is **compute-bound**, so the levers are fewer ops per vector
+> and parallelism, not better locality.
 
 Because byte `i` holds dimensions `2i` and `2i+1`, the query is de-interleaved into even and odd
 streams once per query (not per vector) to line up with the nibble split.

@@ -80,7 +80,7 @@ pub fn main() !void {
 
     var out = std.ArrayList(u8).empty;
     defer out.deinit(a);
-    try out.appendSlice(a, "system,config,bytes_per_vector,recall_at_10,rank_median,rank_p90,rank_worst,qps\n");
+    try out.appendSlice(a, "system,config,bytes_per_vector,recall_at_10,rank_median,rank_p90,rank_worst,qps,batched_qps\n");
 
     std.debug.print("zquant on {s}: {d}x{d}, {d} queries, k={d}\n", .{ dir, base.count, d, nq, K });
 
@@ -157,6 +157,24 @@ pub fn main() !void {
             defer a.free(ranks);
             var recall: f64 = 0;
 
+            // Batched timing, matching how the Python baselines are measured: they
+            // hand every query to one call, so timing ours one at a time was
+            // comparing different things.
+            var batch_searcher = try zq.flat.FlatIndex.BatchSearcher.init(a, index, 32, K);
+            defer batch_searcher.deinit();
+            _ = index.searchBatch(queries.data[0 .. 32 * d], &batch_searcher);
+            var batch_timer = Timer.start();
+            {
+                var off: usize = 0;
+                while (off < nq) : (off += 32) {
+                    const take = @min(32, nq - off);
+                    std.mem.doNotOptimizeAway(
+                        index.searchBatch(queries.data[off * d ..][0 .. take * d], &batch_searcher),
+                    );
+                }
+            }
+            const batch_ns = batch_timer.read();
+
             _ = index.search(queries.data[0..d], &searcher);
             var timer = Timer.start();
             for (0..nq) |qi| {
@@ -186,8 +204,9 @@ pub fn main() !void {
             std.mem.sort(usize, ranks, {}, std.sort.asc(usize));
             const fnq: f64 = @floatFromInt(nq);
             const qps = fnq / (@as(f64, @floatFromInt(elapsed)) / 1e9);
+            const batch_qps = fnq / (@as(f64, @floatFromInt(batch_ns)) / 1e9);
 
-            try out.print(a, "zquant,bits={d}{s},{d},{d:.4},{d},{d},{d},{d:.1}\n", .{
+            try out.print(a, "zquant,bits={d}{s},{d},{d:.4},{d},{d},{d},{d:.1},{d:.1}\n", .{
                 bits,
                 if (calibrated) " +calibrate" else "",
                 index.bytesPerVector(),
@@ -196,8 +215,9 @@ pub fn main() !void {
                 ranks[nq * 9 / 10],
                 ranks[nq - 1],
                 qps,
+                batch_qps,
             });
-            std.debug.print("  bits={d}{s:<12} {d:>3}B  R@10={d:.3}  med={d} p90={d} worst={d}  {d:.0} QPS\n", .{
+            std.debug.print("  bits={d}{s:<12} {d:>3}B  R@10={d:.3}  med={d} p90={d} worst={d}  {d:.0} QPS  {d:.0} batched\n", .{
                 bits,
                 if (calibrated) " +calibrate" else "",
                 index.bytesPerVector(),
@@ -206,6 +226,7 @@ pub fn main() !void {
                 ranks[nq * 9 / 10],
                 ranks[nq - 1],
                 qps,
+                batch_qps,
             });
         }
     }

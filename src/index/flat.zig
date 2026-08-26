@@ -105,6 +105,11 @@ pub const StoredScalars = struct {
     }
 };
 
+/// Largest batch `searchBatch` accepts. Bounded so per-query scratch can live on the
+/// stack; beyond this the query state stops fitting in cache and the amortization the
+/// batch exists for stops paying.
+pub const max_batch: usize = 64;
+
 pub const FlatIndex = struct {
     quantizer: prod_mod.Prod,
     layout: packing.Layout,
@@ -420,6 +425,168 @@ pub const FlatIndex = struct {
             self.* = undefined;
         }
     };
+
+    /// Per-query state for a batch. Same components as `Searcher`, one set per query,
+    /// plus one shared shuffle table.
+    ///
+    /// Sized once and reused: a batch search allocates nothing.
+    pub const BatchSearcher = struct {
+        batch: usize,
+        k: usize,
+        query_states: []prod_mod.QueryState,
+        scan_queries: []scan.Query,
+        sketch_queries: []sketch_kernel.Query,
+        /// `batch * k` entries; query i owns `heap_store[i*k..][0..k]`.
+        heap_store: []Entry,
+        table: scan.Table,
+        workspace: prod_mod.Workspace,
+        allocator: Allocator,
+
+        pub fn init(allocator: Allocator, index: FlatIndex, batch: usize, k: usize) !BatchSearcher {
+            std.debug.assert(batch > 0 and k > 0);
+
+            const query_states = try allocator.alloc(prod_mod.QueryState, batch);
+            errdefer allocator.free(query_states);
+            const scan_queries = try allocator.alloc(scan.Query, batch);
+            errdefer allocator.free(scan_queries);
+            const sketch_queries = try allocator.alloc(sketch_kernel.Query, batch);
+            errdefer allocator.free(sketch_queries);
+
+            var built: usize = 0;
+            errdefer for (0..built) |i| {
+                query_states[i].deinit();
+                scan_queries[i].deinit();
+                sketch_queries[i].deinit();
+            };
+            while (built < batch) : (built += 1) {
+                query_states[built] = try prod_mod.QueryState.init(allocator, index.quantizer);
+                scan_queries[built] = try scan.Query.init(allocator, index.layout);
+                sketch_queries[built] = try sketch_kernel.Query.init(allocator, index.quantizer.padded());
+            }
+
+            const heap_store = try allocator.alloc(Entry, batch * k);
+            errdefer allocator.free(heap_store);
+            var workspace = try prod_mod.Workspace.init(allocator, index.quantizer);
+            errdefer workspace.deinit();
+
+            return .{
+                .batch = batch,
+                .k = k,
+                .query_states = query_states,
+                .scan_queries = scan_queries,
+                .sketch_queries = sketch_queries,
+                .heap_store = heap_store,
+                .table = if (index.vectorized())
+                    scan.Table.init(index.quantizer.mse.codebook.centroids)
+                else
+                    scan.unusedTable(),
+                .workspace = workspace,
+                .allocator = allocator,
+            };
+        }
+
+        pub fn deinit(self: *BatchSearcher) void {
+            for (self.query_states, self.scan_queries, self.sketch_queries) |*a, *b, *c| {
+                a.deinit();
+                b.deinit();
+                c.deinit();
+            }
+            self.workspace.deinit();
+            self.allocator.free(self.heap_store);
+            self.allocator.free(self.sketch_queries);
+            self.allocator.free(self.scan_queries);
+            self.allocator.free(self.query_states);
+            self.* = undefined;
+        }
+    };
+
+    /// Score several queries in one pass over the corpus.
+    ///
+    /// The scan is memory-bound: a vector's codes cost far more to fetch than to
+    /// score. Looping queries *inside* the corpus loop means each vector is read from
+    /// DRAM once and scored `n` times out of L1, so the memory traffic amortizes by
+    /// the batch size. Query state for a batch of 32 at d=256 is about 50 KB, which
+    /// stays resident alongside it.
+    ///
+    /// Returns a flat buffer; query `i`'s results are `result[i*k ..][0..k]`, sorted
+    /// descending. Valid until the next search.
+    pub fn searchBatch(self: *FlatIndex, queries: []const f32, searcher: *BatchSearcher) []Entry {
+        const d = self.dim();
+        std.debug.assert(queries.len % d == 0);
+        const n = queries.len / d;
+        std.debug.assert(n > 0 and n <= searcher.batch);
+
+        const use_simd = self.vectorized();
+
+        // One rotation and one sketch per query, before the corpus is touched.
+        for (0..n) |i| {
+            self.quantizer.prepareQuery(
+                queries[i * d ..][0..d],
+                &searcher.query_states[i],
+                &searcher.workspace,
+            );
+            if (self.calibrated) {
+                for (searcher.query_states[i].rotated, self.scales) |*p, t| p.* *= t;
+            }
+            if (use_simd) {
+                searcher.scan_queries[i].load(searcher.query_states[i].rotated);
+                searcher.sketch_queries[i].load(searcher.query_states[i].sketched);
+            }
+        }
+
+        var collectors: [max_batch]topk.TopK = undefined;
+        for (0..n) |i| {
+            collectors[i] = topk.TopK.init(searcher.heap_store[i * searcher.k ..][0..searcher.k]);
+        }
+
+        const query_norms = blk: {
+            var norms: [max_batch]f32 = undefined;
+            if (self.metric != .inner_product) {
+                for (0..n) |i| norms[i] = euclideanNorm(queries[i * d ..][0..d]);
+            } else {
+                @memset(norms[0..n], 0);
+            }
+            break :blk norms;
+        };
+
+        const stride = self.layout.stride();
+        const sketch_len = self.quantizer.sketchLen();
+        const padded = self.quantizer.padded();
+        const centroids = self.quantizer.mse.codebook.centroids;
+
+        for (self.scalars.items, 0..) |scalars, v| {
+            // Fetched once; the inner loop reads it out of cache.
+            const code_slot = self.codes.items[v * stride ..][0..stride];
+            const sketch_slot = self.sketches.items[v * sketch_len ..][0..sketch_len];
+            const norm: f32 = scalars.norm;
+            const gamma: f32 = scalars.gamma;
+
+            for (0..n) |i| {
+                const mse_term = if (use_simd)
+                    scan.scoreInt8(self.layout, searcher.table, searcher.scan_queries[i], code_slot, padded)
+                else
+                    scan.scoreExact(self.layout, centroids, searcher.query_states[i].rotated, code_slot);
+
+                const estimate = switch (self.correction) {
+                    .scalar => norm * gamma * mse_term,
+                    .qjl_sketch => blk: {
+                        const sketch_term = if (!self.use_sketch)
+                            0
+                        else if (use_simd)
+                            sketch_kernel.signDot(searcher.sketch_queries[i], sketch_slot, padded)
+                        else
+                            sketch_kernel.signDotExact(searcher.query_states[i].sketched, sketch_slot);
+                        break :blk norm * (mse_term + gamma * self.quantizer.sketch_scale * sketch_term);
+                    },
+                };
+                collectors[i].offer(self.score(estimate, norm, query_norms[i]), @intCast(v));
+            }
+        }
+
+        for (0..n) |i| _ = collectors[i].drain();
+        const found = @min(searcher.k, self.count());
+        return searcher.heap_store[0 .. (n - 1) * searcher.k + found];
+    }
 
     /// Top-k search. Results are written into `searcher`'s heap and returned as a
     /// slice into it, valid until the next search.
@@ -1120,4 +1287,87 @@ test "calibrate refuses to run on a non-empty index" {
     const vector = [_]f32{0.25} ** dim;
     _ = try index.add(&vector);
     try testing.expectError(error.IndexNotEmpty, index.calibrate(&vector));
+}
+
+test "batched search agrees with single-query search" {
+    // Same scores, same order, same ids. The batch path reorders the loops for
+    // locality; it must not change a result.
+    const allocator = testing.allocator;
+    const dim: u32 = 128;
+    const n = 800;
+
+    const corpus = try allocator.alloc(f32, n * dim);
+    defer allocator.free(corpus);
+    var prng = std.Random.DefaultPrng.init(0xBA7C);
+    const random = prng.random();
+    for (0..n) |i| randomUnit(corpus[i * dim ..][0..dim], random);
+
+    for ([_]Metric{ .inner_product, .cosine, .l2 }) |metric| {
+        var index = try FlatIndex.init(allocator, .{
+            .dim = dim,
+            .bits = 5,
+            .metric = metric,
+            .seed = 0x5B,
+        });
+        defer index.deinit();
+        try index.addBatch(corpus);
+
+        const batch = 12;
+        const k = 7;
+        var single = try FlatIndex.Searcher.init(allocator, index, k);
+        defer single.deinit();
+        var batched = try FlatIndex.BatchSearcher.init(allocator, index, batch, k);
+        defer batched.deinit();
+
+        const queries = try allocator.alloc(f32, batch * dim);
+        defer allocator.free(queries);
+        for (0..batch) |i| randomUnit(queries[i * dim ..][0..dim], random);
+
+        const grouped = index.searchBatch(queries, &batched);
+        for (0..batch) |i| {
+            const one = index.search(queries[i * dim ..][0..dim], &single);
+            const many = grouped[i * k ..][0..k];
+            try testing.expectEqual(one.len, many.len);
+            for (one, many) |a, b| {
+                try testing.expectEqual(a.id, b.id);
+                try testing.expectEqual(a.score, b.score);
+            }
+        }
+    }
+}
+
+test "batched search handles partial batches and calibration" {
+    const allocator = testing.allocator;
+    const dim: u32 = 64;
+    const n = 300;
+
+    const corpus = try allocator.alloc(f32, n * dim);
+    defer allocator.free(corpus);
+    var prng = std.Random.DefaultPrng.init(5);
+    const random = prng.random();
+    for (0..n) |i| randomUnit(corpus[i * dim ..][0..dim], random);
+
+    var index = try FlatIndex.init(allocator, .{ .dim = dim, .bits = 4, .seed = 1 });
+    defer index.deinit();
+    try index.calibrate(corpus[0 .. 128 * dim]);
+    try index.addBatch(corpus);
+
+    const k = 5;
+    var single = try FlatIndex.Searcher.init(allocator, index, k);
+    defer single.deinit();
+    var batched = try FlatIndex.BatchSearcher.init(allocator, index, 16, k);
+    defer batched.deinit();
+
+    const queries = try allocator.alloc(f32, 16 * dim);
+    defer allocator.free(queries);
+    for (0..16) |i| randomUnit(queries[i * dim ..][0..dim], random);
+
+    // Fewer queries than the searcher was sized for.
+    for ([_]usize{ 1, 3, 16 }) |count| {
+        const grouped = index.searchBatch(queries[0 .. count * dim], &batched);
+        for (0..count) |i| {
+            const one = index.search(queries[i * dim ..][0..dim], &single);
+            for (one, grouped[i * k ..][0..k]) |a, b| try testing.expectEqual(a.id, b.id);
+        }
+    }
 }

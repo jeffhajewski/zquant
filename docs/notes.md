@@ -736,6 +736,39 @@ run dropped from 9.2 to 5.5 GB/s, so the machine is slower right now rather than
 regressed — the *ratio* improved from 17.7× to 26.6×. Worth remembering that absolute throughput
 numbers across sessions are not comparable; ratios measured in the same run are.
 
+### <a name="batch"></a>`HEAD` — batched search, and a claim of mine that was wrong
+
+Added `searchBatch`, which scores several queries in one pass over the corpus so a vector's codes
+are fetched once and scored `n` times. Verified exact agreement with the single-query path across
+all three metrics.
+
+**It gives 1.01×.** Not 5×, not 2× — nothing.
+
+| corpus | single | batched | gain |
+|---|---|---|---|
+| 26 MB | 190.0 | 188.9 | 0.99× |
+| 52 MB | 196.6 | 197.3 | 1.00× |
+| 103 MB | 210.5 | 212.4 | 1.01× |
+
+**That falsifies "the scan is memory-bound", which I had claimed repeatedly** — in DESIGN.md §4.2,
+in the layout-revision commit, and in the scan-kernel notes. It came from dividing throughput by
+corpus size, getting ~21 GB/s, and calling that memory-bound. **A bandwidth figure is not evidence
+of a bandwidth bound.** The test is whether reducing the traffic helps, and it does not: at 103 MB,
+far beyond any cache here, batching 32 queries per pass changes nothing.
+
+So the kernel is **compute-bound**, and the levers are fewer ops per vector or more cores — not
+better locality. Threading should now scale close to linearly, which it would not if memory were
+the constraint.
+
+**A second wrong prediction, worth separating.** I expected batching to explain turbovec's 5.2×
+batched-versus-single advantage. It cannot, since batching does nothing for us. That gap is almost
+certainly Python FFI call overhead amortized across 1000 calls — not a kernel property. The
+comparison that matters is single-query against single-query: **6,072 QPS for turbovec against
+1,381 for us**, a real 4.4× that batching will not close.
+
+`searchBatch` is kept anyway: it is a natural API, it is correct, and it is the right shape to
+parallelize over. But it was built on a mistaken premise and did not deliver what it was built for.
+
 ---
 
 ## Open items for P1

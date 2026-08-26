@@ -104,6 +104,33 @@ pub fn main() !void {
         const par_ns = t.read();
 
         const qps = @as(f64, @floatFromInt(nq)) / (@as(f64,@floatFromInt(search_ns))/1e9);
+        const qps_single = qps;
+
+        // Thread-count sweep, to separate "our scaling is poor" from "this machine has
+        // 4 performance and 6 efficiency cores"., to separate "our scaling is poor" from "this machine has
+        // 4 performance and 6 efficiency cores".
+        if (bits == 5) {
+            std.debug.print("  thread sweep at bits=5:\n", .{});
+            for ([_]usize{ 1, 2, 4, 6, 8, 10 }) |tc| {
+                var sweep = try zq.flat.FlatIndex.ParallelSearcher.init(a, index, tc, 32, k);
+                defer sweep.deinit();
+                _ = try index.searchBatchParallel(queries[0 .. 32 * dim], &sweep);
+                var st = Timer.start();
+                var off: usize = 0;
+                const chunk = tc * 32;
+                while (off < nq) : (off += chunk) {
+                    const take = @min(chunk, nq - off);
+                    std.mem.doNotOptimizeAway(
+                        try index.searchBatchParallel(queries[off * dim ..][0 .. take * dim], &sweep),
+                    );
+                }
+                const ns = st.read();
+                const tq = @as(f64, @floatFromInt(nq)) / (@as(f64, @floatFromInt(ns)) / 1e9);
+                std.debug.print("    {d:>2} threads: {d:>8.0} QPS  {d:>5.2}x\n",
+                    .{ tc, tq, tq / qps_single });
+            }
+        }
+
         const corpus_mb = @as(f64, @floatFromInt(n * index.bytesPerVector())) / 1e6;
         const par_qps = @as(f64, @floatFromInt(nq)) / (@as(f64, @floatFromInt(par_ns)) / 1e9);
         std.debug.print("{d:>5} {d:>8} {d:>6.0}MB {d:>9.1} {d:>9.1} {d:>8.0} {d:>6.1}x {d:>7.3}\n", .{

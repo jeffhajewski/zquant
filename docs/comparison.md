@@ -255,13 +255,17 @@ it was caught.
   Higher dimensions (768–3072), where the design's assumptions are strongest, remain
   unrun.
 - Results differ substantially between the two, so neither generalizes on its own.
-- **QPS across systems needs core accounting, not wall time.** turbovec is internally
-  multithreaded even when handed one query at a time — 7.6 cores busy, measured with
-  `process_time` against `perf_counter`. Per core on nytimes at 132 B: zquant **2,024**,
-  turbovec **4,048** batched. So roughly **2× behind per core**, not the 4× a naive
-  wall-time comparison suggested. In absolute terms turbovec reaches 38,052 QPS on 9.4
-  cores against our 11,790 on 10 threads (5.8× effective), so the remaining gap is as
-  much scaling as per-core efficiency.
+- **Throughput and storage are one tradeoff, not two axes.** turbovec keeps **270 B per
+  vector resident** at `bit_width=4` on nytimes — twice what it serializes (135 B), and
+  twice zquant's 132 B. The in-memory form is dequantized int8, which removes the table
+  lookup and lets its kernel run near-pure `sdot`. So on a full machine turbovec reaches
+  38,052 QPS at 270 B/vector against zquant's 11,790 at 132 B/vector, at R@10 0.914 and
+  0.917 respectively — **different points on the space/time curve**, not a like-for-like
+  deficit. An earlier version of this document compared their *serialized* size against
+  our *resident* size and drew the wrong conclusion.
+- Per-core comparisons are ill-defined here: this machine has 4 performance and 6
+  efficiency cores, and zquant scales at 96% efficiency across the four performance cores
+  before flattening. Quote full-machine throughput alongside residency instead.
 
 ## Reproducing
 

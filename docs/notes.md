@@ -855,6 +855,52 @@ Note also that turbovec's per-core rate is 5.4× worse one-at-a-time than batche
 against the one-at-a-time figure flattered us in the other direction. **Cross-language throughput
 comparisons need core accounting, not just wall time.**
 
+### <a name="scaling"></a>`HEAD` — thread scaling, and the storage comparison was measuring the wrong thing
+
+**Thread scaling is not the problem.** A sweep separates our implementation from the machine:
+
+| threads | QPS | speedup | efficiency |
+|---|---|---|---|
+| 1 | 323 | 0.99× | — |
+| 2 | 630 | 1.93× | 96% |
+| **4** | **1249** | **3.83×** | **96%** |
+| 6 | 1531 | 4.69× | 78% |
+| 10 | 1929 | 5.92× | 59% |
+
+96% efficiency across all four cores, then flattening exactly as threads spill onto the six
+efficiency cores (`hw.perflevel0/1` = 4P + 6E). The 5.8× I called a scaling deficit is close to this
+machine's ceiling. My hypothesis — static partitioning causing load imbalance on heterogeneous
+cores — was wrong, and the sweep cost less than implementing the work-stealing fix would have.
+
+### The storage comparison was measuring the wrong number
+
+turbovec's throughput implied ~3.8 billion vector-scans/s, roughly 100% of theoretical `sdot` peak
+— meaning it issues almost nothing *but* `sdot`, with no unpacking. Two checks explain how:
+
+- **Not pruning.** QPS falls 1.87× per corpus doubling, so it is a genuine full scan.
+- **Storing dequantized bytes in memory.** At `bit_width=4`, d=256:
+
+| | per vector | bits/coord |
+|---|---|---|
+| serialized (`to_bytes`) | 135 B | 4.22 |
+| **resident (RSS delta)** | **270 B** | **8.44** |
+
+**I had been comparing their serialized size against our in-memory size.** At equal residency the
+picture inverts: zquant holds **132 B/vector at R@10 0.917**, turbovec **270 B at 0.914**. Half the
+memory for marginally better recall.
+
+Their speed advantage is therefore a deliberate **2× space-for-time trade** — dequantized int8 needs
+no `tbl`, so the kernel is pure `sdot` — not a better kernel. That is a legitimate design choice and
+an option we could offer too: an expanded in-memory layout for callers who want throughput over
+footprint. It is not evidence that our scan is 3× worse.
+
+**Three framings of this comparison were wrong in a row**, each corrected by measurement: "4× behind
+per core" (assumed their single-query path was single-threaded — it uses 7.6 cores), then "2× behind
+per core" (per-core is ill-defined on 4P+6E), and now the storage baseline itself. The honest
+end-to-end statement is the one that needs no per-core inference: **on a full machine, turbovec
+reaches 38,052 QPS at 270 B/vector and zquant 11,790 at 132 B/vector.** Different points on the
+space/time curve, not a like-for-like deficit.
+
 ---
 
 ## Open items for P1

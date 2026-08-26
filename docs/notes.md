@@ -935,18 +935,40 @@ codes is real work, not hidden work.
 The end-to-end measurement was not wrong — the index's slow `bits=4` configuration is exactly the
 bit-plane path, and the two agree. What was wrong was generalizing one number across both layouts.
 
-**A second correction falls out of the same measurement.** I had said per-vector index overhead
-dominates, at "~13 of 17 cycles". The kernel alone is **11.5 cycles** at d=256, so the overhead is
-~5.8 cycles — about **34%**, real but not dominant. And at 16 `sdot`s per 11.5 cycles the kernel
-runs at **1.39 sdot/cycle** against turbovec's ~1.7, so the kernel gap is ~1.2×, not the ~1.8× that
-whole-system accounting suggested.
-
-Two concrete targets now, both measured rather than guessed: **the bit-plane unpack (4×)** and
-**index per-vector overhead (34%)**.
-
 **Method note.** An end-to-end benchmark can only bound the sum of its parts. Attributing a null
 result to one part requires isolating that part, and doing so here reversed the conclusion for half
 the configurations.
+
+### <a name="noise"></a>Benchmark noise, and a retracted number
+
+Following up on this produced a worse problem. I claimed index per-vector overhead was "~34%",
+derived by comparing a kernel timing against an index timing **from a different run**. Checking the
+run-to-run spread on the same binary:
+
+| run | packed | expanded | ratio |
+|---|---|---|---|
+| 1 | 4.60 | 4.02 | 1.14× |
+| 2 | 5.61 | 3.67 | **1.53×** |
+| 3 | 4.76 | 4.71 | **1.01×** |
+| 4 | 6.04 | 4.05 | 1.49× |
+
+**The same ratio measured anywhere from 1.01× to 1.53× across four identical runs.** The "34%
+overhead" was a cross-run subtraction and is **retracted** — it is not distinguishable from noise.
+The single-sample "0.97×" and "1.13×" ratios in the table above were also inside that spread.
+
+`bench/kernel_bench.zig` now reports the **minimum of seven trials** with the spread alongside.
+Minimum is the right estimator here because noise only ever adds time — scheduling, frequency,
+eviction — so the fastest observation is the least contaminated. With that:
+
+| codebook bits | packing | packed | expanded | ratio |
+|---|---|---|---|---|
+| 2 | sequential | 6.64 (+49%) | 7.28 (+88%) | 0.91× |
+| **3** | **bit-plane** | **15.06** | **3.47** | **4.34×** |
+| 4 | sequential | 4.34 (+25%) | 4.36 (+33%) | 1.00× |
+
+The conclusion survives — sequential unpacking is free, bit-plane costs ~4× — because that gap is
+far outside the spread. Effects smaller than about 1.3× on this machine need min-of-N to see at
+all, and several numbers earlier in this log were single samples that did not clear that bar.
 
 The option is kept, documented as not recommended, because being able to re-run the comparison is
 worth more than the API surface costs.

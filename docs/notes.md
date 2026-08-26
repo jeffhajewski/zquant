@@ -806,6 +806,55 @@ Threading closes the gap against turbovec's *single-query* rate but not against 
 honest reading is that we remain **roughly 4× behind per core**, and that is now the clearest
 remaining deficit — recall is competitive, per-core speed is not.
 
+### <a name="sdot"></a>`HEAD` — SDOT, and a per-core comparison that was wrong
+
+**Profiling first, since the last two guesses about this kernel were both wrong.** The scan was
+running at **IPC 4.0** — essentially peak. It was not executing slowly, it was executing too many
+instructions: accumulating through i16 costs `smlal`, `smlal2` and two `saddw` per 16 products,
+where `SDOT` does the same work in one and accumulates straight into i32, with no overflow ceiling
+to pair chunks around.
+
+LLVM will not emit `SDOT` from the natural formulation — the 4-way grouping lowers to scalar `umov`
+extraction — so `simd/dot.zig` is inline assembly, for the same reason `simd/shuffle.zig` is.
+
+**Two attempts, and the first was a regression:**
+
+| | scan | note |
+|---|---|---|
+| i16 accumulate (before) | 35.9M vec/s | |
+| SDOT, one accumulator | 43.0M | +20%, but IPC fell 4.0 → 2.8 |
+| SDOT, runtime-indexed accumulators | **24.7M** | **−42%** |
+| SDOT, comptime-indexed accumulators | **67.9M** | **+89%** |
+
+Fewer instructions exposed a **dependency chain**: every `sdot` reads the accumulator it writes, so
+one register serialized the loop at multi-cycle latency. Independent accumulators fix it — but only
+if the slot is a *comptime* index. Selecting it with `(ch * groups + k) % accumulators` spilled the
+accumulators to the stack and cost 42%. One accumulator per bit-field group (comptime `k`) keeps
+them in registers.
+
+End to end: index throughput at d=1024 rose 214.7 → 325.6 QPS single-thread, and on nytimes
+1,467 → 2,024.
+
+### The per-core comparison was wrong in our favour
+
+I had reported turbovec as **4.1× ahead per core**, from its 6,072 QPS "one query at a time" against
+our 1,467. That assumed one query at a time meant one thread. It does not:
+
+| | QPS | cores busy | QPS/core |
+|---|---|---|---|
+| turbovec, one-at-a-time | 5,672 | 7.6 | 746 |
+| turbovec, batched | 38,052 | 9.4 | 4,048 |
+| zquant, 1 thread | 2,024 | 1.0 | **2,024** |
+
+Measured with `process_time` against `perf_counter`. So we are **~2× behind per core**, not 4×, and
+the absolute gap (38,052 against our 11,790) is as much a *scaling* problem as an efficiency one —
+they saturate 9.4 of 10 cores where our 10 threads deliver 5.8× effective.
+
+Note also that turbovec's per-core rate is 5.4× worse one-at-a-time than batched (746 against
+4,048), which is the Python FFI overhead showing up as busy cores rather than useful work. Comparing
+against the one-at-a-time figure flattered us in the other direction. **Cross-language throughput
+comparisons need core accounting, not just wall time.**
+
 ---
 
 ## Open items for P1

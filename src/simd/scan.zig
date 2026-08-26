@@ -32,6 +32,7 @@ const packing = @import("../quant/packing.zig");
 const Layout = packing.Layout;
 const bitmask = @import("bitmask.zig");
 const shuffle = @import("shuffle.zig");
+const dot = @import("dot.zig");
 
 /// The 16 centroids, quantized to int8. Query-independent, built once per index.
 pub const Table = struct {
@@ -59,6 +60,10 @@ pub const Table = struct {
         return .{ .values = values, .scale = scale };
     }
 };
+
+/// Independent accumulator registers, enough to cover `sdot` latency without
+/// exhausting the register file.
+const accumulators = 4;
 
 /// Placeholder for indexes that will not take the vectorized path, so callers need
 /// not make the field optional. Never read: the scalar scan does not consult it.
@@ -145,29 +150,27 @@ fn scoreBits(comptime bits: u6, table: Table, query: Query, codes: []const u8, d
     const field_mask: @Vector(16, u8) = @splat(mask_value);
 
     const chunks = @as(usize, dim) * bits / 128;
-    var acc: @Vector(16, i32) = @splat(0);
+
+    // One accumulator per bit-field group. `sdot` has multi-cycle latency and reads
+    // the accumulator it writes, so a single register serializes the loop. The slot
+    // must be a *comptime* index: selecting it with a runtime expression spills the
+    // accumulators to the stack and cost 42% when tried.
+    var acc: [groups]dot.Acc = @splat(@splat(0));
 
     for (0..chunks) |ch| {
         const packed_codes: @Vector(16, u8) = codes[ch * 16 ..][0..16].*;
-
-        comptime var pair: usize = 0;
-        inline while (pair < groups / 2) : (pair += 1) {
-            var chunk_acc: @Vector(16, i16) = @splat(0);
-            inline for (0..2) |half| {
-                const k = pair * 2 + half;
-                const shift: @Vector(16, u3) = @splat(@intCast(k * bits));
-                const idx = (packed_codes >> shift) & field_mask;
-                const w: @Vector(16, i8) =
-                    query.data[k * query.stride + ch * 16 ..][0..16].*;
-                chunk_acc +%= @as(@Vector(16, i16), lookup(table.values, idx)) *%
-                    @as(@Vector(16, i16), w);
-            }
-            acc += @as(@Vector(16, i32), chunk_acc);
+        inline for (0..groups) |k| {
+            const shift: @Vector(16, u3) = @splat(@intCast(k * bits));
+            const idx = (packed_codes >> shift) & field_mask;
+            const w: @Vector(16, i8) = query.data[k * query.stride + ch * 16 ..][0..16].*;
+            acc[k] = dot.accumulate(acc[k], lookup(table.values, idx), w);
         }
     }
 
-    const total: f32 = @floatFromInt(@reduce(.Add, acc));
-    return total * table.scale * query.scale;
+    var folded: dot.Acc = acc[0];
+    inline for (1..groups) |i| folded += acc[i];
+    const sum: f32 = @floatFromInt(dot.total(folded));
+    return sum * table.scale * query.scale;
 }
 
 /// Assemble 16 code indices from `bits` bit-planes.
@@ -187,25 +190,27 @@ inline fn planeIndex(comptime bits: u6, planes: []const u8) @Vector(16, u8) {
 fn scorePlanes(comptime bits: u6, table: Table, query: Query, codes: []const u8, dim: u32) f32 {
     const group_bytes = comptime @as(usize, bits) * (packing.plane_group / 8);
     const groups = dim / packing.plane_group;
-    var acc: @Vector(16, i32) = @splat(0);
+    var acc: [accumulators]dot.Acc = @splat(@splat(0));
 
-    // Two groups per i16 batch, for the same reason as the sequential kernel: two
-    // products reach 32258, just inside i16.
+    // Unrolled so the accumulator index is comptime; a runtime index spills them.
     var g: usize = 0;
-    while (g + 2 <= groups) : (g += 2) {
-        var chunk: @Vector(16, i16) = @splat(0);
-        inline for (0..2) |half| {
-            const gi = g + half;
-            const idx = planeIndex(bits, codes[gi * group_bytes ..][0..group_bytes]);
-            const w: @Vector(16, i8) = query.data[gi * 16 ..][0..16].*;
-            chunk +%= @as(@Vector(16, i16), lookup(table.values, idx)) *%
-                @as(@Vector(16, i16), w);
+    while (g + accumulators <= groups) : (g += accumulators) {
+        inline for (0..accumulators) |u| {
+            const idx = planeIndex(bits, codes[(g + u) * group_bytes ..][0..group_bytes]);
+            const w: @Vector(16, i8) = query.data[(g + u) * 16 ..][0..16].*;
+            acc[u] = dot.accumulate(acc[u], lookup(table.values, idx), w);
         }
-        acc += @as(@Vector(16, i32), chunk);
+    }
+    while (g < groups) : (g += 1) {
+        const idx = planeIndex(bits, codes[g * group_bytes ..][0..group_bytes]);
+        const w: @Vector(16, i8) = query.data[g * 16 ..][0..16].*;
+        acc[0] = dot.accumulate(acc[0], lookup(table.values, idx), w);
     }
 
-    const total: f32 = @floatFromInt(@reduce(.Add, acc));
-    return total * table.scale * query.scale;
+    var folded: dot.Acc = acc[0];
+    inline for (1..accumulators) |i| folded += acc[i];
+    const sum: f32 = @floatFromInt(dot.total(folded));
+    return sum * table.scale * query.scale;
 }
 
 /// Vectorized score. `bits` must satisfy `canVectorize`.

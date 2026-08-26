@@ -43,7 +43,7 @@ pub fn build(b: *std.Build) void {
     ) orelse .ReleaseFast;
 
     const bench_step = b.step("bench", "Run all benchmarks");
-    for ([_][]const u8{ "encode_bench", "scan_bench", "recall_bench", "index_bench", "sift_bench", "sift_verify" }) |name| {
+    for ([_][]const u8{ "encode_bench", "scan_bench", "recall_bench", "index_bench", "sift_bench", "sift_verify", "compare_bench", "diagnose" }) |name| {
         const exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{

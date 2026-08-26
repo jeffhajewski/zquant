@@ -37,7 +37,10 @@ assumed: the distortion bound constant is `√3·π/2 = 2.7207` (not `√(3π)/2
 orthogonal QJL sketch gives exact rather than asymptotic normalization plus ~2.7×
 lower inner-product distortion. See [docs/DESIGN.md](docs/DESIGN.md) §1.2.
 
-Next: P1 — SIMD kernels, blocked layout, flat index, benchmarks.
+See [docs/comparison.md](docs/comparison.md) for the measured comparison against FAISS PQ,
+FAISS RaBitQ, and turbovec. zquant currently **loses at every matched storage budget**;
+the gap is localized to the estimator and the quantizer itself measures at theoretical
+optimum.
 
 ## Building
 

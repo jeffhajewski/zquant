@@ -54,6 +54,15 @@ pub const Params = struct {
     /// adds bounded query-side error (docs/DESIGN.md §4.2) and is the default only
     /// because that error is measured; this is the escape hatch.
     exact_scan: bool = false,
+    /// Include the QJL residual sketch in the score.
+    ///
+    /// The sketch makes the inner-product estimate *unbiased*, which is what
+    /// `prod` exists for. But the bias it removes is multiplicative and essentially
+    /// constant across vectors, and a constant factor does not change a ranking —
+    /// so for top-k search the correction may buy nothing while costing a bit per
+    /// coordinate and adding variance. Exposed so that can be measured rather than
+    /// argued about.
+    use_sketch: bool = true,
 };
 
 /// Half-precision per-vector scalars. See the field comment on `FlatIndex.scalars`.
@@ -71,6 +80,7 @@ pub const FlatIndex = struct {
     layout: packing.Layout,
     metric: Metric,
     exact_scan: bool,
+    use_sketch: bool,
 
     /// Packed codes, `layout.stride()` bytes per vector.
     codes: std.ArrayList(u8),
@@ -112,6 +122,7 @@ pub const FlatIndex = struct {
             .layout = packing.Layout.init(quantizer.padded(), quantizer.mse.bits),
             .metric = params.metric,
             .exact_scan = params.exact_scan,
+            .use_sketch = params.use_sketch,
             .codes = .empty,
             .sketches = .empty,
             .scalars = .empty,
@@ -152,12 +163,14 @@ pub const FlatIndex = struct {
     /// Includes them deliberately: an earlier version reported only codes and
     /// sketch, which overstated the compression ratio by 11% at d=128.
     pub fn bytesPerVector(self: FlatIndex) usize {
-        return self.layout.stride() + self.quantizer.sketchLen() + @sizeOf(StoredScalars);
+        return self.codeBytesPerVector() + @sizeOf(StoredScalars);
     }
 
     /// Bytes of codes and sketch only — the part that scales with the bit budget.
+    /// With the sketch disabled its storage is not counted, because it is not read.
     pub fn codeBytesPerVector(self: FlatIndex) usize {
-        return self.layout.stride() + self.quantizer.sketchLen();
+        const sketch_bytes = if (self.use_sketch) self.quantizer.sketchLen() else 0;
+        return self.layout.stride() + sketch_bytes;
     }
 
     pub fn reserve(self: *FlatIndex, additional: usize) !void {
@@ -190,6 +203,7 @@ pub const FlatIndex = struct {
 
         const scalars = self.quantizer.encode(vector, scratch, sketch_slot, &self.workspace);
         self.layout.pack(scratch, codes_slot);
+
 
         try self.scalars.append(self.allocator, StoredScalars.from(scalars));
         return @intCast(self.scalars.items.len - 1);
@@ -288,7 +302,9 @@ pub const FlatIndex = struct {
             else
                 scan.scoreExact(self.layout, centroids, searcher.query_state.rotated, code_slot);
 
-            const sketch_term = if (use_simd)
+            const sketch_term = if (!self.use_sketch)
+                0
+            else if (use_simd)
                 sketch_kernel.signDot(searcher.sketch_query, sketch_slot, padded)
             else
                 sketch_kernel.signDotExact(searcher.query_state.sketched, sketch_slot);

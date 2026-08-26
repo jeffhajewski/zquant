@@ -23,7 +23,10 @@ for r in rows:
 
 print()
 print("Best R@10 within each storage band:")
-bands = [(0, 25), (25, 40), (40, 56), (56, 72), (72, 90)]
+# Bands span the whole measured range; an earlier list stopped at 90 B and hid the
+# budgets where zquant leads.
+bands = [(0, 25), (25, 40), (40, 56), (56, 72), (72, 90),
+         (90, 110), (110, 140), (140, 200)]
 for lo, hi in bands:
     inb = [r for r in rows if lo <= r["bytes_per_vector"] < hi]
     if not inb:

@@ -13,7 +13,7 @@ import numpy as np
 import faiss
 import turbovec
 
-DATA = "data/sift-norm"
+DATA = "data/" + open("data/dataset.txt").read().strip()
 K = 10
 # Retrieve deeper than K so the true-NN rank distribution is not censored at K:
 # with RETRIEVE == K, "worst rank = 10" only ever means "absent", which hides how

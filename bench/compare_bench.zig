@@ -12,7 +12,7 @@ const Timer = @import("timer.zig").Timer;
 const K = 10;
 /// Retrieve deeper than K so the true-NN rank distribution is not censored at K.
 const RETRIEVE = 100;
-const DATA = "data/sift-norm";
+
 
 fn readFvecs(a: std.mem.Allocator, io: std.Io, path: []const u8) !struct { data: []f32, dim: u32, count: usize } {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 31));
@@ -47,14 +47,32 @@ pub fn main() !void {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const base = readFvecs(a, io, DATA ++ "/base.fvecs") catch |e| {
-        std.debug.print("missing {s} ({s}) — run bench/py/prepare.py\n", .{ DATA, @errorName(e) });
+    // Which corpus to run is written by bench/py/prepare.py, so the Zig and Python
+    // arms cannot drift onto different data.
+    const name_raw = std.Io.Dir.cwd().readFileAlloc(io, "data/dataset.txt", a, .limited(256)) catch |e| {
+        std.debug.print("no data/dataset.txt ({s}) — run bench/py/prepare.py first\n", .{@errorName(e)});
+        return;
+    };
+    defer a.free(name_raw);
+    const name = std.mem.trim(u8, name_raw, " \n\r\t");
+
+    const dir = try std.fmt.allocPrint(a, "data/{s}", .{name});
+    defer a.free(dir);
+    const base_path = try std.fmt.allocPrint(a, "{s}/base.fvecs", .{dir});
+    defer a.free(base_path);
+    const query_path = try std.fmt.allocPrint(a, "{s}/query.fvecs", .{dir});
+    defer a.free(query_path);
+    const truth_path = try std.fmt.allocPrint(a, "{s}/groundtruth.ivecs", .{dir});
+    defer a.free(truth_path);
+
+    const base = readFvecs(a, io, base_path) catch |e| {
+        std.debug.print("missing {s} ({s}) — run bench/py/prepare.py\n", .{ dir, @errorName(e) });
         return;
     };
     defer a.free(base.data);
-    const queries = try readFvecs(a, io, DATA ++ "/query.fvecs");
+    const queries = try readFvecs(a, io, query_path);
     defer a.free(queries.data);
-    const truth = try readIvecs(a, io, DATA ++ "/groundtruth.ivecs");
+    const truth = try readIvecs(a, io, truth_path);
     defer a.free(truth.data);
 
     const d = base.dim;
@@ -64,7 +82,7 @@ pub fn main() !void {
     defer out.deinit(a);
     try out.appendSlice(a, "system,config,bytes_per_vector,recall_at_10,rank_median,rank_p90,rank_worst,qps\n");
 
-    std.debug.print("zquant on {s}: {d}x{d}, {d} queries, k={d}\n", .{ DATA, base.count, d, nq, K });
+    std.debug.print("zquant on {s}: {d}x{d}, {d} queries, k={d}\n", .{ dir, base.count, d, nq, K });
 
     // Control: an exact unquantized scan through this same harness must score 1.000.
     // Anything less means the harness disagrees with the ground truth, and every

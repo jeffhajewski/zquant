@@ -1,20 +1,61 @@
-# Competitive comparison — SIFT10K
+# Competitive comparison
 
 The P1 acceptance criterion: run PQ, RaBitQ, and turbovec **ourselves, on our hardware,
 in our harness**, rather than quoting published numbers.
 
-**Where it stands.** The first pass lost every storage band, several by wide margins.
-After two changes — a per-vector scalar in place of the paper's 1-bit sketch, and a
-fitted per-coordinate scale — zquant now:
+**Where it stands, and it depends on the corpus.**
 
-- **wins the 40–56 B band outright** (0.776, nothing else competes there)
-- **beats turbovec's 3-bit mode by 11.3 points** uncalibrated, 6.2 calibrated
-- **edges turbovec's uncalibrated 4-bit** (0.883 against 0.880) at 68 B
+On **real text embeddings** (nytimes-256, d=256) zquant **wins the two highest storage
+bands outright**, including beating turbovec's best configuration at identical storage.
+On **SIFT10K** (d=128 image descriptors) it wins one middle band and trails at the
+extremes.
 
-It still trails **turbovec's calibrated 4-bit by 2.1 points**, and trails badly below
-40 B, where product quantization's vector codebooks beat any scalar scheme.
+That difference is the most important result here. The first pass lost every band on
+SIFT, and it would have been easy to conclude the implementation was simply behind.
+Testing at a realistic embedding dimension — which is what the library actually targets
+— showed a materially different position.
 
-Not yet competitive across the board. The low-bit regime is the open weakness.
+Two changes got there: a per-vector scalar in place of the paper's 1-bit sketch, and a
+fitted per-coordinate scale.
+
+## nytimes-256 — real text embeddings, d=256
+
+100,000 × 256 sampled from the ann-benchmarks corpus, 1000 queries, exact
+inner-product ground truth. **Recall ceilings at 0.993**, not 1.0: the corpus contains
+6,837 duplicate rows, and every top-10 disagreement between an exact f32 scan and the
+ground truth is an exact boundary tie. All systems face the same ceiling.
+
+| system | config | B/vec | R@10 |
+|---|---|---|---|
+| FAISS PQ | M=16,nbits=8 | 16 | 0.393 |
+| zquant | bits=2 | 36 | 0.530 |
+| FAISS PQ | M=32,nbits=8 | 32 | **0.563** |
+| FAISS RaBitQ | qb=5 | 40 | 0.537 |
+| zquant | bits=3 | 68 | 0.732 |
+| turbovec | bits=2 +calibrate | 68 | 0.743 |
+| FAISS PQ | M=64,nbits=8 | 64 | **0.752** |
+| **zquant** | **bits=4 +calibrate** | **100** | **0.853** |
+| turbovec | bits=3 +calibrate | 132 | 0.850 |
+| turbovec | bits=4 +calibrate | 132 | 0.914 |
+| **zquant** | **bits=5 +calibrate** | **132** | **0.917** |
+
+| band | winner | zquant | gap |
+|---|---|---|---|
+| 25–40 B | FAISS PQ 0.563 | 0.530 | −0.033 |
+| 56–72 B | FAISS PQ 0.752 | 0.732 | −0.020 |
+| **90–110 B** | **zquant 0.853** | — | **wins** |
+| **110–140 B** | **zquant 0.917** | — | **wins** |
+
+At 132 B zquant beats turbovec's *best* configuration (0.917 against 0.914) and its
+3-bit mode by 6.7 points.
+
+**Calibration is worth almost nothing on this corpus** — +0.2 points for zquant, +0.02
+for turbovec — against +1.4 and +8.1 respectively on SIFT. The anisotropy it exploits is
+a property of the data, not of the method, and nytimes does not have much of it. That
+also corroborates that our calibration captures the same structure theirs does; the SIFT
+low-bit gap is specific to that corpus rather than a general deficiency.
+
+## SIFT10K — image descriptors, d=128
 
 ## Setup
 
@@ -209,8 +250,11 @@ it was caught.
 
 ## Caveats
 
-- One corpus, 10k vectors. SIFT10K is easier than SIFT1M and is not an embedding model's
-  output. GloVe and DBpedia-OpenAI remain unrun.
+- Two corpora. SIFT10K is 10k vectors of image descriptors — easier than SIFT1M and not
+  an embedding model's output. nytimes-256 is real text embeddings but sampled to 100k.
+  Higher dimensions (768–3072), where the design's assumptions are strongest, remain
+  unrun.
+- Results differ substantially between the two, so neither generalizes on its own.
 - QPS is not comparable across systems here: turbovec and FAISS batch all 100 queries in
   one call, zquant loops one at a time.
 
@@ -218,7 +262,8 @@ it was caught.
 
 ```sh
 tools/fetch_datasets.sh
-python bench/py/prepare.py         # normalize + exact IP ground truth
+python bench/py/prepare.py                 # SIFT10K
+python bench/py/prepare.py nytimes-256     # or an ann-benchmarks HDF5
 python bench/py/baselines.py       # PQ, RaBitQ, turbovec  -> data/baselines.csv
 zig build compare_bench            # zquant                -> data/zquant.csv
 python bench/py/compare.py         # merged table

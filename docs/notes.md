@@ -901,6 +901,40 @@ end-to-end statement is the one that needs no per-core inference: **on a full ma
 reaches 38,052 QPS at 270 B/vector and zquant 11,790 at 132 B/vector.** Different points on the
 space/time curve, not a like-for-like deficit.
 
+### <a name="expanded"></a>`HEAD` — expanded residency: a measured negative
+
+Built the space/time trade turbovec makes — dequantize to int8 at insert so the scan needs no table
+lookup — expecting roughly 2× throughput for roughly 2× memory. Verified bit-identical to the
+compact path first, so the timings mean something.
+
+**It buys nothing.** nytimes, d=256, QPS single thread:
+
+| bits | compact | expanded | |
+|---|---|---|---|
+| 2 | 1848 @ 36 B | 1881 @ 260 B | no gain, 7× memory |
+| 3 | 1977 @ 68 B | 1904 @ 260 B | *slower* |
+| 4 | 668 @ 100 B | 1911 @ 260 B | 2.9× — the bit-plane path |
+| 5 | **1921 @ 132 B** | 1883 @ 260 B | no gain, 2× memory |
+
+**Our `tbl` unpacking is free.** It issues alongside the `sdot`s rather than competing with them, so
+deleting it frees no cycles. `bits=5 compact` dominates every expanded configuration on memory,
+speed, and recall simultaneously.
+
+That reframes the earlier finding once more. turbovec spending 2× memory to remove unpacking is a
+trade **we do not need to make** — not a trade we were losing. Their remaining per-core advantage
+(~1.8× by MAC-rate accounting: 1.7 `sdot`/cycle/core against our 0.93) is therefore elsewhere, and
+since expanded rules out instruction count, the most likely candidate is per-vector overhead —
+scalar loads, the estimate, and the top-k offer, which at ~17 cycles/vector dwarf the ~4 cycles of
+`sdot` at d=256.
+
+The option is kept, documented as not recommended, because being able to re-run the comparison is
+worth more than the API surface costs.
+
+**A bug this caught, twice over.** Building the int8 table in `FlatIndex.init` overran a 16-entry
+array for `bits > 5` — the identical mistake to the `Searcher.init` overrun from earlier. The
+regression test written for *that* one caught *this* one immediately, which is the clearest argument
+so far for writing the test rather than just the fix.
+
 ---
 
 ## Open items for P1

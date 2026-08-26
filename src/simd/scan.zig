@@ -92,6 +92,17 @@ pub const Query = struct {
     /// `groups` follows the layout: a sequential layout interleaves the query by
     /// `8/bits`, while a bit-plane layout stores 16 consecutive dimensions per group
     /// and needs no interleaving at all.
+    /// A query in plain dimension order, for the expanded residency.
+    pub fn initSequential(allocator: Allocator, dim: u32) Allocator.Error!Query {
+        return .{
+            .data = try allocator.alloc(i8, dim),
+            .groups = 1,
+            .stride = dim,
+            .scale = 1.0,
+            .allocator = allocator,
+        };
+    }
+
     pub fn init(allocator: Allocator, layout: Layout) Allocator.Error!Query {
         const dim = layout.dim;
         const groups: usize = switch (layout.kind()) {
@@ -211,6 +222,42 @@ fn scorePlanes(comptime bits: u6, table: Table, query: Query, codes: []const u8,
     inline for (1..accumulators) |i| folded += acc[i];
     const sum: f32 = @floatFromInt(dot.total(folded));
     return sum * table.scale * query.scale;
+}
+
+/// Score against codes already dequantized to int8, one byte per coordinate.
+///
+/// No unpacking and no table lookup: the loop is loads and `sdot`. That is the whole
+/// point of the expanded residency — it spends about twice the memory of packed codes
+/// to remove roughly half the instructions.
+///
+/// `query` must be built with `Query.initSequential`, since expanded values are stored
+/// in plain dimension order rather than interleaved by bit-field.
+pub fn scoreExpanded(values: []const i8, query: Query, table_scale: f32, dim: u32) f32 {
+    std.debug.assert(query.groups == 1);
+    std.debug.assert(values.len >= dim);
+    std.debug.assert(dim % 16 == 0);
+
+    var acc: [accumulators]dot.Acc = @splat(@splat(0));
+    const chunks = dim / 16;
+
+    var ch: usize = 0;
+    while (ch + accumulators <= chunks) : (ch += accumulators) {
+        inline for (0..accumulators) |u| {
+            const c: @Vector(16, i8) = values[(ch + u) * 16 ..][0..16].*;
+            const w: @Vector(16, i8) = query.data[(ch + u) * 16 ..][0..16].*;
+            acc[u] = dot.accumulate(acc[u], c, w);
+        }
+    }
+    while (ch < chunks) : (ch += 1) {
+        const c: @Vector(16, i8) = values[ch * 16 ..][0..16].*;
+        const w: @Vector(16, i8) = query.data[ch * 16 ..][0..16].*;
+        acc[0] = dot.accumulate(acc[0], c, w);
+    }
+
+    var folded: dot.Acc = acc[0];
+    inline for (1..accumulators) |i| folded += acc[i];
+    const sum: f32 = @floatFromInt(dot.total(folded));
+    return sum * table_scale * query.scale;
 }
 
 /// Vectorized score. `bits` must satisfy `canVectorize`.

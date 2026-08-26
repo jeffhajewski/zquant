@@ -71,6 +71,42 @@ pub const Correction = enum {
     scalar,
 };
 
+/// How codes are held in memory.
+///
+/// **Measured conclusion: `.compact` is the right default and `.expanded` buys
+/// nothing.** It is kept because the measurement is worth being able to repeat, not
+/// because it is recommended.
+///
+/// The hypothesis was that unpacking dominates: a packed vector costs about nine
+/// instructions per 32 dimensions (load, mask, shift, two `tbl`, two `sdot`) where
+/// dequantized bytes cost two per 16. turbovec sits at the expanded end — it
+/// serializes 4 bits per coordinate but keeps 8 bits resident — so the trade looked
+/// real.
+///
+/// It is not, for us. On nytimes at d=256 (QPS, single thread):
+///
+///     bits=2   1848 @ 36 B   vs  1881 @ 260 B
+///     bits=3   1977 @ 68 B   vs  1904 @ 260 B   (expanded slower)
+///     bits=5   1921 @ 132 B  vs  1883 @ 260 B
+///
+/// The `tbl` issues alongside the `sdot`s rather than competing with them, so removing
+/// it frees no cycles. `bits=5` compact dominates every expanded configuration on
+/// memory, speed, *and* recall. The one place expanded wins is `bits=4`, where the
+/// bit-plane unpack is genuinely expensive (668 → 1911 QPS) — but `bits=5` compact
+/// beats that too, so it is not a reason to choose it either.
+pub const Residency = enum {
+    /// `bits` per coordinate, unpacked during the scan. The default: this is a
+    /// compression library, and compactness is the reason to use it.
+    compact,
+    /// One int8 per coordinate, dequantized at insert. Roughly `8/bits` times the
+    /// memory for roughly half the scan instructions. Recall is unchanged — the
+    /// stored values are exactly the centroids the compact path looks up.
+    ///
+    /// Requires a codebook of at most 16 levels (`bits <= 5`), since the values come
+    /// from the same int8 table the compact scan indexes.
+    expanded,
+};
+
 pub const Params = struct {
     dim: u32,
     /// Total bits per coordinate: `bits − 1` for codes plus one sketch bit.
@@ -84,6 +120,8 @@ pub const Params = struct {
     exact_scan: bool = false,
     /// How the MSE term's bias is corrected.
     correction: Correction = .scalar,
+    /// Trade memory for scan speed. See `Residency`.
+    residency: Residency = .compact,
     /// Include the QJL residual sketch in the score.
     ///
     /// The sketch makes the inner-product estimate *unbiased*, which is what
@@ -114,6 +152,9 @@ pub const FlatIndex = struct {
     quantizer: prod_mod.Prod,
     layout: packing.Layout,
     metric: Metric,
+    residency: Residency,
+    /// int8 centroid table, needed at insert time to dequantize for `.expanded`.
+    table: scan.Table,
     exact_scan: bool,
     use_sketch: bool,
     correction: Correction,
@@ -154,7 +195,16 @@ pub const FlatIndex = struct {
     encode_scratch: []u8,
     allocator: Allocator,
 
+    pub const Error = error{
+        /// `.expanded` needs the int8 centroid table, which holds 16 levels.
+        BitWidthTooWideForExpanded,
+    };
+
     pub fn init(allocator: Allocator, params: Params) !FlatIndex {
+        if (params.residency == .expanded and params.bits > 5) {
+            return Error.BitWidthTooWideForExpanded;
+        }
+
         var quantizer = try prod_mod.Prod.init(allocator, .{
             .dim = params.dim,
             .bits = params.bits,
@@ -177,6 +227,14 @@ pub const FlatIndex = struct {
             .quantizer = quantizer,
             .layout = packing.Layout.init(quantizer.padded(), quantizer.mse.bits),
             .metric = params.metric,
+            .residency = params.residency,
+            // Only when the codebook fits one shuffle register. Building it
+            // unconditionally overran a 16-entry array — the same mistake as in
+            // Searcher.init, caught by the regression test added for that one.
+            .table = if (quantizer.mse.codebook.levels() <= 16)
+                scan.Table.init(quantizer.mse.codebook.centroids)
+            else
+                scan.unusedTable(),
             .exact_scan = params.exact_scan,
             .use_sketch = params.use_sketch,
             .correction = params.correction,
@@ -213,8 +271,10 @@ pub const FlatIndex = struct {
     /// Whether queries take the vectorized path. False when the MSE stage's
     /// bit-width does not divide a byte — notably `bits = 4`.
     pub fn vectorized(self: FlatIndex) bool {
-        return !self.exact_scan and
-            scan.canVectorize(self.layout) and
+        if (self.exact_scan) return false;
+        // Expanded codes need no unpacking, so the bit-width constraints do not apply.
+        if (self.residency == .expanded) return self.quantizer.padded() % 16 == 0;
+        return scan.canVectorize(self.layout) and
             sketch_kernel.canVectorize(self.quantizer.padded());
     }
 
@@ -234,7 +294,15 @@ pub const FlatIndex = struct {
             // The scalar factor rides in `StoredScalars`, already counted.
             .scalar => 0,
         };
-        return self.layout.stride() + sketch_bytes;
+        return self.codeStride() + sketch_bytes;
+    }
+
+    /// Bytes of codes per vector, which is what `Residency` changes.
+    pub fn codeStride(self: FlatIndex) usize {
+        return switch (self.residency) {
+            .compact => self.layout.stride(),
+            .expanded => std.mem.alignForward(usize, self.quantizer.padded(), 16),
+        };
     }
 
     /// Fit per-coordinate scales from a sample of representative vectors.
@@ -287,7 +355,7 @@ pub const FlatIndex = struct {
     }
 
     pub fn reserve(self: *FlatIndex, additional: usize) !void {
-        try self.codes.ensureUnusedCapacity(self.allocator, additional * self.layout.stride());
+        try self.codes.ensureUnusedCapacity(self.allocator, additional * self.codeStride());
         try self.sketches.ensureUnusedCapacity(self.allocator, additional * self.quantizer.sketchLen());
         try self.scalars.ensureUnusedCapacity(self.allocator, additional);
     }
@@ -299,7 +367,7 @@ pub const FlatIndex = struct {
     pub fn add(self: *FlatIndex, vector: []const f32) !u32 {
         std.debug.assert(vector.len == self.dim());
 
-        const stride = self.layout.stride();
+        const stride = self.codeStride();
         const sketch_len = self.quantizer.sketchLen();
 
         // Encode into scratch, then pack. The quantizer emits one byte per
@@ -318,7 +386,19 @@ pub const FlatIndex = struct {
             self.encodeCalibrated(vector, scratch)
         else
             self.quantizer.encode(vector, scratch, sketch_slot, &self.workspace);
-        self.layout.pack(scratch, codes_slot);
+
+        switch (self.residency) {
+            .compact => self.layout.pack(scratch, codes_slot),
+            .expanded => {
+                // Resolve each code to its int8 centroid now, so the scan does not
+                // have to. Exactly the values `lookup` would return.
+                const values: [16]i8 = self.table.values;
+                for (codes_slot[0..scratch.len], scratch) |*dst, code| {
+                    dst.* = @bitCast(values[code]);
+                }
+                @memset(codes_slot[scratch.len..], 0);
+            },
+        }
 
         if (self.correction == .scalar) {
             // α = ⟨y, ỹ⟩ / ‖ỹ‖², stored in gamma's slot since the sketch is unused.
@@ -390,7 +470,10 @@ pub const FlatIndex = struct {
         pub fn init(allocator: Allocator, index: FlatIndex, k: usize) !Searcher {
             var query_state = try prod_mod.QueryState.init(allocator, index.quantizer);
             errdefer query_state.deinit();
-            var scan_query = try scan.Query.init(allocator, index.layout);
+            var scan_query = if (index.residency == .expanded)
+                try scan.Query.initSequential(allocator, index.quantizer.padded())
+            else
+                try scan.Query.init(allocator, index.layout);
             errdefer scan_query.deinit();
             var sketch_query = try sketch_kernel.Query.init(allocator, index.quantizer.padded());
             errdefer sketch_query.deinit();
@@ -460,7 +543,10 @@ pub const FlatIndex = struct {
             };
             while (built < batch) : (built += 1) {
                 query_states[built] = try prod_mod.QueryState.init(allocator, index.quantizer);
-                scan_queries[built] = try scan.Query.init(allocator, index.layout);
+                scan_queries[built] = if (index.residency == .expanded)
+                    try scan.Query.initSequential(allocator, index.quantizer.padded())
+                else
+                    try scan.Query.init(allocator, index.layout);
                 sketch_queries[built] = try sketch_kernel.Query.init(allocator, index.quantizer.padded());
             }
 
@@ -549,7 +635,7 @@ pub const FlatIndex = struct {
             break :blk norms;
         };
 
-        const stride = self.layout.stride();
+        const stride = self.codeStride();
         const sketch_len = self.quantizer.sketchLen();
         const padded = self.quantizer.padded();
         const centroids = self.quantizer.mse.codebook.centroids;
@@ -562,10 +648,18 @@ pub const FlatIndex = struct {
             const gamma: f32 = scalars.gamma;
 
             for (0..n) |i| {
-                const mse_term = if (use_simd)
-                    scan.scoreInt8(self.layout, searcher.table, searcher.scan_queries[i], code_slot, padded)
-                else
-                    scan.scoreExact(self.layout, centroids, searcher.query_states[i].rotated, code_slot);
+                const mse_term = switch (self.residency) {
+                    .expanded => scan.scoreExpanded(
+                        @ptrCast(code_slot),
+                        searcher.scan_queries[i],
+                        self.table.scale,
+                        padded,
+                    ),
+                    .compact => if (use_simd)
+                        scan.scoreInt8(self.layout, searcher.table, searcher.scan_queries[i], code_slot, padded)
+                    else
+                        scan.scoreExact(self.layout, centroids, searcher.query_states[i].rotated, code_slot),
+                };
 
                 const estimate = switch (self.correction) {
                     .scalar => norm * gamma * mse_term,
@@ -729,7 +823,7 @@ pub const FlatIndex = struct {
             0;
 
         var collector = topk.TopK.init(searcher.heap);
-        const stride = self.layout.stride();
+        const stride = self.codeStride();
         const sketch_len = self.quantizer.sketchLen();
         const padded = self.quantizer.padded();
         const centroids = self.quantizer.mse.codebook.centroids;
@@ -738,10 +832,18 @@ pub const FlatIndex = struct {
             const code_slot = self.codes.items[i * stride ..][0..stride];
             const sketch_slot = self.sketches.items[i * sketch_len ..][0..sketch_len];
 
-            const mse_term = if (use_simd)
-                scan.scoreInt8(self.layout, searcher.table, searcher.scan_query, code_slot, padded)
-            else
-                scan.scoreExact(self.layout, centroids, searcher.query_state.rotated, code_slot);
+            const mse_term = switch (self.residency) {
+                .expanded => scan.scoreExpanded(
+                    @ptrCast(code_slot),
+                    searcher.scan_query,
+                    self.table.scale,
+                    padded,
+                ),
+                .compact => if (use_simd)
+                    scan.scoreInt8(self.layout, searcher.table, searcher.scan_query, code_slot, padded)
+                else
+                    scan.scoreExact(self.layout, centroids, searcher.query_state.rotated, code_slot),
+            };
 
             const norm: f32 = scalars.norm;
             const gamma: f32 = scalars.gamma;
@@ -1569,4 +1671,65 @@ test "parallel search is deterministic across runs" {
             try testing.expectEqual(a.score, b.score);
         }
     }
+}
+
+test "expanded residency gives identical results to compact" {
+    // The stored bytes are exactly the centroids the compact path looks up, so the
+    // two must agree bit-for-bit. Anything else means the dequantization at insert
+    // and the lookup at scan have drifted.
+    const allocator = testing.allocator;
+    const dim: u32 = 256;
+    const n = 600;
+
+    const corpus = try allocator.alloc(f32, n * dim);
+    defer allocator.free(corpus);
+    var prng = std.Random.DefaultPrng.init(0xE89A);
+    const random = prng.random();
+    for (0..n) |i| randomUnit(corpus[i * dim ..][0..dim], random);
+
+    for ([_]u6{ 3, 4, 5 }) |bits| {
+        var compact = try FlatIndex.init(allocator, .{ .dim = dim, .bits = bits, .seed = 6 });
+        defer compact.deinit();
+        var expanded = try FlatIndex.init(allocator, .{
+            .dim = dim,
+            .bits = bits,
+            .seed = 6,
+            .residency = .expanded,
+        });
+        defer expanded.deinit();
+        try compact.addBatch(corpus);
+        try expanded.addBatch(corpus);
+
+        // Expanded costs one byte per coordinate regardless of bit-width.
+        try testing.expectEqual(@as(usize, dim), expanded.codeStride());
+        try testing.expect(expanded.codeStride() > compact.codeStride());
+        try testing.expect(expanded.vectorized());
+
+        const k = 10;
+        var cs = try FlatIndex.Searcher.init(allocator, compact, k);
+        defer cs.deinit();
+        var es = try FlatIndex.Searcher.init(allocator, expanded, k);
+        defer es.deinit();
+
+        const query = try allocator.alloc(f32, dim);
+        defer allocator.free(query);
+        for (0..25) |_| {
+            randomUnit(query, random);
+            const a = compact.search(query, &cs);
+            const b = expanded.search(query, &es);
+            for (a, b) |x, y| {
+                try testing.expectEqual(x.id, y.id);
+                try testing.expectEqual(x.score, y.score);
+            }
+        }
+    }
+}
+
+test "expanded residency is refused above the table's bit-width" {
+    const allocator = testing.allocator;
+    try testing.expectError(FlatIndex.Error.BitWidthTooWideForExpanded, FlatIndex.init(allocator, .{
+        .dim = 128,
+        .bits = 6,
+        .residency = .expanded,
+    }));
 }

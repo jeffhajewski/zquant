@@ -73,27 +73,28 @@ pub const Correction = enum {
 
 /// How codes are held in memory.
 ///
-/// **Measured conclusion: `.compact` is the right default and `.expanded` buys
-/// nothing.** It is kept because the measurement is worth being able to repeat, not
-/// because it is recommended.
+/// **`.compact` is the right default.** Whether unpacking costs anything depends
+/// entirely on which packing the bit-width uses, and the two answers are very
+/// different. Timed at the kernel, d=256, ns per vector:
 ///
-/// The hypothesis was that unpacking dominates: a packed vector costs about nine
-/// instructions per 32 dimensions (load, mask, shift, two `tbl`, two `sdot`) where
-/// dequantized bytes cost two per 16. turbovec sits at the expanded end — it
-/// serializes 4 bits per coordinate but keeps 8 bits resident — so the trade looked
-/// real.
+///     codebook bits   packing      packed   expanded   ratio
+///     2               sequential     3.82       3.37    1.13x
+///     3               bit-plane     13.76       3.44    4.01x
+///     4               sequential      3.28       3.38    0.97x
 ///
-/// It is not, for us. On nytimes at d=256 (QPS, single thread):
+/// For **sequential** packing the `tbl` issues alongside the `sdot`s rather than
+/// competing with them, and unpacking is free — at 4 bits the packed path is even
+/// marginally ahead. For **bit-plane** packing (3-bit codes, which do not divide a
+/// byte) it costs **4×**: three bit expansions and a weighted recombination per 16
+/// codes is real work.
 ///
-///     bits=2   1848 @ 36 B   vs  1881 @ 260 B
-///     bits=3   1977 @ 68 B   vs  1904 @ 260 B   (expanded slower)
-///     bits=5   1921 @ 132 B  vs  1883 @ 260 B
+/// So `.expanded` is only worth considering at `bits = 4`, the one configuration whose
+/// codebook is 3 bits. Even there `bits = 5` compact beats it on memory, speed *and*
+/// recall, which is why the default does not move.
 ///
-/// The `tbl` issues alongside the `sdot`s rather than competing with them, so removing
-/// it frees no cycles. `bits=5` compact dominates every expanded configuration on
-/// memory, speed, *and* recall. The one place expanded wins is `bits=4`, where the
-/// bit-plane unpack is genuinely expensive (668 → 1911 QPS) — but `bits=5` compact
-/// beats that too, so it is not a reason to choose it either.
+/// turbovec sits at the expanded end — it serializes 4 bits per coordinate but keeps
+/// 8 bits resident. For a sequential layout that trade buys nothing we do not already
+/// have.
 pub const Residency = enum {
     /// `bits` per coordinate, unpacked during the scan. The default: this is a
     /// compression library, and compactness is the reason to use it.

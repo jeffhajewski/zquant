@@ -916,16 +916,37 @@ compact path first, so the timings mean something.
 | 4 | 668 @ 100 B | 1911 @ 260 B | 2.9× — the bit-plane path |
 | 5 | **1921 @ 132 B** | 1883 @ 260 B | no gain, 2× memory |
 
-**Our `tbl` unpacking is free.** It issues alongside the `sdot`s rather than competing with them, so
-deleting it frees no cycles. `bits=5 compact` dominates every expanded configuration on memory,
-speed, and recall simultaneously.
+**"Unpacking is free" — corrected.** That was the first conclusion, drawn from the end-to-end table
+above, and it was overgeneralized. Jeff pushed back that "free" sounded suspicious. Timing the
+kernels in isolation (`bench/kernel_bench.zig`), with no index overhead in the path, splits the
+answer by packing:
 
-That reframes the earlier finding once more. turbovec spending 2× memory to remove unpacking is a
-trade **we do not need to make** — not a trade we were losing. Their remaining per-core advantage
-(~1.8× by MAC-rate accounting: 1.7 `sdot`/cycle/core against our 0.93) is therefore elsewhere, and
-since expanded rules out instruction count, the most likely candidate is per-vector overhead —
-scalar loads, the estimate, and the top-k offer, which at ~17 cycles/vector dwarf the ~4 cycles of
-`sdot` at d=256.
+| codebook bits | packing | packed | expanded | ratio |
+|---|---|---|---|---|
+| 2 | sequential | 3.82 ns | 3.37 ns | 1.13× |
+| **3** | **bit-plane** | **13.76 ns** | **3.44 ns** | **4.01×** |
+| 4 | sequential | 3.28 ns | 3.38 ns | 0.97× |
+
+For **sequential** packing unpacking really is free — at 4 bits the packed path is marginally
+*ahead*, since the `tbl` issues alongside the `sdot`s rather than competing with them. For
+**bit-plane** packing it costs **4×**: three bit expansions plus a weighted recombination per 16
+codes is real work, not hidden work.
+
+The end-to-end measurement was not wrong — the index's slow `bits=4` configuration is exactly the
+bit-plane path, and the two agree. What was wrong was generalizing one number across both layouts.
+
+**A second correction falls out of the same measurement.** I had said per-vector index overhead
+dominates, at "~13 of 17 cycles". The kernel alone is **11.5 cycles** at d=256, so the overhead is
+~5.8 cycles — about **34%**, real but not dominant. And at 16 `sdot`s per 11.5 cycles the kernel
+runs at **1.39 sdot/cycle** against turbovec's ~1.7, so the kernel gap is ~1.2×, not the ~1.8× that
+whole-system accounting suggested.
+
+Two concrete targets now, both measured rather than guessed: **the bit-plane unpack (4×)** and
+**index per-vector overhead (34%)**.
+
+**Method note.** An end-to-end benchmark can only bound the sum of its parts. Attributing a null
+result to one part requires isolating that part, and doing so here reversed the conclusion for half
+the configurations.
 
 The option is kept, documented as not recommended, because being able to re-run the comparison is
 worth more than the API surface costs.

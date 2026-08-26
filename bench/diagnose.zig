@@ -193,6 +193,78 @@ pub fn main() !void {
         std.debug.print("  turbovec, same protocol: bits=2 0.02677  bits=3 0.01370  bits=4 0.00718\n", .{});
     }
 
+    // 1e. Does per-coordinate structure survive the rotation?
+    //
+    // A Haar rotation makes every coordinate identically distributed, so a single
+    // shared codebook is optimal. A *structured* rotation (RHT) on structured data
+    // may not. If the per-coordinate standard deviations vary, a per-coordinate
+    // scale would be worth fitting — that is what turbovec's calibrate() appears to
+    // do, and it buys them +2.4 to +5.1 points.
+    {
+        const sigma = try a.alloc(f64, q.padded);
+        defer a.free(sigma);
+        @memset(sigma, 0);
+        for (0..n) |i| {
+            _ = q.encodeRotated(base.data[i * d ..][0..d], rotated, staging);
+            for (rotated, sigma) |v, *acc| acc.* += @as(f64, v) * v;
+        }
+        var mean: f64 = 0;
+        for (sigma) |*acc| {
+            acc.* = @sqrt(acc.* / @as(f64, @floatFromInt(n)));
+            mean += acc.*;
+        }
+        mean /= @floatFromInt(q.padded);
+        var sd: f64 = 0;
+        var lo: f64 = 1e30;
+        var hi: f64 = 0;
+        for (sigma) |v| {
+            sd += (v - mean) * (v - mean);
+            lo = @min(lo, v);
+            hi = @max(hi, v);
+        }
+        sd = @sqrt(sd / @as(f64, @floatFromInt(q.padded)));
+        std.debug.print("\nper-coordinate sigma after rotation (d={d})\n", .{q.padded});
+        std.debug.print("  mean {e:.4}  sd {e:.4}  cv {d:.4}\n", .{ mean, sd, sd / mean });
+        std.debug.print("  min/mean {d:.3}  max/mean {d:.3}\n", .{ lo / mean, hi / mean });
+        std.debug.print("  -> a per-coordinate scale is worth fitting only if cv is well above 0\n", .{});
+    }
+
+    // 1f. Does a per-coordinate MEAN survive the rotation?
+    //
+    // The codebook is symmetric about zero. SIFT vectors are non-negative histograms
+    // with a strong mean vector μ; after rotation, coordinate j has mean πⱼᵀμ, which
+    // need not be small. If it is comparable to σ_j the codebook is centred in the
+    // wrong place and half its levels are wasted.
+    {
+        const mean = try a.alloc(f64, q.padded);
+        defer a.free(mean);
+        const var_ = try a.alloc(f64, q.padded);
+        defer a.free(var_);
+        @memset(mean, 0);
+        @memset(var_, 0);
+        for (0..n) |i| {
+            _ = q.encodeRotated(base.data[i * d ..][0..d], rotated, staging);
+            for (rotated, mean, var_) |v, *m, *s2| {
+                m.* += v;
+                s2.* += @as(f64, v) * v;
+            }
+        }
+        const fn_: f64 = @floatFromInt(n);
+        var worst: f64 = 0;
+        var mean_ratio: f64 = 0;
+        for (mean, var_) |*m, *s2| {
+            m.* /= fn_;
+            const sd = @sqrt(s2.* / fn_ - m.* * m.*);
+            const ratio = if (sd > 0) @abs(m.*) / sd else 0;
+            worst = @max(worst, ratio);
+            mean_ratio += ratio;
+        }
+        mean_ratio /= @floatFromInt(q.padded);
+        std.debug.print("\nper-coordinate |mean|/sigma after rotation\n", .{});
+        std.debug.print("  average {d:.4}   worst {d:.4}\n", .{ mean_ratio, worst });
+        std.debug.print("  -> a symmetric codebook assumes this is ~0\n", .{});
+    }
+
     // 2. Measured reconstruction distortion vs the paper's value.
     const codes = try a.alloc(u8, q.codeLen());
     defer a.free(codes);

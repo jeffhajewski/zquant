@@ -105,9 +105,10 @@ pub fn main() !void {
     }
 
     for ([_]u6{ 2, 3, 4, 5 }) |bits| {
-        for ([_]zq.flat.Correction{ .qjl_sketch, .scalar }) |correction| {
+        for ([_]bool{ false, true }) |calibrated| {
             const exact = false;
             const sketch = true;
+            const correction: zq.flat.Correction = .scalar;
             var index = try zq.flat.FlatIndex.init(a, .{
                 .dim = d,
                 .bits = bits,
@@ -118,6 +119,17 @@ pub fn main() !void {
                 .correction = correction,
             });
             defer index.deinit();
+            if (calibrated) {
+                // Uniform draw from the corpus, as the fit requires.
+                const rows = 1024;
+                const stride = base.count / rows;
+                const sample = try a.alloc(f32, rows * d);
+                defer a.free(sample);
+                for (0..rows) |i| {
+                    @memcpy(sample[i * d ..][0..d], base.data[i * stride * d ..][0..d]);
+                }
+                try index.calibrate(sample);
+            }
             try index.addBatch(base.data);
 
             var searcher = try zq.flat.FlatIndex.Searcher.init(a, index, RETRIEVE);
@@ -159,7 +171,7 @@ pub fn main() !void {
 
             try out.print(a, "zquant,bits={d}{s},{d},{d:.4},{d},{d},{d},{d:.1}\n", .{
                 bits,
-                if (correction == .scalar) " scalar-corr" else "",
+                if (calibrated) " +calibrate" else "",
                 index.bytesPerVector(),
                 recall / fnq,
                 ranks[nq / 2],
@@ -169,7 +181,7 @@ pub fn main() !void {
             });
             std.debug.print("  bits={d}{s:<12} {d:>3}B  R@10={d:.3}  med={d} p90={d} worst={d}  {d:.0} QPS\n", .{
                 bits,
-                if (correction == .scalar) " scalar-corr" else "",
+                if (calibrated) " +calibrate" else "",
                 index.bytesPerVector(),
                 recall / fnq,
                 ranks[nq / 2],

@@ -126,6 +126,22 @@ pub const FlatIndex = struct {
     /// own inputs are quantized to 4 bits.
     scalars: std.ArrayList(StoredScalars),
 
+    /// Per-coordinate scales for the rotated basis, length `padded`. All ones until
+    /// `calibrate` is called.
+    ///
+    /// A random rotation *randomizes* the axes but does not *whiten* them: after
+    /// rotation, coordinate j has variance πⱼᵀCπⱼ, which still tracks the spectrum of
+    /// the data covariance C. On SIFT that leaves a 4.3× spread (cv 0.30) across
+    /// coordinates, so one shared codebook is badly matched at both ends. Scaling each
+    /// coordinate to the variance the codebook was built for fixes that.
+    ///
+    /// Costs `d` floats for the whole index, not per vector, and nothing at query
+    /// time: the scale folds into the rotated query.
+    scales: []f32,
+    /// Whether `calibrate` has been run. Encoding before and after would produce
+    /// incompatible codes, so adding after calibration is refused.
+    calibrated: bool,
+
     workspace: prod_mod.Workspace,
     /// Reusable unpacked-code buffer for `add`. Held here rather than allocated per
     /// call: `add` runs once per vector, and a transient allocation per vector is
@@ -148,6 +164,10 @@ pub const FlatIndex = struct {
         const encode_scratch = try allocator.alloc(u8, quantizer.codeLen());
         errdefer allocator.free(encode_scratch);
 
+        const scales = try allocator.alloc(f32, quantizer.padded());
+        errdefer allocator.free(scales);
+        @memset(scales, 1.0);
+
         return .{
             .quantizer = quantizer,
             .layout = packing.Layout.init(quantizer.padded(), quantizer.mse.bits),
@@ -160,11 +180,14 @@ pub const FlatIndex = struct {
             .scalars = .empty,
             .workspace = workspace,
             .encode_scratch = encode_scratch,
+            .scales = scales,
+            .calibrated = false,
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *FlatIndex) void {
+        self.allocator.free(self.scales);
         self.allocator.free(self.encode_scratch);
         self.codes.deinit(self.allocator);
         self.sketches.deinit(self.allocator);
@@ -209,6 +232,55 @@ pub const FlatIndex = struct {
         return self.layout.stride() + sketch_bytes;
     }
 
+    /// Fit per-coordinate scales from a sample of representative vectors.
+    ///
+    /// Must be called before any `add`: codes written under different scales are not
+    /// comparable. The sample should be a uniform draw from what the index will hold
+    /// — a sorted or clustered slice will fit the wrong shape, and the resulting
+    /// index will be quietly worse rather than obviously broken.
+    ///
+    /// This is the one data-dependent step in an otherwise data-oblivious library.
+    /// It is opt-in for that reason: it costs a pass over a sample and gives up the
+    /// property that encoding depends only on the seed.
+    pub fn calibrate(self: *FlatIndex, sample: []const f32) !void {
+        if (self.count() > 0) return error.IndexNotEmpty;
+        const d = self.dim();
+        std.debug.assert(sample.len % d == 0);
+        const rows = sample.len / d;
+        if (rows == 0) return error.EmptySample;
+
+        const padded = self.quantizer.padded();
+        const rotated = try self.allocator.alloc(f32, padded);
+        defer self.allocator.free(rotated);
+        const staging = try self.allocator.alloc(f32, padded);
+        defer self.allocator.free(staging);
+
+        const sum_sq = try self.allocator.alloc(f64, padded);
+        defer self.allocator.free(sum_sq);
+        @memset(sum_sq, 0);
+
+        for (0..rows) |i| {
+            _ = self.quantizer.mse.encodeRotated(sample[i * d ..][0..d], rotated, staging);
+            for (rotated, sum_sq) |v, *s2| s2.* += @as(f64, v) * v;
+        }
+
+        // The codebook is built for a coordinate of variance 1/padded, so scale each
+        // coordinate by how far its own RMS departs from that.
+        const frows: f64 = @floatFromInt(rows);
+        const target = 1.0 / @sqrt(@as(f64, @floatFromInt(padded)));
+        for (self.scales, sum_sq) |*t, s2| {
+            // Raw RMS, not the centred standard deviation: the encoder does not
+            // subtract the mean, so the codebook has to cover the offset too.
+            // Scaling by the centred σ leaves z overflowing the codebook's range and
+            // cost 3.4 points of R@10 when it slipped in.
+            const sigma = @sqrt(s2 / frows);
+            // A coordinate with no spread gets left alone rather than scaled by zero,
+            // which would make its codes meaningless.
+            t.* = if (sigma > 1e-20) @floatCast(sigma / target) else 1.0;
+        }
+        self.calibrated = true;
+    }
+
     pub fn reserve(self: *FlatIndex, additional: usize) !void {
         try self.codes.ensureUnusedCapacity(self.allocator, additional * self.layout.stride());
         try self.sketches.ensureUnusedCapacity(self.allocator, additional * self.quantizer.sketchLen());
@@ -237,7 +309,10 @@ pub const FlatIndex = struct {
         const codes_slot = self.codes.items[self.codes.items.len - stride ..];
         const sketch_slot = self.sketches.items[self.sketches.items.len - sketch_len ..];
 
-        var scalars = self.quantizer.encode(vector, scratch, sketch_slot, &self.workspace);
+        var scalars = if (self.calibrated)
+            self.encodeCalibrated(vector, scratch)
+        else
+            self.quantizer.encode(vector, scratch, sketch_slot, &self.workspace);
         self.layout.pack(scratch, codes_slot);
 
         if (self.correction == .scalar) {
@@ -245,11 +320,13 @@ pub const FlatIndex = struct {
             // ⟨y, ỹ⟩ = (‖y‖² + ‖ỹ‖² − ‖y−ỹ‖²)/2, and ‖y‖ = 1 after normalization.
             const centroids = self.quantizer.mse.codebook.centroids;
             var recon_sq: f64 = 0;
-            for (scratch) |code| {
-                const c: f64 = centroids[code];
+            for (scratch, self.scales) |code, t| {
+                // r̃_j = t_j · c[code_j], so the scale enters here too.
+                const c: f64 = @as(f64, centroids[code]) * t;
                 recon_sq += c * c;
             }
             const residual_sq: f64 = @as(f64, scalars.gamma) * scalars.gamma;
+            // ⟨y,ỹ⟩ = (‖y‖² + ‖ỹ‖² − ‖y−ỹ‖²)/2, with ‖y‖ = 1 after normalization.
             const dot = (1.0 + recon_sq - residual_sq) * 0.5;
             scalars.gamma = if (recon_sq > 0) @floatCast(dot / recon_sq) else 1.0;
         }
@@ -257,6 +334,33 @@ pub const FlatIndex = struct {
 
         try self.scalars.append(self.allocator, StoredScalars.from(scalars));
         return @intCast(self.scalars.items.len - 1);
+    }
+
+    /// Rotate, rescale by the fitted per-coordinate scales, and encode.
+    ///
+    /// `gamma` comes back as the residual norm in the rotated basis, matching what
+    /// `Prod.encode` returns, so the α computation downstream is unchanged.
+    fn encodeCalibrated(self: *FlatIndex, vector: []const f32, codes: []u8) prod_mod.Scalars {
+        const ws = &self.workspace;
+        const norm = self.quantizer.mse.encodeRotated(vector, ws.rotated, ws.staging);
+
+        // z = y / t, quantized against the shared codebook.
+        //
+        // Not mean-centred, though the signal is real: |mean|/σ averages 0.78 on
+        // SIFT and reaches 3.8, so a symmetric codebook is off-centre. Subtracting
+        // the mean measured *worse* (0.883 → 0.864 at 68 B) for reasons not yet
+        // understood, so the transform stays out. See docs/comparison.md.
+        for (ws.staging, ws.rotated, self.scales) |*z, y, t| z.* = y / t;
+        self.quantizer.mse.codebook.encodeSlice(ws.staging, codes);
+
+        // Residual: r̃ = t·c[code].
+        const centroids = self.quantizer.mse.codebook.centroids;
+        var residual_sq: f64 = 0;
+        for (codes, ws.staging, self.scales) |code, z, t| {
+            const diff = (@as(f64, z) - @as(f64, centroids[code])) * t;
+            residual_sq += diff * diff;
+        }
+        return .{ .norm = norm, .gamma = @floatCast(@sqrt(residual_sq)) };
     }
 
     /// Append `n` vectors from a row-major buffer.
@@ -275,7 +379,7 @@ pub const FlatIndex = struct {
         sketch_query: sketch_kernel.Query,
         table: scan.Table,
         heap: []Entry,
-        workspace: prod_mod.Workspace,
+    workspace: prod_mod.Workspace,
         allocator: Allocator,
 
         pub fn init(allocator: Allocator, index: FlatIndex, k: usize) !Searcher {
@@ -326,6 +430,11 @@ pub const FlatIndex = struct {
         // One rotation and one sketch for the whole corpus — the point of staying in
         // the rotated basis (docs/DESIGN.md §1.3).
         self.quantizer.prepareQuery(query, &searcher.query_state, &searcher.workspace);
+        if (self.calibrated) {
+            // The scale rides on the query, so the scan kernel keeps using the raw
+            // centroid table. Once per query, not once per vector.
+            for (searcher.query_state.rotated, self.scales) |*p, t| p.* *= t;
+        }
         const use_simd = self.vectorized();
         if (use_simd) {
             searcher.scan_query.load(searcher.query_state.rotated);
@@ -923,4 +1032,92 @@ test "scalar correction removes the estimator's bias" {
         }
     }
     try testing.expectApproxEqAbs(@as(f64, 1.0), cross / truth_sq, 0.05);
+}
+
+test "calibration fits per-coordinate scales and improves recall" {
+    // A random rotation randomizes the axes but does not whiten them, so after
+    // rotation coordinate j keeps variance πⱼᵀCπⱼ. On anisotropic data that leaves a
+    // wide spread and one shared codebook is badly matched at both ends.
+    const allocator = testing.allocator;
+    const dim: u32 = 256;
+    const n = 1200;
+
+    // Deliberately anisotropic: energy concentrated in a low-dimensional subspace,
+    // which is what real embeddings look like and what the uniform-sphere analysis
+    // does not cover.
+    const corpus = try allocator.alloc(f32, n * dim);
+    defer allocator.free(corpus);
+    var prng = std.Random.DefaultPrng.init(0xA15E);
+    const random = prng.random();
+    for (0..n) |i| {
+        const row = corpus[i * dim ..][0..dim];
+        for (row, 0..) |*v, j| {
+            const decay = 1.0 / (1.0 + @as(f32, @floatFromInt(j)) * 0.08);
+            v.* = random.floatNorm(f32) * decay;
+        }
+        const len = euclideanNorm(row);
+        for (row) |*v| v.* /= len;
+    }
+
+    var plain = try FlatIndex.init(allocator, .{ .dim = dim, .bits = 5, .seed = 2 });
+    defer plain.deinit();
+    try plain.addBatch(corpus);
+
+    var fitted = try FlatIndex.init(allocator, .{ .dim = dim, .bits = 5, .seed = 2 });
+    defer fitted.deinit();
+    try fitted.calibrate(corpus[0 .. 512 * dim]);
+    try fitted.addBatch(corpus);
+
+    // The fit must actually find structure, or the comparison is vacuous.
+    var spread: f32 = 0;
+    for (fitted.scales) |t| spread = @max(spread, @abs(t - 1.0));
+    try testing.expect(spread > 0.1);
+
+    // Storage is unchanged: the scales are per index, not per vector.
+    try testing.expectEqual(plain.bytesPerVector(), fitted.bytesPerVector());
+
+    const query = try allocator.alloc(f32, dim);
+    defer allocator.free(query);
+    var hits_plain: usize = 0;
+    var hits_fitted: usize = 0;
+    const trials = 100;
+
+    for ([_]*FlatIndex{ &plain, &fitted }, 0..) |index, which| {
+        var searcher = try FlatIndex.Searcher.init(allocator, index.*, 10);
+        defer searcher.deinit();
+        var qprng = std.Random.DefaultPrng.init(31);
+        for (0..trials) |_| {
+            randomUnit(query, qprng.random());
+            var best: u32 = 0;
+            var best_score: f64 = -std.math.inf(f64);
+            for (0..n) |i| {
+                var d: f64 = 0;
+                for (corpus[i * dim ..][0..dim], query) |x, qv| d += @as(f64, x) * qv;
+                if (d > best_score) {
+                    best_score = d;
+                    best = @intCast(i);
+                }
+            }
+            for (index.search(query, &searcher)) |e| {
+                if (e.id == best) {
+                    if (which == 0) hits_plain += 1 else hits_fitted += 1;
+                    break;
+                }
+            }
+        }
+    }
+    try testing.expect(hits_fitted >= hits_plain);
+}
+
+test "calibrate refuses to run on a non-empty index" {
+    // Codes written under different scales are not comparable, and the failure would
+    // be silent: recall would just be worse.
+    const allocator = testing.allocator;
+    const dim: u32 = 64;
+    var index = try FlatIndex.init(allocator, .{ .dim = dim, .bits = 4 });
+    defer index.deinit();
+
+    const vector = [_]f32{0.25} ** dim;
+    _ = try index.add(&vector);
+    try testing.expectError(error.IndexNotEmpty, index.calibrate(&vector));
 }

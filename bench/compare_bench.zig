@@ -123,8 +123,8 @@ pub fn main() !void {
     }
 
     for ([_]u6{ 2, 3, 4, 5 }) |bits| {
-        for ([_]zq.flat.Residency{ .compact, .expanded }) |residency| {
-            const calibrated = true;
+        for ([_]bool{ false, true }) |calibrated| {
+            const residency: zq.flat.Residency = .compact;
             const exact = false;
             const sketch = true;
             const correction: zq.flat.Correction = .scalar;
@@ -229,7 +229,7 @@ pub fn main() !void {
 
             try out.print(a, "zquant,bits={d}{s},{d},{d:.4},{d},{d},{d},{d:.1},{d:.1}\n", .{
                 bits,
-                if (residency == .expanded) " expanded" else " compact",
+                if (calibrated) " +calibrate" else "",
                 index.bytesPerVector(),
                 recall / fnq,
                 ranks[nq / 2],
@@ -240,7 +240,7 @@ pub fn main() !void {
             });
             std.debug.print("  bits={d}{s:<12} {d:>3}B  R@10={d:.3}  med={d} p90={d} worst={d}  {d:.0} QPS  {d:.0} par\n", .{
                 bits,
-                if (residency == .expanded) " expanded" else " compact",
+                if (calibrated) " +calibrate" else "",
                 index.bytesPerVector(),
                 recall / fnq,
                 ranks[nq / 2],

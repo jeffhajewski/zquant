@@ -978,6 +978,54 @@ array for `bits > 5` — the identical mistake to the `Searcher.init` overrun fr
 regression test written for *that* one caught *this* one immediately, which is the clearest argument
 so far for writing the test rather than just the fix.
 
+### <a name="tqplus"></a>`HEAD` — reading turbovec's source: what we got wrong, and an unresolved integration
+
+turbovec is MIT-licensed with public source, so studying it is legitimate. Doing so answered the
+open question about their calibration directly.
+
+**Their `tqplus_shift` / `tqplus_scale` is per-coordinate shift *and* scale — the same transform I
+tried twice and measured worse. The difference is entirely in how the pair is chosen.**
+
+I fitted **mean and standard deviation**. They fit by **quantile anchoring**: map each coordinate's
+empirical `p`-quantiles onto the codebook's outermost centroids, where `p = P(|x| ≤ c_outer)` under
+the canonical marginal — ~0.93 at 2 bits, ~0.996 at 4. Their reasoning, which is exactly the failure
+I hit:
+
+> Values past the outermost centroid all collapse into one bucket with unbounded error, so the right
+> anchor is the point where the codebook stops.
+
+Matching σ says nothing about where the tails land relative to `c_outer`. They record a case where a
+fixed anchor scaled 4-bit data 2× too far and dropped R@10 from 0.4835 to 0.1439.
+
+**Implemented it, and it half-worked.** The fit is demonstrably right — on SIFT it **halves
+reconstruction error**, ‖y−ŷ‖² going 0.00899 → 0.00436 — and the fitted parameters are sensible
+(anchor probability 0.9967, scales 1.05–2.11, and the coordinates really are skewed: one had
+quantiles at −2.42σ and +1.44σ).
+
+**But recall got worse**: 0.869 → 0.811 at 68 B. Isolated as far as it went:
+
+- Not the int8 query path — an exact f32 scan shows the same gap (0.871 → 0.811).
+- Partly the α rescale, which is actively harmful here (0.736 → 0.812 when disabled) even after
+  correcting its weighting to match the `1/scale` weights the estimator actually applies.
+- Not the fit — reconstruction is better, measured directly.
+
+So: **better reconstruction, worse retrieval.** That is the signature of MSE-optimal not being
+MIPS-optimal — the error that matters for inner products is weighted differently from the error that
+matters for reconstruction — but I could not close the gap between that observation and turbovec's
++8 points at 2 bits within a reasonable budget.
+
+**Reverted** to the mean/σ scale-only calibration, which is worth +1.4 points and is committed.
+Recorded here rather than left in the tree half-working.
+
+**What is worth keeping from this:**
+
+1. The premise "we are missing a lot" was not what the measurements said, and reading their source
+   confirmed the specific gap rather than a broad one: one calibration technique, on one axis.
+2. Quantile anchoring is the right idea and provably improves reconstruction here. The unresolved
+   part is how it composes with our `prod` estimator, which differs from theirs.
+3. A better reconstruction that retrieves worse is a real result and points at anisotropic /
+   score-aware quantization (ScaNN's insight) as the missing piece, not at a coding error.
+
 ---
 
 ## Open items for P1

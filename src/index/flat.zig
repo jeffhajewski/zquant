@@ -588,6 +588,121 @@ pub const FlatIndex = struct {
         return searcher.heap_store[0 .. (n - 1) * searcher.k + found];
     }
 
+    /// Query-parallel batch search state: one `BatchSearcher` per thread.
+    ///
+    /// Threads are given disjoint *queries*, not disjoint corpus shards. Each thread
+    /// therefore reads the whole corpus, which would be wasteful if the scan were
+    /// memory-bound — it is not (see docs/notes.md: batching a corpus pass across 32
+    /// queries gives 1.01×, so per-vector compute is the constraint). Sharding queries
+    /// instead means no shared mutable state, no top-k merge, and no false sharing.
+    pub const ParallelSearcher = struct {
+        shards: []BatchSearcher,
+        threads: []std.Thread,
+        /// Combined results, `capacity * k` entries.
+        results: []Entry,
+        per_thread: usize,
+        k: usize,
+        allocator: Allocator,
+
+        /// `threads` workers, each able to hold `per_thread` queries in flight.
+        pub fn init(
+            allocator: Allocator,
+            index: FlatIndex,
+            threads: usize,
+            per_thread: usize,
+            k: usize,
+        ) !ParallelSearcher {
+            std.debug.assert(threads > 0 and per_thread > 0 and k > 0);
+
+            const shards = try allocator.alloc(BatchSearcher, threads);
+            errdefer allocator.free(shards);
+            var built: usize = 0;
+            errdefer for (0..built) |i| shards[i].deinit();
+            while (built < threads) : (built += 1) {
+                shards[built] = try BatchSearcher.init(allocator, index, per_thread, k);
+            }
+
+            const handles = try allocator.alloc(std.Thread, threads);
+            errdefer allocator.free(handles);
+            const results = try allocator.alloc(Entry, threads * per_thread * k);
+
+            return .{
+                .shards = shards,
+                .threads = handles,
+                .results = results,
+                .per_thread = per_thread,
+                .k = k,
+                .allocator = allocator,
+            };
+        }
+
+        pub fn deinit(self: *ParallelSearcher) void {
+            for (self.shards) |*shard| shard.deinit();
+            self.allocator.free(self.results);
+            self.allocator.free(self.threads);
+            self.allocator.free(self.shards);
+            self.* = undefined;
+        }
+
+        pub fn capacity(self: ParallelSearcher) usize {
+            return self.shards.len * self.per_thread;
+        }
+    };
+
+    const ShardWork = struct {
+        index: *FlatIndex,
+        queries: []const f32,
+        searcher: *BatchSearcher,
+        out: []Entry,
+
+        fn run(work: ShardWork) void {
+            const found = work.index.searchBatch(work.queries, work.searcher);
+            @memcpy(work.out[0..found.len], found);
+        }
+    };
+
+    /// Batch search across `searcher.shards.len` threads.
+    ///
+    /// Threads are spawned per call. That is only sensible because a batch is large
+    /// enough to amortize it: at ~5 ms per query, a 32-query batch runs for ~160 ms
+    /// against ~30 µs of spawn cost per thread. Spawning per *query* would not pay.
+    pub fn searchBatchParallel(
+        self: *FlatIndex,
+        queries: []const f32,
+        searcher: *ParallelSearcher,
+    ) ![]Entry {
+        const d = self.dim();
+        std.debug.assert(queries.len % d == 0);
+        const n = queries.len / d;
+        std.debug.assert(n > 0 and n <= searcher.capacity());
+
+        // Spread queries as evenly as possible; the remainder goes to the first few
+        // threads rather than piling onto the last.
+        const threads = @min(searcher.shards.len, n);
+        const base = n / threads;
+        const extra = n % threads;
+
+        var spawned: usize = 0;
+        errdefer for (0..spawned) |i| searcher.threads[i].join();
+
+        var offset: usize = 0;
+        while (spawned < threads) : (spawned += 1) {
+            const take = base + @intFromBool(spawned < extra);
+            const work = ShardWork{
+                .index = self,
+                .queries = queries[offset * d ..][0 .. take * d],
+                .searcher = &searcher.shards[spawned],
+                .out = searcher.results[offset * searcher.k ..][0 .. take * searcher.k],
+            };
+            searcher.threads[spawned] = try std.Thread.spawn(.{}, ShardWork.run, .{work});
+            offset += take;
+        }
+        for (searcher.threads[0..threads]) |t| t.join();
+
+        const found = @min(searcher.k, self.count());
+        return searcher.results[0 .. (n - 1) * searcher.k + found];
+    }
+
     /// Top-k search. Results are written into `searcher`'s heap and returned as a
     /// slice into it, valid until the next search.
     pub fn search(self: *FlatIndex, query: []const f32, searcher: *Searcher) []Entry {
@@ -1368,6 +1483,90 @@ test "batched search handles partial batches and calibration" {
         for (0..count) |i| {
             const one = index.search(queries[i * dim ..][0..dim], &single);
             for (one, grouped[i * k ..][0..k]) |a, b| try testing.expectEqual(a.id, b.id);
+        }
+    }
+}
+
+test "parallel search agrees with single-query search" {
+    // Threads own disjoint queries and disjoint output, so results must be
+    // bit-identical to the serial path — not merely close.
+    const allocator = testing.allocator;
+    const dim: u32 = 128;
+    const n = 900;
+
+    const corpus = try allocator.alloc(f32, n * dim);
+    defer allocator.free(corpus);
+    var prng = std.Random.DefaultPrng.init(0x9A11E1);
+    const random = prng.random();
+    for (0..n) |i| randomUnit(corpus[i * dim ..][0..dim], random);
+
+    var index = try FlatIndex.init(allocator, .{ .dim = dim, .bits = 5, .seed = 0x77 });
+    defer index.deinit();
+    try index.addBatch(corpus);
+
+    const k = 8;
+    var single = try FlatIndex.Searcher.init(allocator, index, k);
+    defer single.deinit();
+
+    // Thread counts that do and do not divide the query count, so the remainder
+    // distribution is exercised.
+    for ([_]usize{ 1, 2, 3, 4 }) |threads| {
+        var parallel = try FlatIndex.ParallelSearcher.init(allocator, index, threads, 16, k);
+        defer parallel.deinit();
+
+        for ([_]usize{ 1, 5, 17, 32 }) |count| {
+            if (count > parallel.capacity()) continue;
+            const queries = try allocator.alloc(f32, count * dim);
+            defer allocator.free(queries);
+            for (0..count) |i| randomUnit(queries[i * dim ..][0..dim], random);
+
+            const grouped = try index.searchBatchParallel(queries, &parallel);
+            for (0..count) |i| {
+                const one = index.search(queries[i * dim ..][0..dim], &single);
+                const many = grouped[i * k ..][0..k];
+                for (one, many) |a, b| {
+                    try testing.expectEqual(a.id, b.id);
+                    try testing.expectEqual(a.score, b.score);
+                }
+            }
+        }
+    }
+}
+
+test "parallel search is deterministic across runs" {
+    // Nothing is shared between threads, so repeated runs must not vary. A race
+    // would show up here as an intermittent mismatch rather than a crash.
+    const allocator = testing.allocator;
+    const dim: u32 = 64;
+    const n = 400;
+
+    const corpus = try allocator.alloc(f32, n * dim);
+    defer allocator.free(corpus);
+    var prng = std.Random.DefaultPrng.init(3);
+    const random = prng.random();
+    for (0..n) |i| randomUnit(corpus[i * dim ..][0..dim], random);
+
+    var index = try FlatIndex.init(allocator, .{ .dim = dim, .bits = 4, .seed = 2 });
+    defer index.deinit();
+    try index.addBatch(corpus);
+
+    const k = 5;
+    var parallel = try FlatIndex.ParallelSearcher.init(allocator, index, 4, 8, k);
+    defer parallel.deinit();
+
+    const queries = try allocator.alloc(f32, 32 * dim);
+    defer allocator.free(queries);
+    for (0..32) |i| randomUnit(queries[i * dim ..][0..dim], random);
+
+    const first = try allocator.alloc(Entry, 32 * k);
+    defer allocator.free(first);
+    @memcpy(first, try index.searchBatchParallel(queries, &parallel));
+
+    for (0..8) |_| {
+        const again = try index.searchBatchParallel(queries, &parallel);
+        for (first, again) |a, b| {
+            try testing.expectEqual(a.id, b.id);
+            try testing.expectEqual(a.score, b.score);
         }
     }
 }

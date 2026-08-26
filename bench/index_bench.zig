@@ -44,8 +44,8 @@ pub fn main() !void {
     }
 
     std.debug.print("\nFlatIndex: d={d} n={d} k={d}, {d} queries\n", .{ dim, n, k, nq });
-    std.debug.print("{s:>5} {s:>8} {s:>7} {s:>9} {s:>9} {s:>9} {s:>7} {s:>7}\n",
-        .{ "bits", "B/vector", "simd", "corpus", "QPS", "batched", "gain", "1@10" });
+    std.debug.print("{s:>5} {s:>8} {s:>8} {s:>9} {s:>9} {s:>8} {s:>7}\n",
+        .{ "bits", "B/vector", "corpus", "1-thread", "batched", "10-thr", "speedup" });
 
     for ([_]u6{ 2, 3, 4, 5 }) |bits| {
         var index = try zq.flat.FlatIndex.init(a, .{ .dim = dim, .bits = bits, .seed = 0x5EED });
@@ -85,15 +85,36 @@ pub fn main() !void {
         }
         const batch_ns = t.read();
 
+        // Query-parallel: threads own disjoint queries.
+        const threads = 10;
+        var par = try zq.flat.FlatIndex.ParallelSearcher.init(a, index, threads, 32, k);
+        defer par.deinit();
+        _ = try index.searchBatchParallel(queries[0 .. 32 * dim], &par);
+        t.reset();
+        {
+            var off: usize = 0;
+            const chunk = threads * 32;
+            while (off < nq) : (off += chunk) {
+                const take = @min(chunk, nq - off);
+                std.mem.doNotOptimizeAway(
+                    try index.searchBatchParallel(queries[off * dim ..][0 .. take * dim], &par),
+                );
+            }
+        }
+        const par_ns = t.read();
+
         const qps = @as(f64, @floatFromInt(nq)) / (@as(f64,@floatFromInt(search_ns))/1e9);
         const corpus_mb = @as(f64, @floatFromInt(n * index.bytesPerVector())) / 1e6;
-        std.debug.print("{d:>5} {d:>8} {s:>7} {d:>7.0}MB {d:>9.1} {d:>9.1} {d:>6.2}x {d:>7.3}\n", .{
-            bits, index.bytesPerVector(), if (index.vectorized()) "yes" else "no",
+        const par_qps = @as(f64, @floatFromInt(nq)) / (@as(f64, @floatFromInt(par_ns)) / 1e9);
+        std.debug.print("{d:>5} {d:>8} {d:>6.0}MB {d:>9.1} {d:>9.1} {d:>8.0} {d:>6.1}x {d:>7.3}\n", .{
+            bits,
+            index.bytesPerVector(),
             corpus_mb,
             qps,
-            @as(f64, @floatFromInt(nq)) / (@as(f64,@floatFromInt(batch_ns))/1e9),
-            (@as(f64, @floatFromInt(nq)) / (@as(f64,@floatFromInt(batch_ns))/1e9)) / qps,
-            @as(f64,@floatFromInt(hits))/@as(f64,@floatFromInt(nq)),
+            @as(f64, @floatFromInt(nq)) / (@as(f64, @floatFromInt(batch_ns)) / 1e9),
+            par_qps,
+            par_qps / qps,
+            @as(f64, @floatFromInt(hits)) / @as(f64, @floatFromInt(nq)),
         });
     }
 }

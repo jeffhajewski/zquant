@@ -769,6 +769,43 @@ comparison that matters is single-query against single-query: **6,072 QPS for tu
 `searchBatch` is kept anyway: it is a natural API, it is correct, and it is the right shape to
 parallelize over. But it was built on a mistaken premise and did not deliver what it was built for.
 
+### <a name="threads"></a>`HEAD` — query-parallel search
+
+Threads own disjoint **queries**, not disjoint corpus shards. Each thread therefore reads the whole
+corpus — which would be the wrong design if the scan were memory-bound, and is the right one now
+that [batching showed it is not](#batch). No shared mutable state, no top-k merge, no false
+sharing, and results are bit-identical to the serial path.
+
+| corpus | 1 thread | 10 threads | speedup |
+|---|---|---|---|
+| 26 MB | 192 | 1118 | 5.8× |
+| 52 MB | 199 | 1198 | 6.0× |
+| 103 MB | 215 | 1246 | 5.8× |
+
+**5.8–6.3×, not 10×.** Apple Silicon mixes performance and efficiency cores, so ten "cores" are not
+ten equal ones, and the speedup tracks the performance-core count. Worth noting the other end too:
+at 103 MB and 1246 QPS the corpus traffic is ~128 GB/s, which is near this machine's memory
+bandwidth — so the scan is compute-bound on one core and approaches a bandwidth wall on ten. Both
+statements are true and neither generalizes to the other.
+
+Threads are spawned per call, which is only viable because a batch is long enough to amortize it:
+~160 ms of work against ~30 µs of spawn cost per thread. Spawning per *query* would not pay, and
+`std.Thread.Pool` no longer exists in 0.16 (concurrency moved behind `Io.Group`). Migrating to that
+is the idiomatic path if per-call spawning ever becomes the bottleneck.
+
+**Where throughput now stands** (nytimes-256, 132 B/vector):
+
+| | QPS | note |
+|---|---|---|
+| zquant, 1 thread | 1,467 | |
+| turbovec, 1 query at a time | 6,072 | **4.1× ahead per core** |
+| zquant, 10 threads | 7,886 | beats turbovec's single-query rate |
+| turbovec, batched | 31,700 | almost certainly also threaded |
+
+Threading closes the gap against turbovec's *single-query* rate but not against its batched one. The
+honest reading is that we remain **roughly 4× behind per core**, and that is now the clearest
+remaining deficit — recall is competitive, per-core speed is not.
+
 ---
 
 ## Open items for P1

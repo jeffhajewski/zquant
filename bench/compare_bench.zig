@@ -175,6 +175,24 @@ pub fn main() !void {
             }
             const batch_ns = batch_timer.read();
 
+            // Query-parallel across 10 threads.
+            const threads = 10;
+            var par = try zq.flat.FlatIndex.ParallelSearcher.init(a, index, threads, 32, K);
+            defer par.deinit();
+            _ = try index.searchBatchParallel(queries.data[0 .. 32 * d], &par);
+            var par_timer = Timer.start();
+            {
+                var off: usize = 0;
+                const chunk = threads * 32;
+                while (off < nq) : (off += chunk) {
+                    const take = @min(chunk, nq - off);
+                    std.mem.doNotOptimizeAway(
+                        try index.searchBatchParallel(queries.data[off * d ..][0 .. take * d], &par),
+                    );
+                }
+            }
+            const par_ns = par_timer.read();
+
             _ = index.search(queries.data[0..d], &searcher);
             var timer = Timer.start();
             for (0..nq) |qi| {
@@ -205,6 +223,7 @@ pub fn main() !void {
             const fnq: f64 = @floatFromInt(nq);
             const qps = fnq / (@as(f64, @floatFromInt(elapsed)) / 1e9);
             const batch_qps = fnq / (@as(f64, @floatFromInt(batch_ns)) / 1e9);
+            const par_qps = fnq / (@as(f64, @floatFromInt(par_ns)) / 1e9);
 
             try out.print(a, "zquant,bits={d}{s},{d},{d:.4},{d},{d},{d},{d:.1},{d:.1}\n", .{
                 bits,
@@ -217,7 +236,7 @@ pub fn main() !void {
                 qps,
                 batch_qps,
             });
-            std.debug.print("  bits={d}{s:<12} {d:>3}B  R@10={d:.3}  med={d} p90={d} worst={d}  {d:.0} QPS  {d:.0} batched\n", .{
+            std.debug.print("  bits={d}{s:<12} {d:>3}B  R@10={d:.3}  med={d} p90={d} worst={d}  {d:.0} QPS  {d:.0} par\n", .{
                 bits,
                 if (calibrated) " +calibrate" else "",
                 index.bytesPerVector(),
@@ -226,7 +245,7 @@ pub fn main() !void {
                 ranks[nq * 9 / 10],
                 ranks[nq - 1],
                 qps,
-                batch_qps,
+                par_qps,
             });
         }
     }

@@ -255,8 +255,12 @@ it was caught.
   Higher dimensions (768–3072), where the design's assumptions are strongest, remain
   unrun.
 - Results differ substantially between the two, so neither generalizes on its own.
-- QPS is not comparable across systems here: turbovec and FAISS batch all 100 queries in
-  one call, zquant loops one at a time.
+- **QPS across systems needs care.** turbovec and FAISS take all queries in one call; a
+  fair single-query comparison is turbovec 6,072 against zquant 1,467 on nytimes at 132 B
+  — about **4× ahead per core**. With 10 threads zquant reaches 7,886, past turbovec's
+  single-query rate but short of its batched 31,700, which is almost certainly threaded
+  too. Recall is competitive; per-core throughput is not, and that is the clearest
+  remaining deficit.
 
 ## Reproducing
 

@@ -29,6 +29,7 @@ const packing = @import("../quant/packing.zig");
 const scan = @import("../simd/scan.zig");
 const sketch_kernel = @import("../simd/sketch.zig");
 const topk = @import("topk.zig");
+const Density = @import("../math/density.zig").Density;
 const RotationKind = @import("../math/rotation.zig").Kind;
 
 pub const Entry = topk.Entry;
@@ -173,6 +174,9 @@ pub const FlatIndex = struct {
     /// own inputs are quantized to 4 bits.
     scalars: std.ArrayList(StoredScalars),
 
+    /// Per-coordinate shifts for the rotated basis, length `padded`. Zero until
+    /// `calibrate` is called.
+    shifts: []f32,
     /// Per-coordinate scales for the rotated basis, length `padded`. All ones until
     /// `calibrate` is called.
     ///
@@ -224,6 +228,10 @@ pub const FlatIndex = struct {
         errdefer allocator.free(scales);
         @memset(scales, 1.0);
 
+        const shifts = try allocator.alloc(f32, quantizer.padded());
+        errdefer allocator.free(shifts);
+        @memset(shifts, 0.0);
+
         return .{
             .quantizer = quantizer,
             .layout = packing.Layout.init(quantizer.padded(), quantizer.mse.bits),
@@ -245,12 +253,14 @@ pub const FlatIndex = struct {
             .workspace = workspace,
             .encode_scratch = encode_scratch,
             .scales = scales,
+            .shifts = shifts,
             .calibrated = false,
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *FlatIndex) void {
+        self.allocator.free(self.shifts);
         self.allocator.free(self.scales);
         self.allocator.free(self.encode_scratch);
         self.codes.deinit(self.allocator);
@@ -306,51 +316,77 @@ pub const FlatIndex = struct {
         };
     }
 
-    /// Fit per-coordinate scales from a sample of representative vectors.
+    /// Fit a per-coordinate `(shift, scale)` by quantile anchoring.
     ///
-    /// Must be called before any `add`: codes written under different scales are not
-    /// comparable. The sample should be a uniform draw from what the index will hold
-    /// — a sorted or clustered slice will fit the wrong shape, and the resulting
-    /// index will be quietly worse rather than obviously broken.
+    /// Each coordinate is mapped by `z = (y + shift) * scale` before quantizing, with
+    /// the pair chosen so the coordinate's empirical quantiles land on the codebook's
+    /// outermost centroids. The anchor probability is `P(|x| <= c_outer)` under the
+    /// canonical marginal, taken from the codebook rather than fixed.
     ///
-    /// This is the one data-dependent step in an otherwise data-oblivious library.
-    /// It is opt-in for that reason: it costs a pass over a sample and gives up the
-    /// property that encoding depends only on the seed.
+    /// Approach from turbovec (MIT, Ryan Codrai). Fitting mean and standard deviation
+    /// instead — the obvious thing, and what an earlier version here did — measures
+    /// *worse* than no calibration, because matching σ says nothing about where the
+    /// tails land relative to the outermost centroid, and everything past it collapses
+    /// into one bucket.
+    ///
+    /// **Sample size matters more than it looks.** The anchor sits at ~0.9967 for a
+    /// 4-bit codebook, so the high quantile is an order statistic a few rows from the
+    /// end: a 1024-row sample puts only ~3 rows beyond it, and the resulting fit is
+    /// dominated by tail noise. Prefer several thousand rows, and more as bit-width
+    /// rises since the anchor moves further out.
+    ///
+    /// Must be called before any `add`.
     pub fn calibrate(self: *FlatIndex, sample: []const f32) !void {
         if (self.count() > 0) return error.IndexNotEmpty;
         const d = self.dim();
         std.debug.assert(sample.len % d == 0);
         const rows = sample.len / d;
-        if (rows == 0) return error.EmptySample;
+        if (rows < 2) return error.EmptySample;
 
         const padded = self.quantizer.padded();
-        const rotated = try self.allocator.alloc(f32, padded);
-        defer self.allocator.free(rotated);
         const staging = try self.allocator.alloc(f32, padded);
         defer self.allocator.free(staging);
-
-        const sum_sq = try self.allocator.alloc(f64, padded);
-        defer self.allocator.free(sum_sq);
-        @memset(sum_sq, 0);
-
+        const rotated = try self.allocator.alloc(f32, rows * padded);
+        defer self.allocator.free(rotated);
         for (0..rows) |i| {
-            _ = self.quantizer.mse.encodeRotated(sample[i * d ..][0..d], rotated, staging);
-            for (rotated, sum_sq) |v, *s2| s2.* += @as(f64, v) * v;
+            _ = self.quantizer.mse.encodeRotated(
+                sample[i * d ..][0..d],
+                rotated[i * padded ..][0..padded],
+                staging,
+            );
         }
 
-        // The codebook is built for a coordinate of variance 1/padded, so scale each
-        // coordinate by how far its own RMS departs from that.
+        const centroids = self.quantizer.mse.codebook.centroids;
+        var outer: f32 = 0;
+        for (centroids) |c| outer = @max(outer, @abs(c));
+
+        const density = Density.sphereCoord(padded);
+        const p_hi = density.mass(density.support()[0], outer);
+        const p_lo = 1.0 - p_hi;
+
         const frows: f64 = @floatFromInt(rows);
-        const target = 1.0 / @sqrt(@as(f64, @floatFromInt(padded)));
-        for (self.scales, sum_sq) |*t, s2| {
-            // Raw RMS, not the centred standard deviation: the encoder does not
-            // subtract the mean, so the codebook has to cover the offset too.
-            // Scaling by the centred σ leaves z overflowing the codebook's range and
-            // cost 3.4 points of R@10 when it slipped in.
-            const sigma = @sqrt(s2 / frows);
-            // A coordinate with no spread gets left alone rather than scaled by zero,
-            // which would make its codes meaningless.
-            t.* = if (sigma > 1e-20) @floatCast(sigma / target) else 1.0;
+        var lo_idx: usize = @intFromFloat(frows * p_lo);
+        var hi_idx: usize = @intFromFloat(frows * p_hi);
+        lo_idx = @min(lo_idx, rows - 2);
+        hi_idx = @max(@min(hi_idx, rows - 1), lo_idx + 1);
+
+        const column = try self.allocator.alloc(f32, rows);
+        defer self.allocator.free(column);
+
+        for (0..padded) |j| {
+            for (0..rows) |i| column[i] = rotated[i * padded + j];
+            std.mem.sort(f32, column, {}, std.sort.asc(f32));
+
+            const q_lo = column[lo_idx];
+            const q_hi = column[hi_idx];
+            const span = q_hi - q_lo;
+            if (!(span > 1e-20) or outer <= 0) {
+                self.shifts[j] = 0;
+                self.scales[j] = 1;
+                continue;
+            }
+            self.scales[j] = 2.0 * outer / span;
+            self.shifts[j] = -0.5 * (q_lo + q_hi);
         }
         self.calibrated = true;
     }
@@ -401,7 +437,9 @@ pub const FlatIndex = struct {
             },
         }
 
-        if (self.correction == .scalar) {
+        // Only for the uncalibrated path: `encodeCalibrated` already returns α, and
+        // running this over it treats that α as a residual norm and halves it.
+        if (self.correction == .scalar and !self.calibrated) {
             // α = ⟨y, ỹ⟩ / ‖ỹ‖², stored in gamma's slot since the sketch is unused.
             // ⟨y, ỹ⟩ = (‖y‖² + ‖ỹ‖² − ‖y−ỹ‖²)/2, and ‖y‖ = 1 after normalization.
             const centroids = self.quantizer.mse.codebook.centroids;
@@ -430,23 +468,24 @@ pub const FlatIndex = struct {
         const ws = &self.workspace;
         const norm = self.quantizer.mse.encodeRotated(vector, ws.rotated, ws.staging);
 
-        // z = y / t, quantized against the shared codebook.
-        //
-        // Not mean-centred, though the signal is real: |mean|/σ averages 0.78 on
-        // SIFT and reaches 3.8, so a symmetric codebook is off-centre. Subtracting
-        // the mean measured *worse* (0.883 → 0.864 at 68 B) for reasons not yet
-        // understood, so the transform stays out. See docs/comparison.md.
-        for (ws.staging, ws.rotated, self.scales) |*z, y, t| z.* = y / t;
+        // z = (y + shift) · scale, quantized against the shared codebook.
+        for (ws.staging, ws.rotated, self.shifts, self.scales) |*z, y, sh, sc| {
+            z.* = (y + sh) * sc;
+        }
         self.quantizer.mse.codebook.encodeSlice(ws.staging, codes);
 
-        // Residual: r̃ = t·c[code].
+        // α rescales the sum the estimator forms, Σ (p_j/scale_j)·c_j, so it is a
+        // least squares fit against u_j = c_j/scale_j — the pre-shift reconstruction.
         const centroids = self.quantizer.mse.codebook.centroids;
-        var residual_sq: f64 = 0;
-        for (codes, ws.staging, self.scales) |code, z, t| {
-            const diff = (@as(f64, z) - @as(f64, centroids[code])) * t;
-            residual_sq += diff * diff;
+        var recon_sq: f64 = 0;
+        var dot: f64 = 0;
+        for (codes, ws.rotated, self.shifts, self.scales) |code, y, sh, sc| {
+            const u = @as(f64, centroids[code]) / sc;
+            recon_sq += u * u;
+            dot += (@as(f64, y) + sh) * u;
         }
-        return .{ .norm = norm, .gamma = @floatCast(@sqrt(residual_sq)) };
+        const alpha = if (recon_sq > 0) dot / recon_sq else 1.0;
+        return .{ .norm = norm, .gamma = @floatCast(alpha) };
     }
 
     /// Append `n` vectors from a row-major buffer.
@@ -612,12 +651,32 @@ pub const FlatIndex = struct {
                 &searcher.query_states[i],
                 &searcher.workspace,
             );
-            if (self.calibrated) {
-                for (searcher.query_states[i].rotated, self.scales) |*p, t| p.* *= t;
-            }
+
             if (use_simd) {
                 searcher.scan_queries[i].load(searcher.query_states[i].rotated);
                 searcher.sketch_queries[i].load(searcher.query_states[i].sketched);
+            }
+        }
+
+        var shift_terms: [max_batch]f32 = @splat(0);
+        if (self.calibrated) {
+            for (0..n) |i| {
+                var acc: f64 = 0;
+                for (searcher.query_states[i].rotated, self.shifts) |p, sh| {
+                    acc += @as(f64, p) * sh;
+                }
+                shift_terms[i] = @floatCast(-acc);
+            }
+        }
+
+        if (self.calibrated) {
+            for (0..n) |i| {
+                for (searcher.query_states[i].rotated, self.scales) |*p, sc| p.* /= sc;
+            }
+        }
+        for (0..n) |i| {
+            if (self.vectorized()) {
+                searcher.scan_queries[i].load(searcher.query_states[i].rotated);
             }
         }
 
@@ -663,7 +722,7 @@ pub const FlatIndex = struct {
                 };
 
                 const estimate = switch (self.correction) {
-                    .scalar => norm * gamma * mse_term,
+                    .scalar => norm * (shift_terms[i] + gamma * mse_term),
                     .qjl_sketch => blk: {
                         const sketch_term = if (!self.use_sketch)
                             0
@@ -807,10 +866,15 @@ pub const FlatIndex = struct {
         // One rotation and one sketch for the whole corpus — the point of staying in
         // the rotated basis (docs/DESIGN.md §1.3).
         self.quantizer.prepareQuery(query, &searcher.query_state, &searcher.workspace);
+        // ⟨p, ỹ⟩ = Σ (p_j/scale_j)·c[code_j] − ⟨p, shift⟩; the second term is the
+        // same for every vector and cannot reorder them, but is included so scores
+        // are real inner-product estimates.
+        var shift_term: f32 = 0;
         if (self.calibrated) {
-            // The scale rides on the query, so the scan kernel keeps using the raw
-            // centroid table. Once per query, not once per vector.
-            for (searcher.query_state.rotated, self.scales) |*p, t| p.* *= t;
+            var acc: f64 = 0;
+            for (searcher.query_state.rotated, self.shifts) |p, sh| acc += @as(f64, p) * sh;
+            shift_term = @floatCast(-acc);
+            for (searcher.query_state.rotated, self.scales) |*p, sc| p.* /= sc;
         }
         const use_simd = self.vectorized();
         if (use_simd) {
@@ -850,7 +914,7 @@ pub const FlatIndex = struct {
             const gamma: f32 = scalars.gamma;
 
             const estimate = switch (self.correction) {
-                .scalar => norm * gamma * mse_term,
+                .scalar => norm * (shift_term + gamma * mse_term),
                 .qjl_sketch => blk: {
                     const sketch_term = if (!self.use_sketch)
                         0
@@ -1733,4 +1797,90 @@ test "expanded residency is refused above the table's bit-width" {
         .bits = 6,
         .residency = .expanded,
     }));
+}
+
+test "calibrated scores match an explicit reconstruction" {
+    // The estimator must equal ⟨p, ŷ⟩ for the reconstruction the encoder actually
+    // produced, ŷ_j = c[code_j]/scale_j − shift_j.
+    //
+    // This is the test that was missing. A stale post-encode block was overwriting
+    // the α returned by `encodeCalibrated`, treating it as a residual norm and
+    // halving it — scores came out ~21% low with a per-vector wobble, which looked
+    // like "calibration hurts recall" rather than like a bug. Comparing against an
+    // independent reconstruction finds it immediately.
+    const allocator = testing.allocator;
+    const dim: u32 = 128;
+    const n = 200;
+
+    const corpus = try allocator.alloc(f32, n * dim);
+    defer allocator.free(corpus);
+    var prng = std.Random.DefaultPrng.init(0xA1FA);
+    const random = prng.random();
+    // Skewed and anisotropic, so shift and scale both do real work.
+    for (0..n) |i| {
+        const row = corpus[i * dim ..][0..dim];
+        for (row, 0..) |*v, j| {
+            const decay = 1.0 / (1.0 + @as(f32, @floatFromInt(j)) * 0.05);
+            v.* = (random.floatNorm(f32) + 0.7) * decay;
+        }
+        const len = euclideanNorm(row);
+        for (row) |*v| v.* /= len;
+    }
+
+    var index = try FlatIndex.init(allocator, .{
+        .dim = dim,
+        .bits = 5,
+        .seed = 0x33,
+        .exact_scan = true,
+    });
+    defer index.deinit();
+    try index.calibrate(corpus);
+    try index.addBatch(corpus);
+
+    var searcher = try FlatIndex.Searcher.init(allocator, index, n);
+    defer searcher.deinit();
+
+    const padded = index.quantizer.padded();
+    const staging = try allocator.alloc(f32, padded);
+    defer allocator.free(staging);
+    const y = try allocator.alloc(f32, padded);
+    defer allocator.free(y);
+    const z = try allocator.alloc(f32, padded);
+    defer allocator.free(z);
+    const codes = try allocator.alloc(u8, padded);
+    defer allocator.free(codes);
+    const centroids = index.quantizer.mse.codebook.centroids;
+
+    var state = try prod_mod.QueryState.init(allocator, index.quantizer);
+    defer state.deinit();
+    var ws = try prod_mod.Workspace.init(allocator, index.quantizer);
+    defer ws.deinit();
+
+    const query = try allocator.alloc(f32, dim);
+    defer allocator.free(query);
+
+    for (0..10) |_| {
+        randomUnit(query, random);
+        const results = index.search(query, &searcher);
+        index.quantizer.prepareQuery(query, &state, &ws);
+
+        for (results[0..8]) |e| {
+            const id: usize = e.id;
+            _ = index.quantizer.mse.encodeRotated(corpus[id * dim ..][0..dim], y, staging);
+            for (z, y, index.shifts, index.scales) |*zz, yy, sh, sc| zz.* = (yy + sh) * sc;
+            index.quantizer.mse.codebook.encodeSlice(z, codes);
+
+            var expected: f64 = 0;
+            for (codes, state.rotated, index.shifts, index.scales) |c, p, sh, sc| {
+                expected += @as(f64, p) * (@as(f64, centroids[c]) / sc - sh);
+            }
+            // α is a deliberate rescale, so allow for it rather than demanding
+            // equality — but it must be close to 1, not off by a factor.
+            const ratio = @as(f64, e.score) / expected;
+            if (!(ratio > 0.85 and ratio < 1.18)) {
+                std.debug.print("score {d:.5} expected {d:.5} ratio {d:.4}\n", .{ e.score, expected, ratio });
+                return error.EstimatorMismatch;
+            }
+        }
+    }
 }

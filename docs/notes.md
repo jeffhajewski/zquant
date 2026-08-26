@@ -1014,8 +1014,28 @@ MIPS-optimal — the error that matters for inner products is weighted different
 matters for reconstruction — but I could not close the gap between that observation and turbovec's
 +8 points at 2 bits within a reasonable budget.
 
-**Reverted** to the mean/σ scale-only calibration, which is worth +1.4 points and is committed.
-Recorded here rather than left in the tree half-working.
+**Then found the actual bug.** The paradox — better reconstruction, worse retrieval — was not a
+deep property of MIPS. A stale post-encode block was still running unconditionally and
+**overwriting** the α that `encodeCalibrated` returns, treating it as a residual norm and applying
+the uncalibrated formula. With `gamma = α ≈ 1` that reduces to `(1 + ‖ŷ‖² − 1)/2/‖ŷ‖² = 0.5`
+exactly, which is the clean factor of 2 the diagnostic showed: stored α ≈ 0.50 against a correct
+0.99–1.01.
+
+It presented as "calibration hurts recall" because the halving carried a small per-vector wobble
+(0.207–0.229) that reordered near-ties, rather than as a constant factor that would have been
+harmless. Three hypotheses were tested and discarded first — int8 query quantization (exact f32
+shows the same gap), the α weighting (real, but not this), and quantile noise from a small sample
+(1024 rows and 10,000 rows agree to 0.001).
+
+**What found it:** comparing the index's score against an explicit `⟨p, ŷ⟩` computed from the
+reconstruction by hand. That is now a test. It would have caught this in seconds; every hypothesis
+above was reasoning about the *symptom* instead.
+
+**Where it lands after the fix.** The estimator now matches an independent reconstruction (index
+0.836, manual 0.838, truth 0.834), and calibration is correct rather than harmful — but it is close
+to **neutral**: +0.9 points at bits=3 on nytimes, ~0 at bits=5 on both corpora, slightly negative at
+the lowest bit-widths on SIFT. turbovec gets +8 at bits=2 on SIFT from the same transform, so
+something is still missing, and it is no longer the fit, the estimator, or the sample.
 
 **What is worth keeping from this:**
 

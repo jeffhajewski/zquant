@@ -123,7 +123,8 @@ pub fn main() !void {
     }
 
     for ([_]u6{ 2, 3, 4, 5 }) |bits| {
-        for ([_]bool{ false, true }) |calibrated| {
+        for ([_]usize{ 0, 1024, 10000 }) |calib_rows| {
+            const calibrated = calib_rows > 0;
             const residency: zq.flat.Residency = .compact;
             const exact = false;
             const sketch = true;
@@ -141,7 +142,7 @@ pub fn main() !void {
             defer index.deinit();
             if (calibrated) {
                 // Uniform draw from the corpus, as the fit requires.
-                const rows = 1024;
+                const rows = @min(base.count, calib_rows);
                 const stride = base.count / rows;
                 const sample = try a.alloc(f32, rows * d);
                 defer a.free(sample);
@@ -229,7 +230,7 @@ pub fn main() !void {
 
             try out.print(a, "zquant,bits={d}{s},{d},{d:.4},{d},{d},{d},{d:.1},{d:.1}\n", .{
                 bits,
-                if (calibrated) " +calibrate" else "",
+                if (calib_rows == 0) "" else if (calib_rows <= 1024) " +cal1k" else " +cal-all",
                 index.bytesPerVector(),
                 recall / fnq,
                 ranks[nq / 2],
@@ -240,7 +241,7 @@ pub fn main() !void {
             });
             std.debug.print("  bits={d}{s:<12} {d:>3}B  R@10={d:.3}  med={d} p90={d} worst={d}  {d:.0} QPS  {d:.0} par\n", .{
                 bits,
-                if (calibrated) " +calibrate" else "",
+                if (calib_rows == 0) "" else if (calib_rows <= 1024) " +cal1k" else " +cal-all",
                 index.bytesPerVector(),
                 recall / fnq,
                 ranks[nq / 2],

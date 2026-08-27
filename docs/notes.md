@@ -1079,3 +1079,56 @@ Recording these so they are not mistaken for oversights:
   we agree.
 - SIMD anywhere. P0 is the correctness oracle that P1's kernels get checked against, so it
   is written for obviousness, not speed.
+
+
+## 04bf5e4..HEAD — the calibration correction had to be fit in the basis it is applied in
+
+Quantile anchoring landed correct but near-neutral. The remaining error was in how α
+composed with it, and it took reading turbovec's scoring site to see it.
+
+Their kernel comment (`search.rs:588`) is the tell: *"fa already holds bias + Σ
+scale*partial — only vec_scales left"*. The per-vector correction multiplies the **whole**
+expression, shift bias included. Ours multiplied only half of it:
+
+```
+ours:   norm · (−⟨p,shift⟩ + α·⟨p,u⟩)          u = c/scale
+theirs: norm · α · (⟨p,u⟩ − ⟨p,shift⟩) = norm · α · ⟨p, x̂⟩
+```
+
+And ours fit α in the shifted basis, `⟨y+shift, u⟩/‖u‖²`, while applying it to a sum that
+is really about `x̂ = u − shift`. Both sides of that fit contain the shift, which dominates,
+so α came out ≈1 whatever the codes did — the correction had quietly become a no-op.
+
+**Neither half is the fix.** Measured separately on SIFT at bits=3:
+
+| variant | R@10 |
+|---|---|
+| baseline (old basis, old scope) | 0.582 |
+| new basis only | 0.600 |
+| new scope only | **0.463** |
+| both | **0.691** |
+
+Scope alone is *worse than doing nothing*. This is one change, not two: α is a least-squares
+coefficient, and it is only meaningful when fit against the same vector it multiplies.
+Mixing the bases produces a coefficient that is wrong for the sum it scales.
+
+**Result on SIFT** (anisotropic, where calibration has work to do): bits=2 0.285→0.357,
+bits=3 0.582→**0.691**, bits=4 0.773→0.832, bits=5 0.869→**0.907**. That is the +8-point
+class of gain turbovec gets, and it puts us ahead of them at both matched byte widths —
+0.691 vs 0.6825 at 36 B, 0.907 vs 0.9036 at 68 B.
+
+**nytimes stays neutral** (+0.7 at bits=3, ~0 elsewhere), and that is the expected shape
+rather than a disappointment: nytimes is near-isotropic after rotation, so there is little
+per-coordinate mis-fit for the shift/scale to remove. Calibration pays where the data is
+anisotropic.
+
+**On the earlier mechanism claim.** I had written that α was "a near-tautology ≈1" and
+expected the fix to make it a real shrinkage factor. Measured, α is 0.98–1.00 both before
+and after — the magnitude barely moves. The gain comes from α being the *right* coefficient
+for the sum it scales, not from it becoming small. I only found that by isolating the two
+changes; the recall win alone would have let the wrong story stand.
+
+**Test.** `calibrated alpha is the least-squares fit in the pre-shift basis` asserts α against
+its definition. The existing score-vs-reconstruction test cannot catch this: under the wrong
+basis the score stays *proportional* to ⟨p,x̂⟩, just with a wrong constant, so it passes with
+a ratio near 1. Verified the new test fails on the old basis before keeping it.

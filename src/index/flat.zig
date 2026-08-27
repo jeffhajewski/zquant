@@ -474,15 +474,18 @@ pub const FlatIndex = struct {
         }
         self.quantizer.mse.codebook.encodeSlice(ws.staging, codes);
 
-        // α rescales the sum the estimator forms, Σ (p_j/scale_j)·c_j, so it is a
-        // least squares fit against u_j = c_j/scale_j — the pre-shift reconstruction.
+        // α is a least squares fit of the rotated vector against its reconstruction
+        // in the *original* basis, x̂_j = c_j/scale_j − shift_j. Fitting in the
+        // shifted basis instead — y+shift against c/scale — makes α a near-tautology:
+        // both sides then contain the shift, which dominates, so α ≈ 1 no matter how
+        // coarse the codes are and the correction silently does nothing.
         const centroids = self.quantizer.mse.codebook.centroids;
         var recon_sq: f64 = 0;
         var dot: f64 = 0;
         for (codes, ws.rotated, self.shifts, self.scales) |code, y, sh, sc| {
-            const u = @as(f64, centroids[code]) / sc;
-            recon_sq += u * u;
-            dot += (@as(f64, y) + sh) * u;
+            const x_hat = @as(f64, centroids[code]) / sc - sh;
+            recon_sq += x_hat * x_hat;
+            dot += @as(f64, y) * x_hat;
         }
         const alpha = if (recon_sq > 0) dot / recon_sq else 1.0;
         return .{ .norm = norm, .gamma = @floatCast(alpha) };
@@ -722,7 +725,10 @@ pub const FlatIndex = struct {
                 };
 
                 const estimate = switch (self.correction) {
-                    .scalar => norm * (shift_terms[i] + gamma * mse_term),
+                    // α scales the whole reconstruction ⟨p, x̂⟩ = mse_term + shift_term,
+                    // not just one of its two halves: x̂ = c/scale − shift, so both
+                    // terms come from the same reconstruction and share its error.
+                    .scalar => norm * gamma * (shift_terms[i] + mse_term),
                     .qjl_sketch => blk: {
                         const sketch_term = if (!self.use_sketch)
                             0
@@ -914,7 +920,7 @@ pub const FlatIndex = struct {
             const gamma: f32 = scalars.gamma;
 
             const estimate = switch (self.correction) {
-                .scalar => norm * (shift_term + gamma * mse_term),
+                .scalar => norm * gamma * (shift_term + mse_term),
                 .qjl_sketch => blk: {
                     const sketch_term = if (!self.use_sketch)
                         0
@@ -1882,5 +1888,67 @@ test "calibrated scores match an explicit reconstruction" {
                 return error.EstimatorMismatch;
             }
         }
+    }
+}
+
+test "calibrated alpha is the least-squares fit in the pre-shift basis" {
+    // α must be ⟨y, x̂⟩/‖x̂‖² for x̂_j = c[code_j]/scale_j − shift_j — the same basis
+    // the estimator applies it in.
+    //
+    // The score-vs-reconstruction test above cannot see this. Fitting α in the
+    // shifted basis instead (⟨y+shift, u⟩/‖u‖² for u = c/scale) leaves the score
+    // still *proportional* to ⟨p, x̂⟩, so that test passes with a ratio near 1 —
+    // but the constant is wrong and recall drops 12 points on anisotropic data.
+    // Only checking α against its definition catches it.
+    const allocator = testing.allocator;
+    const dim: u32 = 96;
+    const n = 128;
+
+    const corpus = try allocator.alloc(f32, n * dim);
+    defer allocator.free(corpus);
+    var prng = std.Random.DefaultPrng.init(0xB2C3);
+    const random = prng.random();
+    // Off-centre and anisotropic, so the fitted shift is large: that is exactly the
+    // case where the two bases disagree.
+    for (0..n) |i| {
+        const row = corpus[i * dim ..][0..dim];
+        for (row, 0..) |*v, j| {
+            const decay = 1.0 / (1.0 + @as(f32, @floatFromInt(j)) * 0.04);
+            v.* = (random.floatNorm(f32) + 1.3) * decay;
+        }
+        const len = euclideanNorm(row);
+        for (row) |*v| v.* /= len;
+    }
+
+    var index = try FlatIndex.init(allocator, .{ .dim = dim, .bits = 3, .seed = 0x77 });
+    defer index.deinit();
+    try index.calibrate(corpus);
+    try index.addBatch(corpus);
+
+    const padded = index.quantizer.padded();
+    const staging = try allocator.alloc(f32, padded);
+    defer allocator.free(staging);
+    const y = try allocator.alloc(f32, padded);
+    defer allocator.free(y);
+    const z = try allocator.alloc(f32, padded);
+    defer allocator.free(z);
+    const codes = try allocator.alloc(u8, padded);
+    defer allocator.free(codes);
+    const centroids = index.quantizer.mse.codebook.centroids;
+
+    for (0..n) |id| {
+        _ = index.quantizer.mse.encodeRotated(corpus[id * dim ..][0..dim], y, staging);
+        for (z, y, index.shifts, index.scales) |*zz, yy, sh, sc| zz.* = (yy + sh) * sc;
+        index.quantizer.mse.codebook.encodeSlice(z, codes);
+
+        var dot: f64 = 0;
+        var recon_sq: f64 = 0;
+        for (codes, y, index.shifts, index.scales) |c, yy, sh, sc| {
+            const x_hat = @as(f64, centroids[c]) / sc - sh;
+            dot += @as(f64, yy) * x_hat;
+            recon_sq += x_hat * x_hat;
+        }
+        const want: f32 = @floatCast(dot / recon_sq);
+        try testing.expectApproxEqRel(want, index.scalars.items[id].gamma, 1e-3);
     }
 }

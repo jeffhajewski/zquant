@@ -7,16 +7,19 @@ in our harness**, rather than quoting published numbers.
 
 On **real text embeddings** (nytimes-256, d=256) zquant **wins the two highest storage
 bands outright**, including beating turbovec's best configuration at identical storage.
-On **SIFT10K** (d=128 image descriptors) it wins one middle band and trails at the
-extremes.
+On **SIFT10K** (d=128 image descriptors) it now **wins every band from 25 B up**, and
+trails only below 25 B, where FAISS PQ's learned codebook still leads.
 
-That difference is the most important result here. The first pass lost every band on
-SIFT, and it would have been easy to conclude the implementation was simply behind.
+The corpus difference is the most important result here. The first pass lost every band
+on SIFT, and it would have been easy to conclude the implementation was simply behind.
 Testing at a realistic embedding dimension — which is what the library actually targets
-— showed a materially different position.
+— showed a materially different position, and fixing the SIFT case later confirmed the
+gap had been a specific defect rather than a structural deficit.
 
-Two changes got there: a per-vector scalar in place of the paper's 1-bit sketch, and a
-fitted per-coordinate scale.
+Three changes got there: a per-vector scalar in place of the paper's 1-bit sketch, a
+fitted per-coordinate shift and scale anchored on the codebook's outermost centroids,
+and — the one that mattered most on SIFT — fitting the per-vector correction in the same
+basis the estimator applies it in.
 
 ## nytimes-256 — real text embeddings, d=256
 
@@ -91,18 +94,18 @@ R@10, 1000 queries, standard error ≈ 0.30 points.
 | system | config | B/vec | R@10 | med | p90 | worst |
 |---|---|---|---|---|---|---|
 | FAISS PQ | M=16,nbits=8 | 16 | **0.511** | 1 | 20 | 100 |
-| zquant | bits=2 scalar | 20 | 0.285 | 9 | 100 | 100 |
+| zquant | bits=2 scalar +calibrate | 20 | 0.357 | 5 | 58 | 100 |
 | FAISS RaBitQ | qb=5 | 24 | 0.395 | 2 | 39 | 100 |
 | FAISS PQ | M=32,nbits=8 | 32 | 0.641 | 0 | 6 | 68 |
 | turbovec | bits=2 | 35.9 | 0.602 | 1 | 7 | 62 |
 | turbovec | bits=2 +calibrate | 36 | **0.682** | 0 | 5 | 31 |
-| zquant | bits=3 scalar | 36 | 0.582 | 1 | 10 | 66 |
-| **zquant** | **bits=4 scalar +calibrate** | **52** | **0.776** | 0 | 2 | 23 |
+| **zquant** | **bits=3 scalar +calibrate** | **36** | **0.691** | 0 | 5 | 55 |
+| **zquant** | **bits=4 scalar +calibrate** | **52** | **0.832** | 0 | 2 | 8 |
 | FAISS PQ | M=64,nbits=8 | 64 | 0.845 | 0 | 2 | 22 |
 | turbovec | bits=3 | 67.9 | 0.770 | 0 | 3 | 17 |
 | turbovec | bits=3 +calibrate | 68 | 0.821 | 0 | 2 | 14 |
 | **zquant** | **bits=5 scalar** | **68** | **0.869** | 0 | 1 | 10 |
-| **zquant** | **bits=5 scalar +calibrate** | **68** | **0.883** | 0 | 1 | 7 |
+| **zquant** | **bits=5 scalar +calibrate** | **68** | **0.907** | 0 | 1 | 4 |
 | turbovec | bits=4 | 67.9 | 0.880 | 0 | 1 | 7 |
 | turbovec | bits=4 +calibrate | 68 | **0.904** | 0 | 1 | 9 |
 | zquant | bits=5 qjl-sketch | 84 | 0.833 | 0 | 2 | 10 |
@@ -111,20 +114,29 @@ R@10, 1000 queries, standard error ≈ 0.30 points.
 
 | | R@10 | vs zquant |
 |---|---|---|
-| turbovec bits=3 | 0.770 | **−11.3 pts** |
-| turbovec bits=3 +calibrate | 0.821 | **−6.2 pts** |
-| turbovec bits=4 | 0.880 | **−0.3 pts** |
-| **zquant bits=5 scalar +calibrate** | **0.883** | — |
-| turbovec bits=4 +calibrate | 0.904 | +2.1 pts |
+| turbovec bits=3 | 0.770 | **−13.7 pts** |
+| turbovec bits=3 +calibrate | 0.821 | **−8.6 pts** |
+| turbovec bits=4 | 0.880 | **−2.7 pts** |
+| turbovec bits=4 +calibrate | 0.904 | **−0.3 pts** |
+| **zquant bits=5 scalar +calibrate** | **0.907** | — |
 
 **Best in each storage band:**
 
 | band | winner | zquant | gap |
 |---|---|---|---|
-| 0–25 B | FAISS PQ 0.511 | 0.285 | **−0.226** |
-| 25–40 B | turbovec 0.682 | 0.590 | **−0.093** |
-| **40–56 B** | **zquant 0.776** | — | **wins** |
-| 56–72 B | turbovec 0.904 | 0.883 | −0.020 |
+| 0–25 B | FAISS PQ 0.511 | 0.357 | **−0.154** |
+| **25–40 B** | **zquant 0.691** | — | **wins** (turbovec 0.682) |
+| **40–56 B** | **zquant 0.832** | — | **wins** |
+| **56–72 B** | **zquant 0.907** | — | **wins** (turbovec 0.904, a tie) |
+
+Calibration is what moved three of these bands. Fitting the per-vector correction α in the
+same basis it is applied in — against `x̂ = c/scale − shift`, not against `c/scale` — is
+worth +10.9 points at bits=3 and +3.8 at bits=5. The two halves of that change do not
+decompose: applying α to the whole estimator while still fitting it in the shifted basis
+scores 0.463, *below* the 0.582 baseline. See `docs/notes.md`.
+
+The remaining loss is the sub-25 B band, where product quantization's learned codebook
+still beats a scalar quantizer with a fixed density — a structural gap, not a tuning one.
 
 ## The scalar correction
 

@@ -1477,3 +1477,44 @@ k=10 and k=100; a few points of that are now recovered and the rest is not expla
 staging buffer should have helped more than it did — it cuts cold-heap touches eightfold —
 so something beyond heap locality is still involved. Branch misprediction on the mask test
 accounts for perhaps a seventh of the gap by arithmetic, which leaves most of it open.
+
+
+## Reading turbovec's collector, and finding it is worse than ours
+
+The right move after two failed guesses was to read their code rather than reason further.
+`neon_block_topk_update` and `rescan_min` do two things we do not:
+
+1. **Their collector is not a heap.** It is an unsorted k-entry array with a tracked
+   minimum; an accept overwrites the minimum slot and a **linear O(k) scan** finds the new
+   one. Asymptotically worse than a sift, but sequential and predictable where a sift chases
+   scattered dependent accesses — which is exactly the shape of cost measured at ~55 ns per
+   accept.
+2. **A whole-block prune.** They score 32 vectors into a contiguous array, take a SIMD max
+   across all 32, and skip the entire lane loop on one compare.
+
+The first looked like the answer. Implemented faithfully, including their tie-break (evict
+the larger id so the earlier survives), it is **much worse** at the depths that matter:
+
+| k | our heap | their array + rescan |
+|---|---|---|
+| 10 | 149.5 | 152.9 |
+| 50 | 141.1 | 137.7 |
+| 100 | 130.7 | **112.5** |
+| 200 | 113.1 | **74.0** |
+
+The O(k) rescan wins at k=10 and loses badly past it. Reverted.
+
+**Their own comments say why this was never going to transfer.** `range_cap_for_k` notes
+"each range keeps its own k-entry heap (every replacement an O(k) `rescan_min`)" and calls
+k=10 "the batch default". Their collector is tuned for small k and is a handicap at k=100 —
+the depth our harness compares at, since that is what `baselines.py` asks of both systems.
+
+**So this rules the collector out as the source of their advantage**, which is worth more
+than another few percent. They beat us at k=100 while carrying a collector that is worse
+than ours at k=100. Whatever the remaining gap is, it is in the scan and block structure —
+the second item above, which we have not tried — and not in result collection.
+
+The block prune is the open lead. Ours tests one vector against eight queries; theirs tests
+32 vectors against one query, so it runs a quarter as many prune tests over the same work.
+Whether that pays is not obvious by arithmetic — their test is a max-reduce over 32 lanes
+against our single compare — so it needs measuring, not estimating.

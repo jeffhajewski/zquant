@@ -707,6 +707,7 @@ pub const FlatIndex = struct {
         // vector, so each code chunk is loaded once rather than once per query. See
         // `scan.scoreExpandedMulti` for why batching did nothing without this.
         const group = 8;
+        const compact_width = if (use_simd) scan.multiWidth(self.layout) else 1;
         var mse_terms: [max_batch]f32 = undefined;
 
         for (self.scalars.items, 0..) |scalars, v| {
@@ -736,13 +737,35 @@ pub const FlatIndex = struct {
                         padded,
                     );
                 }
+            } else if (use_simd) {
+                // The unpack is query-independent, so the group shares it.
+                var i: usize = 0;
+                while (i + compact_width <= n) : (i += compact_width) {
+                    scan.scoreInt8Multi(
+                        self.layout,
+                        searcher.table,
+                        searcher.scan_queries[i..],
+                        code_slot,
+                        padded,
+                        mse_terms[i..],
+                    );
+                }
+                while (i < n) : (i += 1) {
+                    mse_terms[i] = scan.scoreInt8(
+                        self.layout,
+                        searcher.table,
+                        searcher.scan_queries[i],
+                        code_slot,
+                        padded,
+                    );
+                }
             }
 
             for (0..n) |i| {
                 const mse_term = switch (self.residency) {
                     .expanded => mse_terms[i],
                     .compact => if (use_simd)
-                        scan.scoreInt8(self.layout, searcher.table, searcher.scan_queries[i], code_slot, padded)
+                        mse_terms[i]
                     else
                         scan.scoreExact(self.layout, centroids, searcher.query_states[i].rotated, code_slot),
                 };

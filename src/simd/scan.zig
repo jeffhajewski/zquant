@@ -311,6 +311,95 @@ pub fn scoreExpandedMulti(
     }
 }
 
+/// Widest query group the compact kernels can hold without spilling.
+///
+/// A sequential layout keeps one accumulator per bit-field group, so the multi-query
+/// form needs `Q * groups` of them. aarch64 has 32 vector registers and the loop also
+/// needs the code chunk, the unpacked values and a query chunk, so the accumulator
+/// budget is 16. Exceeding it spills to the stack, which cost 42% when it happened
+/// to the single-query kernel.
+pub fn multiWidth(layout: Layout) usize {
+    return switch (layout.kind()) {
+        .sequential => @max(1, 16 / (8 / @as(usize, layout.bits))),
+        .bit_plane => 4,
+    };
+}
+
+/// Score one packed vector against `Q` queries in a single pass.
+///
+/// The unpack — shift, mask, and table lookup — does not depend on the query, so the
+/// single-query kernel redoes all of it for every query in a batch. Here it happens
+/// once per bit-field group and feeds `Q` SDOTs, which is a larger saving than the
+/// expanded kernel gets: that one only amortizes a load, this amortizes the whole
+/// unpack.
+fn scoreBitsMulti(
+    comptime bits: u6,
+    comptime Q: usize,
+    table: Table,
+    queries: []const Query,
+    codes: []const u8,
+    dim: u32,
+    out: []f32,
+) void {
+    const groups = comptime 8 / @as(usize, bits);
+    const mask_value = comptime (@as(u8, 1) << @as(u3, @intCast(bits))) - 1;
+    const field_mask: @Vector(16, u8) = @splat(mask_value);
+    const chunks = @as(usize, dim) * bits / 128;
+
+    var qp: [Q][*]const i8 = undefined;
+    inline for (0..Q) |q| qp[q] = queries[q].data.ptr;
+    const qstride = queries[0].stride;
+
+    var acc: [Q][groups]dot.Acc = @splat(@splat(@splat(0)));
+
+    for (0..chunks) |ch| {
+        const packed_codes: @Vector(16, u8) = codes[ch * 16 ..][0..16].*;
+        inline for (0..groups) |k| {
+            const shift: @Vector(16, u3) = @splat(@intCast(k * bits));
+            const idx = (packed_codes >> shift) & field_mask;
+            // Hoisted out of the query loop: this is the whole point of the kernel.
+            const vals = lookup(table.values, idx);
+            inline for (0..Q) |q| {
+                const w: @Vector(16, i8) = qp[q][k * qstride + ch * 16 ..][0..16].*;
+                acc[q][k] = dot.accumulate(acc[q][k], vals, w);
+            }
+        }
+    }
+
+    inline for (0..Q) |q| {
+        var folded: dot.Acc = acc[q][0];
+        inline for (1..groups) |i| folded += acc[q][i];
+        const sum: f32 = @floatFromInt(dot.total(folded));
+        out[q] = sum * table.scale * queries[q].scale;
+    }
+}
+
+/// Multi-query compact score. `layout` must satisfy `canVectorize`, and `queries`
+/// and `out` must hold at least `multiWidth(layout)` entries.
+pub fn scoreInt8Multi(
+    layout: Layout,
+    table: Table,
+    queries: []const Query,
+    codes: []const u8,
+    dim: u32,
+    out: []f32,
+) void {
+    std.debug.assert(codes.len * 8 >= @as(usize, dim) * layout.bits);
+    switch (layout.kind()) {
+        .sequential => switch (layout.bits) {
+            1 => scoreBitsMulti(1, 2, table, queries, codes, dim, out),
+            2 => scoreBitsMulti(2, 4, table, queries, codes, dim, out),
+            4 => scoreBitsMulti(4, 8, table, queries, codes, dim, out),
+            else => unreachable,
+        },
+        // Bit-plane assembles its indices from planes rather than by shift-and-mask;
+        // it keeps the per-query kernel until that is worth restructuring too.
+        .bit_plane => for (0..multiWidth(layout)) |q| {
+            out[q] = scoreInt8(layout, table, queries[q], codes, dim);
+        },
+    }
+}
+
 /// Vectorized score. `bits` must satisfy `canVectorize`.
 pub fn scoreInt8(layout: Layout, table: Table, query: Query, codes: []const u8, dim: u32) f32 {
     std.debug.assert(codes.len * 8 >= @as(usize, dim) * layout.bits);
@@ -643,4 +732,75 @@ test "exact reference agrees with a naive unpacked dot product" {
         scoreExact(layout, cb.centroids, rotated, codes),
         1e-6,
     );
+}
+
+test "multi-query kernels agree exactly with the per-query kernels" {
+    // Restructuring the loop must not change a single bit of the result: the multi
+    // form does the same SDOTs in the same order, only with the unpack hoisted. An
+    // approximate bound here would hide exactly the reordering bugs worth catching.
+    for ([_]u6{ 1, 2, 4 }) |bits| {
+        for ([_]u32{ 128, 256, 1024 }) |dim| {
+            const layout = Layout.init(dim, bits);
+            if (!canVectorize(layout)) continue;
+            const width = multiWidth(layout);
+
+            const codes = try testing.allocator.alloc(u8, layout.stride());
+            defer testing.allocator.free(codes);
+            const rotated = try testing.allocator.alloc(f32, dim);
+            defer testing.allocator.free(rotated);
+            var cb = try setup(dim, bits, 0x1234 + dim + bits, codes, rotated);
+            defer cb.deinit();
+            const table = Table.init(cb.centroids);
+
+            const queries = try testing.allocator.alloc(Query, width);
+            defer testing.allocator.free(queries);
+            var built: usize = 0;
+            defer for (0..built) |i| queries[i].deinit();
+            var prng = std.Random.DefaultPrng.init(dim + bits);
+            const random = prng.random();
+            const scratch = try testing.allocator.alloc(f32, dim);
+            defer testing.allocator.free(scratch);
+            while (built < width) : (built += 1) {
+                queries[built] = try Query.init(testing.allocator, layout);
+                for (scratch) |*v| v.* = random.floatNorm(f32) / @sqrt(@as(f32, @floatFromInt(dim)));
+                queries[built].load(scratch);
+            }
+
+            const out = try testing.allocator.alloc(f32, width);
+            defer testing.allocator.free(out);
+            scoreInt8Multi(layout, table, queries, codes, dim, out);
+
+            for (0..width) |q| {
+                const one = scoreInt8(layout, table, queries[q], codes, dim);
+                try testing.expectEqual(one, out[q]);
+            }
+        }
+    }
+}
+
+test "expanded multi-query kernel agrees exactly with the per-query kernel" {
+    const dim: u32 = 512;
+    const values = try testing.allocator.alloc(i8, dim);
+    defer testing.allocator.free(values);
+    var prng = std.Random.DefaultPrng.init(0xC0DE);
+    const random = prng.random();
+    for (values) |*v| v.* = random.intRangeAtMost(i8, -127, 127);
+
+    const Q = 8;
+    var queries: [Q]Query = undefined;
+    var built: usize = 0;
+    defer for (0..built) |i| queries[i].deinit();
+    const scratch = try testing.allocator.alloc(f32, dim);
+    defer testing.allocator.free(scratch);
+    while (built < Q) : (built += 1) {
+        queries[built] = try Query.initSequential(testing.allocator, dim);
+        for (scratch) |*v| v.* = random.floatNorm(f32) / @sqrt(@as(f32, @floatFromInt(dim)));
+        queries[built].load(scratch);
+    }
+
+    var out: [Q]f32 = undefined;
+    scoreExpandedMulti(Q, values, queries[0..], 0.01, dim, out[0..]);
+    for (0..Q) |q| {
+        try testing.expectEqual(scoreExpanded(values, queries[q], 0.01, dim), out[q]);
+    }
 }

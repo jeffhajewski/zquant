@@ -1264,3 +1264,35 @@ spend effort.
 and ~25,300 parallel; expanded 260 B at 5,257 batched and ~28,400 parallel. turbovec is
 38,052 at 270 B and 0.914 — so 1.34× behind at matched memory, from 4.2× when this started,
 with equal recall and, in the compact configuration, half the memory.
+
+
+## The sub-25 B gap is the codes, and three cheaper explanations are not
+
+FAISS PQ leads below 25 B/vector on SIFT — 0.511 at 16 B against our 0.357 at 20 B. Three
+candidate causes, each cheap to test, each eliminated:
+
+| hypothesis | test | result |
+|---|---|---|
+| int8 query quantization or the estimator | exact f32 scan of the same codes | **0.356 vs 0.357** — identical |
+| the rotation leaves structure unmixed | 4, 6, 8 RHT rounds instead of 3 | +0.6 to +1.2 points, saturates by 6 |
+| too many dimensions, too few bits each | d/2 at 2 bits, d/4 at 2–4 bits, same bytes | **0.232 and 0.071** — far worse |
+
+The first is the important one. An exact f32 scan over the same codes scores the same to
+within noise, so nothing in the query path or the estimator is losing anything: **the codes
+themselves are the limit.** The paper's QJL sketch correction is also confirmed worse here —
+0.262 at 36 B against the scalar correction's 0.357 at 20 B.
+
+The mixing test is worth noting because calibration gains +7 points on SIFT and ~0 on
+nytimes, which reads as "the rotation is failing to mix SIFT". More rounds recovers about a
+point of that, so the rotation is fine and the calibration gain comes from somewhere else.
+
+The third result is the most useful for design. A random rotation makes coordinates
+exchangeable, so keeping the first m is a Johnson–Lindenstrauss projection — it trades signal
+for bits on the coordinates that survive. At equal bytes that trade loses badly in both
+directions tested. For MIPS at ~1 bit per dimension, **dimension count dominates
+per-coordinate precision**, and there is no budget to buy precision with.
+
+What remains is a learned or vector quantizer. Per-coordinate scalar quantization against a
+fixed density cannot represent inter-coordinate structure at all, and that is exactly what
+PQ's learned sub-vector codebooks buy at this bit rate. It is a real feature, not a tuning
+change.

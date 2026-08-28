@@ -744,6 +744,35 @@ pub const FlatIndex = struct {
                         );
                     }
                 }
+            } else if (use_simd and take == tile and scan.canTile(self.layout)) {
+                // Both amortizations at once: shared unpack and register-resident
+                // query chunks.
+                var i: usize = 0;
+                while (i + group <= n) : (i += group) {
+                    scan.scoreInt8Tiled(
+                        tile,
+                        group,
+                        self.layout,
+                        searcher.table,
+                        searcher.scan_queries[i..],
+                        self.codes.items.ptr + v0 * stride,
+                        stride,
+                        padded,
+                        mse_block[i..],
+                        max_batch,
+                    );
+                }
+                while (i < n) : (i += 1) {
+                    for (0..take) |u| {
+                        mse_block[u * max_batch + i] = scan.scoreInt8(
+                            self.layout,
+                            searcher.table,
+                            searcher.scan_queries[i],
+                            self.codes.items[(v0 + u) * stride ..][0..stride],
+                            padded,
+                        );
+                    }
+                }
             } else if (use_simd) {
                 // The unpack is query-independent, so the group shares it.
                 for (0..take) |u| {

@@ -425,6 +425,93 @@ fn scoreBitsMulti(
     }
 }
 
+/// Score `V` consecutive packed vectors against `Q` queries in one pass.
+///
+/// Combines both amortizations: the unpack is shared across the query group, and the
+/// query chunks stay in registers across the vector tile.
+///
+/// Unlike `scoreBitsMulti` this keeps one accumulator per (vector, query) rather than
+/// per (query, bit-field group), so the tile costs V·Q accumulators whatever the bit
+/// width — which is what lets Q stay at 4 for every layout instead of shrinking as
+/// `groups` grows. Integer addition is associative, so folding the groups into one
+/// accumulator is still bit-identical to summing them separately.
+fn scoreBitsTiled(
+    comptime bits: u6,
+    comptime V: usize,
+    comptime Q: usize,
+    table: Table,
+    queries: []const Query,
+    base: [*]const u8,
+    code_stride: usize,
+    dim: u32,
+    out: []f32,
+    out_stride: usize,
+) void {
+    const groups = comptime 8 / @as(usize, bits);
+    const mask_value = comptime (@as(u8, 1) << @as(u3, @intCast(bits))) - 1;
+    const field_mask: @Vector(16, u8) = @splat(mask_value);
+    const chunks = @as(usize, dim) * bits / 128;
+
+    var qp: [Q][*]const i8 = undefined;
+    inline for (0..Q) |q| qp[q] = queries[q].data.ptr;
+    const qstride = queries[0].stride;
+
+    var acc: [V][Q]dot.Acc = @splat(@splat(@splat(0)));
+
+    for (0..chunks) |ch| {
+        var pc: [V]@Vector(16, u8) = undefined;
+        inline for (0..V) |v| pc[v] = base[v * code_stride + ch * 16 ..][0..16].*;
+
+        inline for (0..groups) |k| {
+            const shift: @Vector(16, u3) = @splat(@intCast(k * bits));
+            var w: [Q]@Vector(16, i8) = undefined;
+            inline for (0..Q) |q| w[q] = qp[q][k * qstride + ch * 16 ..][0..16].*;
+            inline for (0..V) |v| {
+                const vals = lookup(table.values, (pc[v] >> shift) & field_mask);
+                inline for (0..Q) |q| acc[v][q] = dot.accumulate(acc[v][q], vals, w[q]);
+            }
+        }
+    }
+
+    inline for (0..V) |v| {
+        inline for (0..Q) |q| {
+            const sum: f32 = @floatFromInt(dot.total(acc[v][q]));
+            out[v * out_stride + q] = sum * table.scale * queries[q].scale;
+        }
+    }
+}
+
+/// Whether a vector-tiled compact kernel exists for this layout.
+pub fn canTile(layout: Layout) bool {
+    return switch (layout.kind()) {
+        .sequential => layout.bits == 1 or layout.bits == 2 or layout.bits == 4,
+        // Bit-plane assembles indices from planes rather than by shift-and-mask.
+        .bit_plane => false,
+    };
+}
+
+/// Vector-tiled compact score. `canTile(layout)` must hold.
+pub fn scoreInt8Tiled(
+    comptime V: usize,
+    comptime Q: usize,
+    layout: Layout,
+    table: Table,
+    queries: []const Query,
+    base: [*]const u8,
+    code_stride: usize,
+    dim: u32,
+    out: []f32,
+    out_stride: usize,
+) void {
+    std.debug.assert(canTile(layout));
+    switch (layout.bits) {
+        1 => scoreBitsTiled(1, V, Q, table, queries, base, code_stride, dim, out, out_stride),
+        2 => scoreBitsTiled(2, V, Q, table, queries, base, code_stride, dim, out, out_stride),
+        4 => scoreBitsTiled(4, V, Q, table, queries, base, code_stride, dim, out, out_stride),
+        else => unreachable,
+    }
+}
+
 /// Multi-query compact score. `layout` must satisfy `canVectorize`, and `queries`
 /// and `out` must hold at least `multiWidth(layout)` entries.
 pub fn scoreInt8Multi(
@@ -883,4 +970,52 @@ test "tiled kernel agrees exactly with the per-query kernel" {
         const one = scoreExpanded(store[v * dim ..][0..dim], queries[q], 0.01, dim);
         try testing.expectEqual(one, out[v * Q + q]);
     };
+}
+
+test "compact tiled kernel agrees exactly with the per-query kernel" {
+    for ([_]u6{ 1, 2, 4 }) |bits| {
+        for ([_]u32{ 128, 256, 1024 }) |dim| {
+            const layout = Layout.init(dim, bits);
+            if (!canVectorize(layout)) continue;
+            const V = 4;
+            const Q = 4;
+            const stride = layout.stride();
+
+            const codes = try testing.allocator.alloc(u8, V * stride);
+            defer testing.allocator.free(codes);
+            const rotated = try testing.allocator.alloc(f32, dim);
+            defer testing.allocator.free(rotated);
+            var cb: ?Codebook = null;
+            defer if (cb) |*c| c.deinit();
+            for (0..V) |v| {
+                var c = try setup(dim, bits, 0x900D + dim + bits + v, codes[v * stride ..][0..stride], rotated);
+                if (cb) |*prev| prev.deinit();
+                cb = c;
+                _ = &c;
+            }
+            const table = Table.init(cb.?.centroids);
+
+            const queries = try testing.allocator.alloc(Query, Q);
+            defer testing.allocator.free(queries);
+            var built: usize = 0;
+            defer for (0..built) |i| queries[i].deinit();
+            var prng = std.Random.DefaultPrng.init(dim + bits);
+            const random = prng.random();
+            while (built < Q) : (built += 1) {
+                queries[built] = try Query.init(testing.allocator, layout);
+                for (rotated) |*x| x.* = random.floatNorm(f32) / @sqrt(@as(f32, @floatFromInt(dim)));
+                queries[built].load(rotated);
+            }
+
+            const out = try testing.allocator.alloc(f32, V * Q);
+            defer testing.allocator.free(out);
+            try testing.expect(canTile(layout));
+            scoreInt8Tiled(V, Q, layout, table, queries, codes.ptr, stride, dim, out, Q);
+
+            for (0..V) |v| for (0..Q) |q| {
+                const one = scoreInt8(layout, table, queries[q], codes[v * stride ..][0..stride], dim);
+                try testing.expectEqual(one, out[v * Q + q]);
+            };
+        }
+    }
 }

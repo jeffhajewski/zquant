@@ -104,30 +104,46 @@ pub fn main() !void {
         const par_ns = t.read();
 
         const qps = @as(f64, @floatFromInt(nq)) / (@as(f64,@floatFromInt(search_ns))/1e9);
-        const qps_single = qps;
+        // Retained: the sweep now reports speedup against its own 1-thread run.
+        std.mem.doNotOptimizeAway(qps);
 
         // Thread-count sweep, to separate "our scaling is poor" from "this machine has
         // 4 performance and 6 efficiency cores"., to separate "our scaling is poor" from "this machine has
         // 4 performance and 6 efficiency cores".
         if (bits == 5) {
-            std.debug.print("  thread sweep at bits=5:\n", .{});
+            // Sweep over a replicated query set, not the 100 ground-truth queries.
+            // With only 100, ten threads get batches of ten while eight get twelve,
+            // so the per-vector cost amortizes over fewer queries as the thread count
+            // rises — the sweep would measure that, not scaling. Every thread here
+            // gets a full 32-query batch at every thread count.
+            const sweep_n = 640;
+            const sweep_queries = try a.alloc(f32, sweep_n * dim);
+            defer a.free(sweep_queries);
+            for (0..sweep_n) |i| {
+                @memcpy(sweep_queries[i * dim ..][0..dim], queries[(i % nq) * dim ..][0..dim]);
+            }
+
+            std.debug.print("  thread sweep at bits=5 ({d} queries, 32 per thread per call):\n",
+                .{sweep_n});
+            var base_qps: f64 = 0;
             for ([_]usize{ 1, 2, 4, 6, 8, 10 }) |tc| {
                 var sweep = try zq.flat.FlatIndex.ParallelSearcher.init(a, index, tc, 32, k);
                 defer sweep.deinit();
-                _ = try index.searchBatchParallel(queries[0 .. 32 * dim], &sweep);
+                _ = try index.searchBatchParallel(sweep_queries[0 .. 32 * dim], &sweep);
                 var st = Timer.start();
                 var off: usize = 0;
                 const chunk = tc * 32;
-                while (off < nq) : (off += chunk) {
-                    const take = @min(chunk, nq - off);
+                while (off < sweep_n) : (off += chunk) {
+                    const take = @min(chunk, sweep_n - off);
                     std.mem.doNotOptimizeAway(
-                        try index.searchBatchParallel(queries[off * dim ..][0 .. take * dim], &sweep),
+                        try index.searchBatchParallel(sweep_queries[off * dim ..][0 .. take * dim], &sweep),
                     );
                 }
                 const ns = st.read();
-                const tq = @as(f64, @floatFromInt(nq)) / (@as(f64, @floatFromInt(ns)) / 1e9);
-                std.debug.print("    {d:>2} threads: {d:>8.0} QPS  {d:>5.2}x\n",
-                    .{ tc, tq, tq / qps_single });
+                const tq = @as(f64, @floatFromInt(sweep_n)) / (@as(f64, @floatFromInt(ns)) / 1e9);
+                if (tc == 1) base_qps = tq;
+                std.debug.print("    {d:>2} threads: {d:>8.0} QPS  {d:>5.2}x  ({d:.0}% eff)\n",
+                    .{ tc, tq, tq / base_qps, tq / base_qps / @as(f64, @floatFromInt(tc)) * 100 });
             }
         }
 

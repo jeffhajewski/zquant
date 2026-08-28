@@ -1187,3 +1187,45 @@ Single-thread batched throughput is stable to about ±5% and is the honest numbe
 the parallel figures above are first-run (coldest) and should be read as an upper bound.
 The corollary is that the remaining nytimes gap is partly parallel efficiency — 3,845 batched
 single-thread against ~21,100 across 10 threads is 5.5×, not the ~8× the core count suggests.
+
+
+## Parallel scaling: the anomaly was the benchmark, not the scheduler
+
+The thread sweep showed ten threads running *slower* than eight — 3,269 against 3,739 QPS
+at d=1024, reproducible across runs. A work-conserving split cannot do that, so the reading
+was that static equal shares were stranding work on the four performance / six efficiency
+core split, with every thread waiting on the slowest.
+
+**That was wrong, and implementing the fix is what showed it.** Replacing the static split
+with threads claiming chunks from an atomic cursor made things *worse* by about 15% at every
+thread count, including one thread — which contends with nothing. The cause is that each
+`searchBatch` call is a full pass over the corpus, so chunks smaller than the batch multiply
+the per-vector overhead. Measured back-to-back against a stashed baseline, because the
+machine drifts enough (740 → 635 at one thread across fifteen minutes) that comparing to an
+earlier run would have credited the drift to the change.
+
+The real cause was the benchmark. It swept over the 100 ground-truth queries, so at ten
+threads each thread got a batch of ten while at eight it got twelve or thirteen. The
+per-vector cost amortizes over the batch, so raising the thread count *shrank* the unit of
+work. The sweep was measuring batch efficiency and calling it scaling.
+
+Sweeping over a replicated 640-query set, so every thread gets a full 32-query batch at
+every thread count:
+
+| threads | QPS | speedup | efficiency |
+|---|---|---|---|
+| 1 | 744 | 1.00× | 100% |
+| 2 | 1,443 | 1.94× | 97% |
+| 4 | 2,897 | 3.89× | 97% |
+| 8 | 4,214 | 5.66× | 71% |
+| 10 | 4,314 | 5.80× | 58% |
+
+Monotonic, and 97% across the four performance cores. The efficiency column falls only
+because the last six cores are efficiency cores; 5.80× on 4P+6E is close to the machine's
+real capacity.
+
+**Correction.** I had listed parallel efficiency as part of the remaining gap against
+turbovec, on the strength of "3,845 single-thread against ~21,100 on 10 threads is 5.5×,
+short of the core count." The core count was the wrong denominator — six of those cores are
+worth about a third of a performance core each. Scaling is close to maxed, and the remaining
+throughput gap is per-core kernel work, not threading.

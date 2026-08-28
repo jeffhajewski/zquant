@@ -20,6 +20,12 @@ Each preset isolates one property:
              transformer KV caches actually look like ("massive activations"). A stated
              target of this library that no benchmark here has ever exercised.
 
+  offset     Isotropic directions plus a shared mean vector, so the corpus centroid sits
+             away from the origin. A random rotation preserves that offset, and a
+             per-coordinate shift is exactly what removes it — this is the knob the
+             `spectrum` sweep showed was the real one, since calibration pays nothing at
+             effective rank 31 but SIFT is nonnegative histograms with a large centroid.
+
   cluster    Mixture of von Mises-Fisher-ish clusters. Real corpora are clumpy, and
              neighbourhood density is what recall@10 is actually sensitive to; uniform
              corpora make retrieval look easier than it is.
@@ -75,6 +81,12 @@ def gen(kind, n, d, rng, alpha, clusters, n_outliers, outlier_scale):
         x[:, idx] += outlier_scale
         return x
 
+    if kind == "offset":
+        # `mu` is per-coordinate; after normalization what matters is the norm of the
+        # centroid of the *directions*, which `describe` reports as `centroid`.
+        x = rng.standard_normal((n, d)).astype(np.float32)
+        return x + alpha
+
     if kind == "cluster":
         centres = rng.standard_normal((clusters, d)).astype(np.float32)
         centres /= np.linalg.norm(centres, axis=1, keepdims=True)
@@ -93,12 +105,17 @@ def describe(x):
     cov_eig = np.clip(cov_eig, 0, None)
     # Participation ratio: effective number of directions carrying variance.
     eff = (cov_eig.sum() ** 2) / max((cov_eig**2).sum(), 1e-30)
-    return dict(eff_rank=eff, dim=x.shape[1], chan_ratio=float(sd.max() / max(sd.mean(), 1e-9)))
+    # Norm of the centroid of the unit directions: how far off-origin the corpus sits,
+    # which is what a per-coordinate shift can remove and a scale cannot.
+    u = x / np.maximum(np.linalg.norm(x, axis=1, keepdims=True), 1e-30)
+    centroid = float(np.linalg.norm(u.mean(axis=0)))
+    return dict(eff_rank=eff, dim=x.shape[1], centroid=centroid,
+                chan_ratio=float(sd.max() / max(sd.mean(), 1e-9)))
 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("kind", choices=["iso", "spectrum", "outlier", "cluster"])
+    p.add_argument("kind", choices=["iso", "spectrum", "outlier", "cluster", "offset"])
     p.add_argument("-n", type=int, default=100_000)
     p.add_argument("-d", type=int, default=768)
     p.add_argument("--nq", type=int, default=1000)
@@ -139,6 +156,7 @@ def main():
         "spectrum": f"spec{a.alpha:g}",
         "outlier": f"out{a.outliers}x{a.outlier_scale:g}",
         "cluster": f"clu{a.clusters}",
+        "offset": f"off{a.alpha:g}",
     }[a.kind]
     name = f"synth-{tag}-{a.n}x{a.d}"
     dst = f"data/{name}"
@@ -151,7 +169,8 @@ def main():
 
     sep = float(np.mean(top[:, 0] - top[:, 99]))
     print(f"  effective rank {stats['eff_rank']:.1f} of {stats['dim']}   "
-          f"max/mean channel sd {stats['chan_ratio']:.1f}")
+          f"max/mean channel sd {stats['chan_ratio']:.1f}   "
+          f"centroid norm {stats['centroid']:.3f}")
     print(f"  sim(NN) {top[:,0].mean():.4f}  sim(100th) {top[:,99].mean():.4f}  separation {sep:.4f}")
     print(f"  wrote -> {dst}, and data/dataset.txt")
 

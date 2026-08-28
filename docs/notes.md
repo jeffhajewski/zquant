@@ -1600,3 +1600,57 @@ scale factor: it is a far more extreme corpus than its description suggests.
 
 Synthetic data is for explaining behaviour under a controlled sweep. Competitive claims stay
 on the real corpora, where the distribution is not one we chose.
+
+
+## What actually predicts calibration's benefit — and it is not anisotropy
+
+The synthetic sweep was built to put a number on "SIFT is anisotropic". It showed instead
+that anisotropy is the wrong variable. At d=768, n=20k, bits=3:
+
+| corpus | effective rank | uncalibrated → calibrated |
+|---|---|---|
+| `iso` | 739.6 | 0.564 → 0.570 (+0.6) |
+| `cluster` | 739.3 | 0.573 → 0.574 (+0.1) |
+| `spectrum α=0.5` | 394.8 | 0.663 → 0.665 (+0.2) |
+| `spectrum α=1.0` | 31.5 | 0.808 → 0.815 (+0.7) |
+| `outlier` | 8.7 | **0.695 → 0.761 (+6.6)** |
+| `spectrum α=2.0` | 2.5 | 0.827 → **0.797 (−3.0)** |
+
+Effective rank predicts nothing: the *lowest*-rank corpus is the one where calibration
+**hurts**. The only corpus that gains is `outlier`, and what makes it different is not its
+rank but that its heavy channels carry a nonzero **mean**.
+
+**The variable is the centroid norm** — `‖mean(x/‖x‖)‖`, how far off the origin the corpus of
+directions sits. A random rotation preserves it, and a per-coordinate *shift* is exactly what
+removes it, which a scale cannot. Measured on the real corpora: **SIFT 0.650, nytimes 0.124**
+— a 5× difference that lines up with +10.9 against +0.7.
+
+Confirmed with an `offset` preset that varies the centroid while holding the spectrum fixed
+at effective rank 739.6 (fully isotropic), so nothing else moves:
+
+| centroid norm | bits=3 | bits=5 | real corpus at that centroid |
+|---|---|---|---|
+| 0.124 | +0.9 | +0.1 | nytimes (0.124) measured **+0.7** |
+| 0.410 | +3.2 | +1.3 | — |
+| 0.648 | **+11.4** | +2.8 | SIFT (0.650) measured **+10.9** |
+
+The synthetic model predicts both real corpora to within about half a point, from a knob that
+has nothing to do with either dataset. That is the point of building these: the rule was
+derived on data whose distribution we chose, and then checked against data we did not.
+
+**Consequences.**
+
+- There is a cheap decision procedure for users: compute `‖mean(x/‖x‖)‖` on a sample; expect
+  calibration to pay above roughly 0.3 and to be neutral below it. That is one pass over a
+  sample, far cheaper than fitting and A/B-ing the index.
+- Calibration is not free — it **cost 3 points** on `spectrum α=2.0`, a very low-rank zero-mean
+  corpus. Keeping it opt-in is the right default, and the earlier decision to do so was better
+  founded than the reasoning given for it at the time.
+- It suggests a simpler mechanism may capture most of the gain: if the shift is doing
+  mean-removal, then subtracting the corpus mean before rotation would get there without
+  fitting per-coordinate quantiles. Untested, and worth testing before believing.
+
+**The `cluster` result is worth its own line.** Clustering changed recall difficulty (worst-rank
+80 against 23 for `iso`) while changing calibration's value not at all — which is the
+separation the preset was built to check, and a reminder that "harder corpus" and "corpus
+calibration helps on" are different axes.

@@ -114,17 +114,29 @@ R@10, 1000 queries, standard error ≈ 0.30 points.
 
 | | B/vec | R@10 | QPS |
 |---|---|---|---|
-| **zquant bits=5 +calibrate** | **68** | **0.907** | **203,542** |
+| **zquant bits=5 +calibrate** | **68** | **0.907** | **295,159** |
 | turbovec bits=4 +calibrate | 68 | 0.904 | 87,522 |
 
-zquant wins this corpus on recall, memory, and throughput simultaneously. On nytimes-256 it
-wins recall and memory — 132 B against 270 B at R@10 0.916 against 0.914 — but trails on
-throughput, ~21,100 QPS against 38,052.
+zquant wins this corpus on all three axes at once — better recall at identical storage, and
+**3.4× the throughput**.
 
-The split is corpus size. SIFT10K is 680 KB and stays cache-resident, which is the regime the
-scan kernel was rebuilt for; nytimes-256 is 13 MB compact and is not. Part of the remaining
-gap there is parallel efficiency rather than the kernel: 3,845 QPS batched single-thread
-against ~21,100 across 10 threads is 5.5x, short of what the core count suggests.
+On nytimes-256 it wins recall and memory but still trails on throughput:
+
+| | B/vec | R@10 | QPS (10 threads) |
+|---|---|---|---|
+| zquant bits=5 compact | **132** | **0.916** | 25,300 |
+| zquant bits=5 expanded | 260 | **0.916** | 28,400 |
+| turbovec | 270 | 0.914 | **38,052** |
+
+1.34× behind at matched memory, from 4.2× before the scan was rebuilt, with equal recall and
+half the memory in the compact configuration.
+
+The split is corpus size: SIFT10K is 680 KB and cache-resident, nytimes-256 is 13 MB compact.
+The remaining gap is per-core kernel work — the index reaches 134 G dim/s against the
+isolated kernel's 181, and neither memory bandwidth nor epilogue addressing accounts for the
+difference (both tested; see `docs/notes.md`). It is **not** parallel efficiency: scaling is
+97% across the four performance cores, and 5.80× on this 4P+6E machine is close to its real
+capacity.
 
 Parallel figures drift with thermal state — three consecutive runs of one configuration gave
 21,096, 18,950, and 15,525 QPS. Those quoted are first-run and should be read as upper

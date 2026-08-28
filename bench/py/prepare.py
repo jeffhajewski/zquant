@@ -76,6 +76,15 @@ def main():
     which = sys.argv[1] if len(sys.argv) > 1 else "siftsmall"
     base, query, out_name = load_siftsmall() if which == "siftsmall" else load_hdf5(which)
 
+    # Optional corpus cap, as a second argument. Corpus size is a variable worth
+    # sweeping and not just a constant: per-query fixed costs amortize over the
+    # corpus, so two systems with different fixed costs and different scan rates
+    # cross over at some size, and finding that point needs more than one size.
+    if len(sys.argv) > 2:
+        cap = int(sys.argv[2])
+        base = base[:cap]
+        out_name = f"{out_name}-{cap}"
+
     dst = f"data/{out_name}"
     os.makedirs(dst, exist_ok=True)
 

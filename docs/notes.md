@@ -1343,3 +1343,50 @@ swaps each that is well under 1% of the scan. What it plausibly is instead is wo
 100 heaps × 100 entries × 8 B is 80 KB per thread against 8 KB at k=10, so every accept
 walks a heap that no longer sits in L1. That is a hypothesis, not a measurement, and the
 last three hypotheses in this file were wrong — it needs testing before it is worth acting on.
+
+
+## Why we win one corpus and lose the other: fixed cost against scan rate
+
+Being 1.7× faster on SIFT10K and 1.26× slower on nytimes-256 looks incoherent until the
+numbers are normalized. Raw QPS is not comparable across corpora — nytimes asks 20× more
+work per query (100k×256 against 10k×128). Normalized to the scan work actually done:
+
+| corpus | zquant G dim/s | turbovec G dim/s |
+|---|---|---|
+| SIFT10K | 190.6 | 112.0 |
+| nytimes-256 | 771.6 | 974.1 |
+
+*Both* systems are far less efficient on the small corpus, because per-query fixed costs —
+rotation, query preparation, top-k setup — amortize over the corpus. turbovec degrades more
+(8.7× against our 4.0×), which is the whole story.
+
+Fitting `time_per_query = fixed + work / rate` to the two corpora:
+
+| system | fixed µs/query | peak G dim/s |
+|---|---|---|
+| zquant | 5.3 | 919 |
+| turbovec | 10.6 | 1637 |
+
+**turbovec's steady-state scan is ~1.8× faster; our per-query fixed cost is ~2× lower.** So
+there is a crossover, predicted at ~43,500 vectors at d=256.
+
+**This was validated rather than asserted.** Two points fit a two-parameter model by
+construction, so the model was used to predict a third: at n=25,000 zquant should lead. Built
+a 25,000-vector nytimes subset with its own ground truth and ran both systems. At matched
+storage (132 B) and matched recall (0.908 against 0.909), zquant 56,411 QPS against turbovec
+55,907 — even, where at n=100,000 turbovec leads by 1.26×. Direction confirmed.
+
+The absolute predictions were ~25% optimistic for both systems (81k predicted against 59k
+measured for us; 69k against 56k for them), so the model captures the *shape* and not the
+magnitude. The fitted peak rates in particular should not be quoted: 1637 G dim/s machine-wide
+would need ~4.3 SDOT per cycle per core, which is at the edge of what the hardware can issue,
+so that number is probably absorbing scaling effects the two-point fit cannot separate.
+
+Two things follow. Our fixed-cost advantage is real and matters for small-to-medium corpora
+and for latency-sensitive use. And the honest statement of the remaining gap is not "we are
+26% slower" but "our steady-state scan rate is behind, and it only shows above roughly 40,000
+vectors at d=256."
+
+Also corrects the SIFT headline: 3.8× was measured at k=10 against turbovec's k=100. Matched
+at k=100 it is **1.70×**, and retrieval depth costs us 55% on that corpus against 18% on
+nytimes — the same top-k weakness, amplified where the scan is small enough not to hide it.

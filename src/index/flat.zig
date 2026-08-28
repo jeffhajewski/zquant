@@ -713,6 +713,11 @@ pub const FlatIndex = struct {
         // tile*group SDOTs. See `scan.scoreExpandedTiled` for the accounting.
         const tile = 4;
         const group = 4;
+        // Everything the inner loop would otherwise re-test per (vector, query) pair:
+        // all three are fixed for the whole index.
+        const fast_path = self.correction == .scalar and
+            self.metric == .inner_product and
+            (self.residency == .expanded or use_simd);
         const compact_width = if (use_simd) scan.multiWidth(self.layout) else 1;
         var mse_block: [tile * max_batch]f32 = undefined;
 
@@ -822,15 +827,17 @@ pub const FlatIndex = struct {
 
                 // Split on the correction outside the query loop rather than
                 // switching per pair: it is fixed for the whole index.
-                if (self.correction == .scalar and (self.residency == .expanded or use_simd)) {
+                if (fast_path) {
                     const block = mse_block[u * max_batch ..][0..n];
                     for (0..n) |i| {
                         // α scales the whole reconstruction ⟨p, x̂⟩ = mse_term +
                         // shift_term, not just one of its two halves: x̂ = c/scale −
                         // shift, so both terms come from the same reconstruction and
                         // share its error.
-                        const estimate = norm * gamma * (shift_terms[i] + block[i]);
-                        const sc = self.score(estimate, norm, query_norms[i]);
+                        //
+                        // Under inner product `score` is the identity, so the metric
+                        // switch and the query-norm load are both hoisted away here.
+                        const sc = norm * gamma * (shift_terms[i] + block[i]);
                         if (!filled or sc > thresholds[i]) {
                             collectors[i].offer(sc, @intCast(v));
                             thresholds[i] = collectors[i].threshold();

@@ -1654,3 +1654,28 @@ derived on data whose distribution we chose, and then checked against data we di
 80 against 23 for `iso`) while changing calibration's value not at all — which is the
 separation the preset was built to check, and a reminder that "harder corpus" and "corpus
 calibration helps on" are different axes.
+
+
+## Does mean-centring alone do it? Half of it.
+
+The centroid-norm result suggested calibration might be doing nothing more than removing the
+mean, in which case the per-coordinate quantile fit could be dropped for a single subtraction.
+Since the uncalibrated path is already `shift=0, scale=1`, mean-centring-only is exactly
+`shift=-mean, scale=1` — a two-line change, so the claim was cheap to check rather than leave
+sitting in a commit message.
+
+On SIFT (centroid 0.650):
+
+| | uncalibrated | mean-centring only | full calibration |
+|---|---|---|---|
+| bits=3 | 0.582 | 0.638 (+5.6) | **0.691 (+10.9)** |
+| bits=5 | 0.869 | 0.889 (+2.0) | **0.907 (+3.8)** |
+
+**Half, not most.** The shift is worth about as much as the scale, and neither dominates. The
+quantile anchoring keeps its place: it is worth a further +5.3 points at bits=3 over
+mean-centring alone.
+
+So the mechanism is two things, not one. The centroid explains *which corpora* calibration
+helps on — that result stands, and predicted both real corpora to within half a point. It does
+not follow that the shift is doing all the work once you are on such a corpus, and the
+temptation to carry that inference across was worth one experiment to resist.

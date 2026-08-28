@@ -148,7 +148,7 @@ pub const StoredScalars = struct {
 /// Largest batch `searchBatch` accepts. Bounded so per-query scratch can live on the
 /// stack; beyond this the query state stops fitting in cache and the amortization the
 /// batch exists for stops paying.
-pub const max_batch: usize = 64;
+pub const max_batch: usize = 128;
 
 /// Lane count for the batch epilogue's early-reject compare. Once the heaps fill,
 /// almost every candidate is rejected, so scoring a lane group and testing one mask

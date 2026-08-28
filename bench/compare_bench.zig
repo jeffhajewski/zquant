@@ -184,13 +184,14 @@ pub fn main() !void {
 
             // Query-parallel across 10 threads.
             const threads = 10;
-            var par = try zq.flat.FlatIndex.ParallelSearcher.init(a, index, threads, 32, K);
+            const per_thread = 100;
+            var par = try zq.flat.FlatIndex.ParallelSearcher.init(a, index, threads, per_thread, RETRIEVE);
             defer par.deinit();
             _ = try index.searchBatchParallel(queries.data[0 .. 32 * d], &par);
             var par_timer = Timer.start();
             {
                 var off: usize = 0;
-                const chunk = threads * 32;
+                const chunk = threads * per_thread;
                 while (off < nq) : (off += chunk) {
                     const take = @min(chunk, nq - off);
                     std.mem.doNotOptimizeAway(

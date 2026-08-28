@@ -1311,3 +1311,35 @@ isolated kernel throughput (86–91% by residency, measured by ablation), spawn 
 1.2%, and parallel scaling is 97% across the performance cores. There is no large structural
 overhead left to remove — further gains would come from the scan kernel itself, which is
 already within a few percent of one SDOT per cycle at 0.625 loads per SDOT.
+
+
+## The turbovec throughput gap was mostly our benchmark, and my 1.15× was not apples-to-apples
+
+`bench/py/baselines.py` times turbovec as `ix.search(query, RETRIEVE)` — **all 1000 queries in
+one call, retrieving 100**. zquant's arm was timed at **32 queries per thread, retrieving 10**.
+Two asymmetries, pulling in opposite directions:
+
+| configuration | expanded, 260 B | vs turbovec 38,052 |
+|---|---|---|
+| 32 per thread, k=10 (as previously reported) | 32,982 | 1.15× |
+| 64 per thread, k=10 | 34,000 | 1.12× |
+| 100 per thread, k=10 (their batch shape) | 36,875 | 1.03× |
+| **100 per thread, k=100 (their batch shape *and* depth)** | **30,141** | **1.26×** |
+
+**The 1.15× I reported was wrong** — it compared our k=10 against their k=100 and flattered us.
+Matched properly the gap is 1.26×, not 1.15×.
+
+Two separate findings fall out:
+
+**Batch shape was worth 12%.** Per-vector cost amortizes over the batch, and chunking at 32
+queries against their 1000 gave away 32,982 → 36,875. That was a benchmark artifact, not an
+implementation difference; the harness now uses the same batch shape and the same retrieval
+depth as the baselines it compares against.
+
+**Retrieval depth costs us 18%**, and that one is real: 36,875 at k=10 against 30,141 at
+k=100, with nothing else changed. The arithmetic says it is not the sift work — at k=100 the
+expected accepts per query are ~k·ln(n/k) ≈ 690 against ~92 at k=10, and even at log₂(100)
+swaps each that is well under 1% of the scan. What it plausibly is instead is working set:
+100 heaps × 100 entries × 8 B is 80 KB per thread against 8 KB at k=10, so every accept
+walks a heap that no longer sits in L1. That is a hypothesis, not a measurement, and the
+last three hypotheses in this file were wrong — it needs testing before it is worth acting on.

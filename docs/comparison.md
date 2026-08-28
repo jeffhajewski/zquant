@@ -114,21 +114,21 @@ R@10, 1000 queries, standard error ≈ 0.30 points.
 
 | | B/vec | R@10 | QPS |
 |---|---|---|---|
-| **zquant bits=5 +calibrate** | **68** | **0.907** | **295,159** |
+| **zquant bits=5 +calibrate** | **68** | **0.907** | **335,121** |
 | turbovec bits=4 +calibrate | 68 | 0.904 | 87,522 |
 
 zquant wins this corpus on all three axes at once — better recall at identical storage, and
-**3.4× the throughput**.
+**3.8× the throughput**.
 
 On nytimes-256 it wins recall and memory but still trails on throughput:
 
 | | B/vec | R@10 | QPS (10 threads) |
 |---|---|---|---|
-| zquant bits=5 compact | **132** | **0.916** | 25,300 |
-| zquant bits=5 expanded | 260 | **0.916** | 28,400 |
+| zquant bits=5 compact | **132** | **0.916** | 28,689 |
+| zquant bits=5 expanded | 260 | **0.916** | 32,982 |
 | turbovec | 270 | 0.914 | **38,052** |
 
-1.34× behind at matched memory, from 4.2× before the scan was rebuilt, with equal recall and
+1.15× behind at matched memory, from 4.2× before the scan was rebuilt, with equal recall and
 half the memory in the compact configuration.
 
 The split is corpus size: SIFT10K is 680 KB and cache-resident, nytimes-256 is 13 MB compact.
@@ -167,8 +167,27 @@ worth +10.9 points at bits=3 and +3.8 at bits=5. The two halves of that change d
 decompose: applying α to the whole estimator while still fitting it in the shifted basis
 scores 0.463, *below* the 0.582 baseline. See `docs/notes.md`.
 
-The remaining loss is the sub-25 B band, where product quantization's learned codebook
-still beats a scalar quantizer with a fixed density — a structural gap, not a tuning one.
+### The sub-25 B band is conceded, and why
+
+FAISS PQ leads below 25 B — 0.511 at 16 B against 0.357 at 20 B — and that is a deliberate
+concession rather than an open item. Three cheaper explanations were tested and eliminated:
+
+- **The estimator and the int8 query path are not losing anything.** An exact f32 scan over
+  the same codes scores 0.356 against 0.357.
+- **The rotation is not under-mixing.** Raising the RHT from 3 rounds to 4, 6, and 8 gains
+  0.6–1.2 points and saturates.
+- **The bit budget is not misallocated across dimensions.** Spending the same bytes on d/2 at
+  2 bits scores 0.232, and d/4 scores 0.071. At ~1 bit per dimension, dimension count
+  dominates per-coordinate precision.
+
+So the codes themselves are the limit, and closing it needs a learned vector quantizer —
+PQ's sub-vector codebooks represent inter-coordinate structure that per-coordinate scalar
+quantization cannot express at any tuning. That is a second algorithm, not a fix.
+
+It is conceded because of where the band sits. 20 B at d=128 is ~1.25 bits per dimension; at
+the d=768–3072 this library targets, 25 B is ~0.2 bits per dimension — a rate almost nothing
+runs in production. The useful range is 1–4 bits per dimension, and zquant wins every band
+there on both corpora.
 
 ## The scalar correction
 

@@ -1296,3 +1296,18 @@ What remains is a learned or vector quantizer. Per-coordinate scalar quantizatio
 fixed density cannot represent inter-coordinate structure at all, and that is exactly what
 PQ's learned sub-vector codebooks buy at this bit rate. It is a real feature, not a tuning
 change.
+
+
+## Per-call thread spawn: measured, not worth removing
+
+`searchBatchParallel` spawns its workers per call, which looks like an obvious thing to
+replace with a persistent pool. Measured: spawn plus join for ten threads is **113 µs**,
+against a parallel call of ~9.7 ms at current throughput — **1.2%**. A pool would buy that
+back in exchange for a condition-variable handshake on every call and the deadlock surface
+that comes with it. Not taken.
+
+This also retires the last item on the throughput list. The batch loop now reaches 89% of
+isolated kernel throughput (86–91% by residency, measured by ablation), spawn accounts for
+1.2%, and parallel scaling is 97% across the performance cores. There is no large structural
+overhead left to remove — further gains would come from the scan kernel itself, which is
+already within a few percent of one SDOT per cycle at 0.625 loads per SDOT.

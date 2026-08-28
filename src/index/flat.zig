@@ -703,6 +703,12 @@ pub const FlatIndex = struct {
         const padded = self.quantizer.padded();
         const centroids = self.quantizer.mse.codebook.centroids;
 
+        // The expanded residency scores the whole query group in one pass over the
+        // vector, so each code chunk is loaded once rather than once per query. See
+        // `scan.scoreExpandedMulti` for why batching did nothing without this.
+        const group = 8;
+        var mse_terms: [max_batch]f32 = undefined;
+
         for (self.scalars.items, 0..) |scalars, v| {
             // Fetched once; the inner loop reads it out of cache.
             const code_slot = self.codes.items[v * stride ..][0..stride];
@@ -710,14 +716,31 @@ pub const FlatIndex = struct {
             const norm: f32 = scalars.norm;
             const gamma: f32 = scalars.gamma;
 
-            for (0..n) |i| {
-                const mse_term = switch (self.residency) {
-                    .expanded => scan.scoreExpanded(
+            if (self.residency == .expanded) {
+                var i: usize = 0;
+                while (i + group <= n) : (i += group) {
+                    scan.scoreExpandedMulti(
+                        group,
+                        @ptrCast(code_slot),
+                        searcher.scan_queries[i..],
+                        self.table.scale,
+                        padded,
+                        mse_terms[i..],
+                    );
+                }
+                while (i < n) : (i += 1) {
+                    mse_terms[i] = scan.scoreExpanded(
                         @ptrCast(code_slot),
                         searcher.scan_queries[i],
                         self.table.scale,
                         padded,
-                    ),
+                    );
+                }
+            }
+
+            for (0..n) |i| {
+                const mse_term = switch (self.residency) {
+                    .expanded => mse_terms[i],
                     .compact => if (use_simd)
                         scan.scoreInt8(self.layout, searcher.table, searcher.scan_queries[i], code_slot, padded)
                     else

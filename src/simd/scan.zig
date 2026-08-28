@@ -260,6 +260,57 @@ pub fn scoreExpanded(values: []const i8, query: Query, table_scale: f32, dim: u3
     return sum * table_scale * query.scale;
 }
 
+/// Score one stored vector against `Q` queries in a single pass.
+///
+/// The one-query kernel issues two loads per `SDOT` — the code chunk and the query
+/// chunk — which pins it at one `SDOT` per cycle on the load ports, and that is the
+/// ~48 G dim/s ceiling the scan sits at regardless of dimension or residency.
+///
+/// Batching alone did not move it (measured 1.00×) because the batch loop called the
+/// one-query kernel once per query, re-walking the vector and reloading both operands
+/// each time. It amortized cache lines, which were never the constraint.
+///
+/// Here the code chunk is loaded once and reused across all `Q` queries, so the ratio
+/// falls to (1 + Q)/Q loads per `SDOT` — 1.25 at Q=4 against 2.0. The `Q` independent
+/// accumulator chains also supply the instruction-level parallelism that the chunk
+/// unroll provides in the single-query path, so there is no separate unroll here.
+pub fn scoreExpandedMulti(
+    comptime Q: usize,
+    values: []const i8,
+    queries: []const Query,
+    table_scale: f32,
+    dim: u32,
+    out: []f32,
+) void {
+    std.debug.assert(queries.len >= Q and out.len >= Q);
+    std.debug.assert(values.len >= dim);
+    std.debug.assert(dim % 16 == 0);
+
+    // Hoist the query base pointers. Reading `queries[q].data` inside the loop makes
+    // the slice header itself a load — two per query per chunk instead of one, which
+    // is worse than the single-query kernel it is meant to beat.
+    var qp: [Q][*]const i8 = undefined;
+    inline for (0..Q) |q| qp[q] = queries[q].data.ptr;
+    const vp: [*]const i8 = values.ptr;
+
+    var acc: [Q]dot.Acc = @splat(@splat(0));
+    const chunks = dim / 16;
+
+    var ch: usize = 0;
+    while (ch < chunks) : (ch += 1) {
+        const c: @Vector(16, i8) = vp[ch * 16 ..][0..16].*;
+        inline for (0..Q) |q| {
+            const w: @Vector(16, i8) = qp[q][ch * 16 ..][0..16].*;
+            acc[q] = dot.accumulate(acc[q], c, w);
+        }
+    }
+
+    inline for (0..Q) |q| {
+        const sum: f32 = @floatFromInt(dot.total(acc[q]));
+        out[q] = sum * table_scale * queries[q].scale;
+    }
+}
+
 /// Vectorized score. `bits` must satisfy `canVectorize`.
 pub fn scoreInt8(layout: Layout, table: Table, query: Query, codes: []const u8, dim: u32) f32 {
     std.debug.assert(codes.len * 8 >= @as(usize, dim) * layout.bits);

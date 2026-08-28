@@ -123,9 +123,13 @@ pub fn main() !void {
     }
 
     for ([_]u6{ 2, 3, 4, 5 }) |bits| {
-        for ([_]usize{ 0, 1024, 10000 }) |calib_rows| {
+        // Sweep residency as well: turbovec buys its throughput by keeping dequantized
+        // int8 resident (270 B/vector), which is what `.expanded` does. Comparing only
+        // `.compact` was comparing our memory-optimal point against their speed-optimal
+        // one and calling the throughput difference a deficit.
+        for ([_]zq.flat.Residency{ .compact, .expanded }) |residency| {
+        for ([_]usize{ 0, 10000 }) |calib_rows| {
             const calibrated = calib_rows > 0;
-            const residency: zq.flat.Residency = .compact;
             const exact = false;
             const sketch = true;
             const correction: zq.flat.Correction = .scalar;
@@ -228,9 +232,10 @@ pub fn main() !void {
             const batch_qps = fnq / (@as(f64, @floatFromInt(batch_ns)) / 1e9);
             const par_qps = fnq / (@as(f64, @floatFromInt(par_ns)) / 1e9);
 
-            try out.print(a, "zquant,bits={d}{s},{d},{d:.4},{d},{d},{d},{d:.1},{d:.1}\n", .{
+            try out.print(a, "zquant,bits={d} {s}{s},{d},{d:.4},{d},{d},{d},{d:.1},{d:.1}\n", .{
                 bits,
-                if (calib_rows == 0) "" else if (calib_rows <= 1024) " +cal1k" else " +cal-all",
+                @tagName(residency),
+                if (calib_rows == 0) "" else " +cal",
                 index.bytesPerVector(),
                 recall / fnq,
                 ranks[nq / 2],
@@ -239,9 +244,10 @@ pub fn main() !void {
                 qps,
                 batch_qps,
             });
-            std.debug.print("  bits={d}{s:<12} {d:>3}B  R@10={d:.3}  med={d} p90={d} worst={d}  {d:.0} QPS  {d:.0} par\n", .{
+            std.debug.print("  bits={d} {s:<9}{s:<5} {d:>4}B  R@10={d:.3}  med={d} p90={d} worst={d}  {d:>6.0} QPS  {d:>7.0} par\n", .{
                 bits,
-                if (calib_rows == 0) "" else if (calib_rows <= 1024) " +cal1k" else " +cal-all",
+                @tagName(residency),
+                if (calib_rows == 0) "" else "+cal",
                 index.bytesPerVector(),
                 recall / fnq,
                 ranks[nq / 2],
@@ -250,6 +256,7 @@ pub fn main() !void {
                 qps,
                 par_qps,
             });
+        }
         }
     }
 

@@ -1390,3 +1390,40 @@ vectors at d=256."
 Also corrects the SIFT headline: 3.8× was measured at k=10 against turbovec's k=100. Matched
 at k=100 it is **1.70×**, and retrieval depth costs us 55% on that corpus against 18% on
 nytimes — the same top-k weakness, amplified where the scan is small enough not to hide it.
+
+
+## "Better SIMD" — measured, and there is nothing to switch to
+
+turbovec's NEON scan uses `SMMLA` (ARMv8.6 I8MM) alongside an `SDOT` path, and this machine
+reports `FEAT_I8MM: 1`. SMMLA does a 2×8 by 8×2 int8 matrix product into a 2×2 int32
+accumulator — **32 MACs per instruction against SDOT's 16** — which looked like exactly the
+missing factor.
+
+It is not. Raw issue throughput, 16 independent accumulators, register-resident operands, no
+memory traffic:
+
+| instruction | issue rate | MACs/instr | MAC throughput |
+|---|---|---|---|
+| `SDOT` | 16.18 G/s | 16 | **258.8 G/s** |
+| `SMMLA` | 7.98 G/s | 32 | **255.4 G/s** |
+
+SMMLA issues at *exactly half* SDOT's rate, which cancels its doubled MACs to within 1%. On
+this core the two are interchangeable and there is no faster int8 MAC available. A tiled
+SMMLA kernel over a blocked layout measured **0.78×** against the current SDOT kernel, which
+is consistent: same MAC ceiling, worse load structure (SMMLA's operands are 8-byte rows, so a
+contiguous layout needs two loads where SDOT needs one).
+
+**This also retires the "their scan is 1.8× faster" claim.** That came from the two-point fit,
+which put turbovec at 1637 G dim/s machine-wide. Peak is now known to be ~259 G MAC/s per
+core, so 1637 would need ~6.3 cores sustaining 100% of MAC issue while also issuing loads —
+impossible on 4P+6E. The fit was absorbing scaling it could not separate, exactly as suspected.
+
+**What the ceiling actually says.** Peak is ~259 G pair-dims/s per core. The isolated tiled
+kernel reaches 196 (76%), and the index reaches ~156 (60%). Working backwards from the
+matched full-nytimes comparison, turbovec's end-to-end rate is consistent with ~76% of peak —
+about what our *kernel* already achieves in isolation.
+
+So the gap is not instruction selection and not the kernel. It is that our index sustains 60%
+of peak where our own kernel sustains 76%, and the largest identified piece of that is
+collection at depth: retrieval at k=100 costs 18% on nytimes and 55% on SIFT. That is the
+lever, and it is not a SIMD problem.

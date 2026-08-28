@@ -110,6 +110,26 @@ R@10, 1000 queries, standard error ≈ 0.30 points.
 | turbovec | bits=4 +calibrate | 68 | **0.904** | 0 | 1 | 9 |
 | zquant | bits=5 qjl-sketch | 84 | 0.833 | 0 | 2 | 10 |
 
+**Throughput at 68 bytes, SIFT10K**, 10 threads:
+
+| | B/vec | R@10 | QPS |
+|---|---|---|---|
+| **zquant bits=5 +calibrate** | **68** | **0.907** | **203,542** |
+| turbovec bits=4 +calibrate | 68 | 0.904 | 87,522 |
+
+zquant wins this corpus on recall, memory, and throughput simultaneously. On nytimes-256 it
+wins recall and memory — 132 B against 270 B at R@10 0.916 against 0.914 — but trails on
+throughput, ~21,100 QPS against 38,052.
+
+The split is corpus size. SIFT10K is 680 KB and stays cache-resident, which is the regime the
+scan kernel was rebuilt for; nytimes-256 is 13 MB compact and is not. Part of the remaining
+gap there is parallel efficiency rather than the kernel: 3,845 QPS batched single-thread
+against ~21,100 across 10 threads is 5.5x, short of what the core count suggests.
+
+Parallel figures drift with thermal state — three consecutive runs of one configuration gave
+21,096, 18,950, and 15,525 QPS. Those quoted are first-run and should be read as upper
+bounds; single-thread batched throughput is stable to about 5%.
+
 **Head to head at 68 bytes:**
 
 | | R@10 | vs zquant |

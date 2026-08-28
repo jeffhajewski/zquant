@@ -1132,3 +1132,58 @@ changes; the recall win alone would have let the wrong story stand.
 its definition. The existing score-vs-reconstruction test cannot catch this: under the wrong
 basis the score stays *proportional* to ⟨p,x̂⟩, just with a wrong constant, so it passes with
 a ratio near 1. Verified the new test fails on the old basis before keeping it.
+
+
+## 8824e43..HEAD — the scan was load-issue bound, and batching had never exploited it
+
+The scan sat at a flat ~48–65 G dim/s single-threaded regardless of dimension, dataset, or
+residency. That flatness is the tell: a memory-bound kernel would move with corpus size, and
+a compute-bound one would move with bit width. A kernel pinned on *load issue* does neither.
+
+The one-query kernel spends two loads per `SDOT` — the code chunk and the query chunk — which
+is exactly one `SDOT` per cycle on the load ports.
+
+Batching had been measured at 1.00× and written off. The reason it did nothing is that the
+batch loop called the one-query kernel once per query, re-walking the vector and reloading
+both operands each time. It amortized cache lines, which were never the constraint.
+
+**Three restructurings, each measured:**
+
+| kernel | loads per SDOT | d=784, G dim/s |
+|---|---|---|
+| one query | 2.0 | 60.7 |
+| query group, Q=8 | 1.125 | 148.2 |
+| tiled, V=4 × Q=4 | 0.625 | **206.8** |
+
+Tiling the stored vectors is what breaks below one load per SDOT — the query chunks stay in
+registers and are reused across V vectors. The query-only form cannot reach that at any Q.
+
+**Register budget picks the tile, not taste.** V·Q accumulators + Q query chunks + V code
+chunks must fit in 32 vector registers. 4×8 needs 44 and collapses to 153 G dim/s — the
+spill. 4×4 needs 24, is fastest at both d=256 and d=784, and is the most stable candidate
+(1% spread against 9% for 2×8).
+
+**A load that isn't in the source.** Hoisting the query base pointers out of the loop was
+worth as much as the restructuring: reading `queries[q].data` inside the loop makes the
+slice header itself a load — two per query per chunk, worse than the kernel it replaces.
+Batched went 1196 → 1652 QPS on that one change.
+
+**Compact benefits more than expanded.** Its shift/mask/table-lookup is query-independent,
+so the group amortizes the whole unpack rather than just a load. Keeping one accumulator per
+(vector, query) instead of per (query, bit-field group) is what lets Q stay at 4 for every
+bit width. Integer addition is associative, so that fold is bit-identical — every
+multi-query and tiled kernel is tested for *exact* equality against its per-query
+counterpart, not a tolerance, since they issue the same SDOTs and an approximate bound would
+hide precisely the reordering bugs worth catching.
+
+**Where it lands.** SIFT10K at 68 B: 203,542 QPS against turbovec's 87,522, at R@10 0.907
+against 0.904 — we now win that corpus on recall, memory, and throughput at once.
+nytimes-256 at 132 B: ~21,100 parallel QPS at R@10 0.916, against turbovec's 38,052 at 270 B
+and 0.914. Half their memory, equal recall, still 1.8× behind on throughput.
+
+**Measurement caveat, stated because it matters.** The parallel numbers drift with thermal
+state: three consecutive runs of the identical configuration gave 21,096 → 18,950 → 15,525.
+Single-thread batched throughput is stable to about ±5% and is the honest number to compare;
+the parallel figures above are first-run (coldest) and should be read as an upper bound.
+The corollary is that the remaining nytimes gap is partly parallel efficiency — 3,845 batched
+single-thread against ~21,100 across 10 threads is 5.5×, not the ~8× the core count suggests.

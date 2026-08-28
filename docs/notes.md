@@ -1564,3 +1564,39 @@ not a missing trick. Absent a measurement showing otherwise, the honest position
 we are near the practical limit of this design on this hardware, at 1.22× behind on the one
 corpus large enough for steady-state scan rate to dominate, while ahead on smaller ones and
 ahead on recall and memory throughout.
+
+
+## Synthetic corpora: turning "anisotropic" into a number
+
+Calibration is worth +7 points on SIFT and ~0 on nytimes, and the explanation offered so far
+was "SIFT is anisotropic" — a label, not a threshold. Real corpora say *that* something
+happens; a knob says *when*. `bench/py/synth.py` generates corpora with one property varied
+at a time, with exact inner-product ground truth in the same format every system reads.
+
+| preset | what it isolates | why it earns its place |
+|---|---|---|
+| `iso` | nothing — isotropic directions | The control. A random rotation cannot improve on it, so calibration must be worth ~0; a gain here would be noise or a bug. |
+| `spectrum` | power-law covariance, `λ_i ∝ i^-α` | Sweeps the exact axis that separates SIFT from nytimes, with α attached. Real embeddings have power-law spectra. |
+| `outlier` | a few channels with large scale *and* offset | What transformer KV caches actually look like. A stated target of this library that no benchmark here had ever exercised. |
+| `cluster` | neighbourhood density | Real corpora are clumpy; uniform ones make recall@10 look easier than it is. |
+
+The generator reports **effective rank** (participation ratio of the covariance spectrum), so
+the knob's effect is measured rather than assumed. At d=768, n=20k:
+
+| corpus | effective rank | max/mean channel σ |
+|---|---|---|
+| `iso` | 739.6 | 1.0 |
+| `cluster` | 739.3 | 1.0 |
+| `spectrum α=0.5` | 394.8 | 1.1 |
+| `spectrum α=1.0` | 31.5 | 1.5 |
+| `outlier` (4 channels × 20) | 8.7 | 18.3 |
+| `spectrum α=2.0` | 2.5 | 2.9 |
+
+Two things worth noting in that table. Clustering leaves effective rank untouched — it moves
+where the mass sits, not which directions carry it, so it should predict nothing about
+calibration and everything about recall difficulty. And the outlier preset reaches effective
+rank 8.7 with only four heavy channels, because variance scales with the square of the
+scale factor: it is a far more extreme corpus than its description suggests.
+
+Synthetic data is for explaining behaviour under a controlled sweep. Competitive claims stay
+on the real corpora, where the distribution is not one we chose.

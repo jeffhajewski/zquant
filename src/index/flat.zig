@@ -455,7 +455,6 @@ pub const FlatIndex = struct {
             scalars.gamma = if (recon_sq > 0) @floatCast(dot / recon_sq) else 1.0;
         }
 
-
         try self.scalars.append(self.allocator, StoredScalars.from(scalars));
         return @intCast(self.scalars.items.len - 1);
     }
@@ -507,7 +506,7 @@ pub const FlatIndex = struct {
         sketch_query: sketch_kernel.Query,
         table: scan.Table,
         heap: []Entry,
-    workspace: prod_mod.Workspace,
+        workspace: prod_mod.Workspace,
         allocator: Allocator,
 
         pub fn init(allocator: Allocator, index: FlatIndex, k: usize) !Searcher {
@@ -870,11 +869,17 @@ pub const FlatIndex = struct {
 
     /// Query-parallel batch search state: one `BatchSearcher` per thread.
     ///
-    /// Threads are given disjoint *queries*, not disjoint corpus shards. Each thread
-    /// therefore reads the whole corpus, which would be wasteful if the scan were
-    /// memory-bound — it is not (see docs/notes.md: batching a corpus pass across 32
-    /// queries gives 1.01×, so per-vector compute is the constraint). Sharding queries
-    /// instead means no shared mutable state, no top-k merge, and no false sharing.
+    /// Threads are given disjoint *queries*, not disjoint corpus shards, so each
+    /// thread reads the whole corpus. That costs no extra bandwidth: total traffic is
+    /// one corpus pass per batch either way, since every thread's batch has to see
+    /// every vector regardless of how the work is divided. Sharding queries instead
+    /// means no shared mutable state, no top-k merge, and no false sharing.
+    ///
+    /// This once cited "batching gives 1.01×, so per-vector compute is the
+    /// constraint" as the justification. That measurement was real but the inference
+    /// was wrong: batching did nothing because the batch loop called the one-query
+    /// kernel per query rather than because the corpus pass was free. It now gives
+    /// ~1.9× (see docs/notes.md).
     pub const ParallelSearcher = struct {
         shards: []BatchSearcher,
         threads: []std.Thread,
@@ -1019,40 +1024,89 @@ pub const FlatIndex = struct {
         const padded = self.quantizer.padded();
         const centroids = self.quantizer.mse.codebook.centroids;
 
-        for (self.scalars.items, 0..) |scalars, i| {
-            const code_slot = self.codes.items[i * stride ..][0..stride];
-            const sketch_slot = self.sketches.items[i * sketch_len ..][0..sketch_len];
+        // A single query cannot tile over queries, but it can still tile over stored
+        // vectors: the one query chunk stays in a register and is reused across the
+        // tile, so the loop issues V + 1 loads against V SDOTs — 1.125 at V=8 against
+        // the per-vector kernel's 2.0. Q=1 leaves registers nearly free, so the tile
+        // is wider here than in the batch path.
+        const tile = 8;
+        const queries: [1]scan.Query = .{searcher.scan_query};
+        const can_tile = use_simd and
+            (self.residency == .expanded or scan.canTile(self.layout));
+        var block: [tile]f32 = undefined;
 
-            const mse_term = switch (self.residency) {
-                .expanded => scan.scoreExpanded(
-                    @ptrCast(code_slot),
-                    searcher.scan_query,
-                    self.table.scale,
-                    padded,
-                ),
-                .compact => if (use_simd)
-                    scan.scoreInt8(self.layout, searcher.table, searcher.scan_query, code_slot, padded)
-                else
-                    scan.scoreExact(self.layout, centroids, searcher.query_state.rotated, code_slot),
-            };
+        const total = self.scalars.items.len;
+        var v0: usize = 0;
+        while (v0 < total) : (v0 += tile) {
+            const take = @min(tile, total - v0);
 
-            const norm: f32 = scalars.norm;
-            const gamma: f32 = scalars.gamma;
-
-            const estimate = switch (self.correction) {
-                .scalar => norm * gamma * (shift_term + mse_term),
-                .qjl_sketch => blk: {
-                    const sketch_term = if (!self.use_sketch)
-                        0
-                    else if (use_simd)
-                        sketch_kernel.signDot(searcher.sketch_query, sketch_slot, padded)
+            if (can_tile and take == tile) {
+                switch (self.residency) {
+                    .expanded => scan.scoreExpandedTiled(
+                        tile,
+                        1,
+                        @ptrCast(self.codes.items.ptr + v0 * stride),
+                        stride,
+                        queries[0..],
+                        self.table.scale,
+                        padded,
+                        block[0..],
+                        1,
+                    ),
+                    .compact => scan.scoreInt8Tiled(
+                        tile,
+                        1,
+                        self.layout,
+                        searcher.table,
+                        queries[0..],
+                        self.codes.items.ptr + v0 * stride,
+                        stride,
+                        padded,
+                        block[0..],
+                        1,
+                    ),
+                }
+            } else for (0..take) |u| {
+                const slot = self.codes.items[(v0 + u) * stride ..][0..stride];
+                block[u] = switch (self.residency) {
+                    .expanded => scan.scoreExpanded(
+                        @ptrCast(slot),
+                        searcher.scan_query,
+                        self.table.scale,
+                        padded,
+                    ),
+                    .compact => if (use_simd)
+                        scan.scoreInt8(self.layout, searcher.table, searcher.scan_query, slot, padded)
                     else
-                        sketch_kernel.signDotExact(searcher.query_state.sketched, sketch_slot);
-                    break :blk norm * (mse_term + gamma * self.quantizer.sketch_scale * sketch_term);
-                },
-            };
+                        scan.scoreExact(self.layout, centroids, searcher.query_state.rotated, slot),
+                };
+            }
 
-            collector.offer(self.score(estimate, norm, query_norm), @intCast(i));
+            for (0..take) |u| {
+                const i = v0 + u;
+                const scalars = self.scalars.items[i];
+                const sketch_slot = self.sketches.items[i * sketch_len ..][0..sketch_len];
+
+                const mse_term = block[u];
+
+                const norm: f32 = scalars.norm;
+                const gamma: f32 = scalars.gamma;
+
+                const estimate = switch (self.correction) {
+                    .scalar => norm * gamma * (shift_term + mse_term),
+                    .qjl_sketch => blk: {
+                        const sketch_term = if (!self.use_sketch)
+                            0
+                        else if (use_simd)
+                            sketch_kernel.signDot(searcher.sketch_query, sketch_slot, padded)
+                        else
+                            sketch_kernel.signDotExact(searcher.query_state.sketched, sketch_slot);
+                        break :blk norm * (mse_term + gamma * self.quantizer.sketch_scale * sketch_term);
+                    },
+                };
+
+                collector.offer(self.score(estimate, norm, query_norm), @intCast(i));
+            }
         }
 
         return collector.drain();

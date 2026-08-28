@@ -481,12 +481,56 @@ fn scoreBitsTiled(
     }
 }
 
+/// Vector- and query-tiled score over a bit-plane layout.
+///
+/// Bit-plane pays about nine operations per 16 dimensions assembling indices from
+/// planes, against two for a sequential extraction — the 4.34x gap that made bits=4
+/// the one configuration nobody should pick. All of that work is query-independent,
+/// so it amortizes better here than anywhere else: the assembly and lookup happen
+/// once per vector per group and feed V·Q SDOTs.
+fn scorePlanesTiled(
+    comptime bits: u6,
+    comptime V: usize,
+    comptime Q: usize,
+    table: Table,
+    queries: []const Query,
+    base: [*]const u8,
+    code_stride: usize,
+    dim: u32,
+    out: []f32,
+    out_stride: usize,
+) void {
+    const group_bytes = comptime @as(usize, bits) * (packing.plane_group / 8);
+    const groups = dim / packing.plane_group;
+
+    var qp: [Q][*]const i8 = undefined;
+    inline for (0..Q) |q| qp[q] = queries[q].data.ptr;
+
+    var acc: [V][Q]dot.Acc = @splat(@splat(@splat(0)));
+
+    for (0..groups) |g| {
+        var w: [Q]@Vector(16, i8) = undefined;
+        inline for (0..Q) |q| w[q] = qp[q][g * 16 ..][0..16].*;
+        inline for (0..V) |v| {
+            const idx = planeIndex(bits, base[v * code_stride + g * group_bytes ..][0..group_bytes]);
+            const vals = lookup(table.values, idx);
+            inline for (0..Q) |q| acc[v][q] = dot.accumulate(acc[v][q], vals, w[q]);
+        }
+    }
+
+    inline for (0..V) |v| {
+        inline for (0..Q) |q| {
+            const sum: f32 = @floatFromInt(dot.total(acc[v][q]));
+            out[v * out_stride + q] = sum * table.scale * queries[q].scale;
+        }
+    }
+}
+
 /// Whether a vector-tiled compact kernel exists for this layout.
 pub fn canTile(layout: Layout) bool {
     return switch (layout.kind()) {
         .sequential => layout.bits == 1 or layout.bits == 2 or layout.bits == 4,
-        // Bit-plane assembles indices from planes rather than by shift-and-mask.
-        .bit_plane => false,
+        .bit_plane => layout.bits == 3,
     };
 }
 
@@ -504,11 +548,14 @@ pub fn scoreInt8Tiled(
     out_stride: usize,
 ) void {
     std.debug.assert(canTile(layout));
-    switch (layout.bits) {
-        1 => scoreBitsTiled(1, V, Q, table, queries, base, code_stride, dim, out, out_stride),
-        2 => scoreBitsTiled(2, V, Q, table, queries, base, code_stride, dim, out, out_stride),
-        4 => scoreBitsTiled(4, V, Q, table, queries, base, code_stride, dim, out, out_stride),
-        else => unreachable,
+    switch (layout.kind()) {
+        .sequential => switch (layout.bits) {
+            1 => scoreBitsTiled(1, V, Q, table, queries, base, code_stride, dim, out, out_stride),
+            2 => scoreBitsTiled(2, V, Q, table, queries, base, code_stride, dim, out, out_stride),
+            4 => scoreBitsTiled(4, V, Q, table, queries, base, code_stride, dim, out, out_stride),
+            else => unreachable,
+        },
+        .bit_plane => scorePlanesTiled(3, V, Q, table, queries, base, code_stride, dim, out, out_stride),
     }
 }
 
@@ -973,7 +1020,7 @@ test "tiled kernel agrees exactly with the per-query kernel" {
 }
 
 test "compact tiled kernel agrees exactly with the per-query kernel" {
-    for ([_]u6{ 1, 2, 4 }) |bits| {
+    for ([_]u6{ 1, 2, 3, 4 }) |bits| {
         for ([_]u32{ 128, 256, 1024 }) |dim| {
             const layout = Layout.init(dim, bits);
             if (!canVectorize(layout)) continue;

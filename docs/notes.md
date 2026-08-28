@@ -1229,3 +1229,38 @@ turbovec, on the strength of "3,845 single-thread against ~21,100 on 10 threads 
 short of the core count." The core count was the wrong denominator — six of those cores are
 worth about a third of a performance core each. Scaling is close to maxed, and the remaining
 throughput gap is per-core kernel work, not threading.
+
+
+## Closing on the per-core gap, and two things it is not
+
+Hoisting the metric switch out of the batch inner loop was worth ~20%. `score()` was
+switching on the metric for every (vector, query) pair even though it is fixed for the whole
+index and is the *identity* under inner product, so the switch, the branch, and the
+query-norm load were all overhead on the common path. It joins the correction and residency
+tests in one index-wide predicate. nytimes-256 bits=5 batched: 4,096 → 4,906 compact,
+4,428 → 5,257 expanded.
+
+That leaves the index at ~134 G dim/s against the isolated kernel's ~181 at d=256 — 74% of
+kernel peak reaching the index. Two hypotheses for the missing 26%, both tested, both wrong:
+
+**Not memory bandwidth.** The isolated kernel benchmark used a 5 MB corpus while the real
+index is 26 MB, so the obvious reading was that the index is bandwidth-bound where the
+benchmark is not. Re-running the kernel at n=100,000 (25.6 MB at d=256) gives **180.7 G
+dim/s**, against 175 at n=20,000 — no drop at all. The scan streams codes once per pass with
+no reuse, and at ~0.6 loads per SDOT it simply does not demand enough bandwidth to saturate.
+
+**Not the epilogue's loads.** Per pair the epilogue does three loads — the scan does about
+ten — so loading `shift_terms[i]` and `thresholds[i]` once per tile instead of once per pair
+looked like a clear win. Inverting the loop nesting to query-major measured **4% slower**
+(5,257 → 5,032). The saving was real but it made the `mse_block` read strided across four
+cache lines, and the premise was weak to begin with: vector-major reads all three arrays as
+*contiguous* L1 streams, which cost almost nothing. Reverted.
+
+So the remaining gap is neither bandwidth nor epilogue addressing. Ruling those out is worth
+more than the 4% the second experiment cost, since both were the obvious next places to
+spend effort.
+
+**Standing on nytimes-256** (100k × 256): bits=5 compact 132 B at R@10 0.916, 4,885 batched
+and ~25,300 parallel; expanded 260 B at 5,257 batched and ~28,400 parallel. turbovec is
+38,052 at 270 B and 0.914 — so 1.34× behind at matched memory, from 4.2× when this started,
+with equal recall and, in the compact configuration, half the memory.

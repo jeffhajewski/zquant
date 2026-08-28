@@ -14,7 +14,7 @@ const Timer = @import("timer.zig").Timer;
 
 pub fn main() !void {
     const a = std.heap.smp_allocator;
-    const n: usize = 20_000;
+    const n: usize = 100_000;
     const trials = 7;
 
     var prng = std.Random.DefaultPrng.init(1);

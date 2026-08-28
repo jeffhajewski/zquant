@@ -1518,3 +1518,49 @@ The block prune is the open lead. Ours tests one vector against eight queries; t
 32 vectors against one query, so it runs a quarter as many prune tests over the same work.
 Whether that pays is not obvious by arithmetic — their test is a max-reduce over 32 lanes
 against our single compare — so it needs measuring, not estimating.
+
+
+## The block prune is worse too — and that exhausts the collection hypotheses
+
+Their second idea, the whole-block prune: score 32 vectors per query into a contiguous
+row, SIMD-max across all 32, skip the row on one compare. A quarter as many prune tests as
+ours for the same work.
+
+Measured over identical score data at the k=100 accept rate (~0.7% of pairs), with the
+accept counts asserted equal:
+
+| strategy | ns per 32×32 block |
+|---|---|
+| ours — per vector, 8-query SIMD compare, `@ctz` descent | **46.0** |
+| theirs — per query, 32-vector max prune | 244.6 |
+
+**5.3× in our favour.** The prune tests are cheaper for them; the *hit path* is far more
+expensive. At this accept rate ~20% of their 32-vector rows contain a hit, and each hit
+scans all 32 lanes scalar. Ours descends only into the lanes the mask says passed, which is
+almost always one.
+
+**That exhausts collection as an explanation.** Both of turbovec's collection mechanisms are
+worse than ours at the depth the comparison runs at. Combined with the earlier results, the
+eliminated list is now:
+
+| candidate | verdict |
+|---|---|
+| a faster int8 instruction (SMMLA) | no such thing — identical MAC throughput |
+| reservoir collection | worse at depth |
+| their array collector + linear rescan | much worse at k≥50 |
+| their whole-block prune | 5.3× worse |
+| per-call thread spawn | 1.2% |
+| parallel efficiency | 97% across the performance cores |
+| batch shape | was a harness artifact, fixed |
+
+What is left is the scan kernel itself. Theirs is not an SDOT kernel at all: `score_4bit_block_neon`
+accumulates **4-bit LUT lookups in `u8`** (`vqtbl1q_u8` twice plus `vaddq_u8`) over a blocked
+layout holding 16 vectors per register. By operation count that is ~10.7 vector-dims per op
+against our ~9.8 pair-dims per op — close, and it carries a cost we do not pay, since `u8`
+accumulators saturate at 255 and need periodic widening flushes.
+
+So the remaining gap is a different scan algorithm with, on paper, single-digit headroom —
+not a missing trick. Absent a measurement showing otherwise, the honest position is that
+we are near the practical limit of this design on this hardware, at 1.22× behind on the one
+corpus large enough for steady-state scan rate to dominate, while ahead on smaller ones and
+ahead on recall and memory throughout.

@@ -1032,25 +1032,36 @@ test "compact tiled kernel agrees exactly with the per-query kernel" {
             defer testing.allocator.free(codes);
             const rotated = try testing.allocator.alloc(f32, dim);
             defer testing.allocator.free(rotated);
-            var cb: ?Codebook = null;
-            defer if (cb) |*c| c.deinit();
+
+            // One codebook for the whole tile, as an index has. Building one per
+            // vector meant V Lloyd-Max solves per (bits, dim) pair — at dim=1024 that
+            // alone took the unit suite from ~100 s to over ten minutes — and it also
+            // misrepresented the setup, since the codes would then be packed against
+            // codebooks the scoring table does not come from.
+            var cb = try Codebook.init(testing.allocator, Density.sphereCoord(dim), bits);
+            defer cb.deinit();
+            const table = Table.init(cb.centroids);
+
+            var seed = std.Random.DefaultPrng.init(0x900D + dim + bits);
+            const rand = seed.random();
+            const sigma = 1.0 / @sqrt(@as(f32, @floatFromInt(dim)));
+            const raw = try testing.allocator.alloc(f32, dim);
+            defer testing.allocator.free(raw);
+            const scratch_codes = try testing.allocator.alloc(u8, dim);
+            defer testing.allocator.free(scratch_codes);
             for (0..V) |v| {
-                var c = try setup(dim, bits, 0x900D + dim + bits + v, codes[v * stride ..][0..stride], rotated);
-                if (cb) |*prev| prev.deinit();
-                cb = c;
-                _ = &c;
+                for (raw) |*x| x.* = rand.floatNorm(f32) * sigma;
+                cb.encodeSlice(raw, scratch_codes);
+                layout.pack(scratch_codes, codes[v * stride ..][0..stride]);
             }
-            const table = Table.init(cb.?.centroids);
 
             const queries = try testing.allocator.alloc(Query, Q);
             defer testing.allocator.free(queries);
             var built: usize = 0;
             defer for (0..built) |i| queries[i].deinit();
-            var prng = std.Random.DefaultPrng.init(dim + bits);
-            const random = prng.random();
             while (built < Q) : (built += 1) {
                 queries[built] = try Query.init(testing.allocator, layout);
-                for (rotated) |*x| x.* = random.floatNorm(f32) / @sqrt(@as(f32, @floatFromInt(dim)));
+                for (rotated) |*x| x.* = rand.floatNorm(f32) * sigma;
                 queries[built].load(rotated);
             }
 

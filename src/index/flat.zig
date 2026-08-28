@@ -684,6 +684,12 @@ pub const FlatIndex = struct {
         }
 
         var collectors: [max_batch]topk.TopK = undefined;
+        // Mirror of each collector's admission threshold. Reading it from the heap
+        // costs three loads — `len`, `heap.ptr`, `heap.len` — for every (vector,
+        // query) pair, and at d=256 the scan itself is only about ten loads per pair,
+        // so the epilogue was a large fraction of the loop it followed. Almost every
+        // candidate is rejected, so the cache is refreshed only on the rare accept.
+        var thresholds: [max_batch]f32 = @splat(-std.math.inf(f32));
         for (0..n) |i| {
             collectors[i] = topk.TopK.init(searcher.heap_store[i * searcher.k ..][0..searcher.k]);
         }
@@ -800,6 +806,13 @@ pub const FlatIndex = struct {
                 }
             }
 
+            // Until every collector holds k candidates the threshold is -inf, and a
+            // -inf score — a zero vector under cosine — would be rejected by a strict
+            // compare even though the heap has room, returning short results. Once
+            // filled, the cached threshold is exactly `heap[0].score`, so the fast
+            // reject is identical to the test inside `offer`.
+            const filled = v0 >= searcher.k;
+
             for (0..take) |u| {
                 const v = v0 + u;
                 const scalars = self.scalars.items[v];
@@ -808,16 +821,29 @@ pub const FlatIndex = struct {
                 const norm: f32 = scalars.norm;
                 const gamma: f32 = scalars.gamma;
 
-                for (0..n) |i| {
+                // Split on the correction outside the query loop rather than
+                // switching per pair: it is fixed for the whole index.
+                if (self.correction == .scalar and (self.residency == .expanded or use_simd)) {
+                    const block = mse_block[u * max_batch ..][0..n];
+                    for (0..n) |i| {
+                        // α scales the whole reconstruction ⟨p, x̂⟩ = mse_term +
+                        // shift_term, not just one of its two halves: x̂ = c/scale −
+                        // shift, so both terms come from the same reconstruction and
+                        // share its error.
+                        const estimate = norm * gamma * (shift_terms[i] + block[i]);
+                        const sc = self.score(estimate, norm, query_norms[i]);
+                        if (!filled or sc > thresholds[i]) {
+                            collectors[i].offer(sc, @intCast(v));
+                            thresholds[i] = collectors[i].threshold();
+                        }
+                    }
+                } else for (0..n) |i| {
                     const mse_term = if (self.residency == .expanded or use_simd)
                         mse_block[u * max_batch + i]
                     else
                         scan.scoreExact(self.layout, centroids, searcher.query_states[i].rotated, code_slot);
 
                     const estimate = switch (self.correction) {
-                        // α scales the whole reconstruction ⟨p, x̂⟩ = mse_term + shift_term,
-                        // not just one of its two halves: x̂ = c/scale − shift, so both
-                        // terms come from the same reconstruction and share its error.
                         .scalar => norm * gamma * (shift_terms[i] + mse_term),
                         .qjl_sketch => blk: {
                             const sketch_term = if (!self.use_sketch)
@@ -829,7 +855,11 @@ pub const FlatIndex = struct {
                             break :blk norm * (mse_term + gamma * self.quantizer.sketch_scale * sketch_term);
                         },
                     };
-                    collectors[i].offer(self.score(estimate, norm, query_norms[i]), @intCast(v));
+                    const sc = self.score(estimate, norm, query_norms[i]);
+                    if (!filled or sc > thresholds[i]) {
+                        collectors[i].offer(sc, @intCast(v));
+                        thresholds[i] = collectors[i].threshold();
+                    }
                 }
             }
         }
@@ -2040,5 +2070,48 @@ test "calibrated alpha is the least-squares fit in the pre-shift basis" {
         }
         const want: f32 = @floatCast(dot / recon_sq);
         try testing.expectApproxEqRel(want, index.scalars.items[id].gamma, 1e-3);
+    }
+}
+
+test "batch search fills k results when some vectors score -inf" {
+    // A zero vector has no direction, so under cosine it scores -inf. The batch
+    // loop caches each collector's admission threshold to avoid three loads per
+    // (vector, query) pair, and that cache starts at -inf — a strict compare would
+    // reject a -inf score even while the heap still has room, and the returned
+    // slice would be shorter than the k entries per query that callers index by.
+    const allocator = testing.allocator;
+    const dim: u32 = 64;
+    const n = 8;
+    const k = 8;
+
+    const corpus = try allocator.alloc(f32, n * dim);
+    defer allocator.free(corpus);
+    @memset(corpus, 0);
+    var prng = std.Random.DefaultPrng.init(0x2E20);
+    const random = prng.random();
+    // Half the corpus is left as zero vectors.
+    for (0..n / 2) |i| randomUnit(corpus[i * dim ..][0..dim], random);
+
+    var index = try FlatIndex.init(allocator, .{
+        .dim = dim,
+        .bits = 5,
+        .seed = 0x11,
+        .metric = .cosine,
+    });
+    defer index.deinit();
+    try index.addBatch(corpus);
+
+    const nq = 3;
+    const queries = try allocator.alloc(f32, nq * dim);
+    defer allocator.free(queries);
+    for (0..nq) |i| randomUnit(queries[i * dim ..][0..dim], random);
+
+    var searcher = try FlatIndex.BatchSearcher.init(allocator, index, nq, k);
+    defer searcher.deinit();
+    const res = index.searchBatch(queries, &searcher);
+
+    try testing.expectEqual(@as(usize, nq * k), res.len);
+    for (0..nq) |q| {
+        for (res[q * k ..][0..k]) |e| try testing.expect(e.id < n);
     }
 }

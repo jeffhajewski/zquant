@@ -311,6 +311,57 @@ pub fn scoreExpandedMulti(
     }
 }
 
+/// Score `V` consecutive stored vectors against `Q` queries in one pass.
+///
+/// `scoreExpandedMulti` amortizes the code load across the query group, reaching
+/// (1 + Q)/Q loads per SDOT — 1.125 at Q=8, close to the floor of 1. What it cannot
+/// amortize is the *query* loads, one per SDOT.
+///
+/// Tiling the stored vectors as well holds the Q query chunks in registers and reuses
+/// them across V vectors: per chunk the loop issues Q + V loads against V·Q SDOTs, so
+/// 0.625 at V=2, Q=8. That is below one load per SDOT, which the query-only form
+/// cannot reach at any Q.
+///
+/// V·Q accumulators plus Q query chunks plus V code chunks must fit in 32 vector
+/// registers, which is what bounds the tile: V=2, Q=8 needs 26.
+pub fn scoreExpandedTiled(
+    comptime V: usize,
+    comptime Q: usize,
+    base: [*]const i8,
+    vec_stride: usize,
+    queries: []const Query,
+    table_scale: f32,
+    dim: u32,
+    out: []f32,
+    out_stride: usize,
+) void {
+    std.debug.assert(queries.len >= Q);
+    std.debug.assert(dim % 16 == 0);
+
+    var qp: [Q][*]const i8 = undefined;
+    inline for (0..Q) |q| qp[q] = queries[q].data.ptr;
+
+    var acc: [V][Q]dot.Acc = @splat(@splat(@splat(0)));
+    const chunks = dim / 16;
+
+    var ch: usize = 0;
+    while (ch < chunks) : (ch += 1) {
+        var w: [Q]@Vector(16, i8) = undefined;
+        inline for (0..Q) |q| w[q] = qp[q][ch * 16 ..][0..16].*;
+        inline for (0..V) |v| {
+            const c: @Vector(16, i8) = base[v * vec_stride + ch * 16 ..][0..16].*;
+            inline for (0..Q) |q| acc[v][q] = dot.accumulate(acc[v][q], c, w[q]);
+        }
+    }
+
+    inline for (0..V) |v| {
+        inline for (0..Q) |q| {
+            const sum: f32 = @floatFromInt(dot.total(acc[v][q]));
+            out[v * out_stride + q] = sum * table_scale * queries[q].scale;
+        }
+    }
+}
+
 /// Widest query group the compact kernels can hold without spilling.
 ///
 /// A sequential layout keeps one accumulator per bit-field group, so the multi-query
@@ -803,4 +854,33 @@ test "expanded multi-query kernel agrees exactly with the per-query kernel" {
     for (0..Q) |q| {
         try testing.expectEqual(scoreExpanded(values, queries[q], 0.01, dim), out[q]);
     }
+}
+
+test "tiled kernel agrees exactly with the per-query kernel" {
+    const dim: u32 = 512;
+    const V = 2;
+    const Q = 8;
+    const store = try testing.allocator.alloc(i8, V * dim);
+    defer testing.allocator.free(store);
+    var prng = std.Random.DefaultPrng.init(0x7113);
+    const random = prng.random();
+    for (store) |*v| v.* = random.intRangeAtMost(i8, -127, 127);
+
+    var queries: [Q]Query = undefined;
+    var built: usize = 0;
+    defer for (0..built) |i| queries[i].deinit();
+    const scratch = try testing.allocator.alloc(f32, dim);
+    defer testing.allocator.free(scratch);
+    while (built < Q) : (built += 1) {
+        queries[built] = try Query.initSequential(testing.allocator, dim);
+        for (scratch) |*v| v.* = random.floatNorm(f32) / @sqrt(@as(f32, @floatFromInt(dim)));
+        queries[built].load(scratch);
+    }
+
+    var out: [V * Q]f32 = undefined;
+    scoreExpandedTiled(V, Q, store.ptr, dim, queries[0..], 0.01, dim, out[0..], Q);
+    for (0..V) |v| for (0..Q) |q| {
+        const one = scoreExpanded(store[v * dim ..][0..dim], queries[q], 0.01, dim);
+        try testing.expectEqual(one, out[v * Q + q]);
+    };
 }

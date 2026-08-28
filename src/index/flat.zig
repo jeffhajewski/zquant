@@ -703,92 +703,107 @@ pub const FlatIndex = struct {
         const padded = self.quantizer.padded();
         const centroids = self.quantizer.mse.codebook.centroids;
 
-        // The expanded residency scores the whole query group in one pass over the
-        // vector, so each code chunk is loaded once rather than once per query. See
-        // `scan.scoreExpandedMulti` for why batching did nothing without this.
-        const group = 8;
+        // Vectors are tiled as well as queries: the group's query chunks stay in
+        // registers across the tile, so the loop issues group + tile loads against
+        // tile*group SDOTs. See `scan.scoreExpandedTiled` for the accounting.
+        const tile = 4;
+        const group = 4;
         const compact_width = if (use_simd) scan.multiWidth(self.layout) else 1;
-        var mse_terms: [max_batch]f32 = undefined;
+        var mse_block: [tile * max_batch]f32 = undefined;
 
-        for (self.scalars.items, 0..) |scalars, v| {
-            // Fetched once; the inner loop reads it out of cache.
-            const code_slot = self.codes.items[v * stride ..][0..stride];
-            const sketch_slot = self.sketches.items[v * sketch_len ..][0..sketch_len];
-            const norm: f32 = scalars.norm;
-            const gamma: f32 = scalars.gamma;
+        const total = self.scalars.items.len;
+        var v0: usize = 0;
+        while (v0 < total) : (v0 += tile) {
+            const take = @min(tile, total - v0);
 
             if (self.residency == .expanded) {
                 var i: usize = 0;
-                while (i + group <= n) : (i += group) {
-                    scan.scoreExpandedMulti(
-                        group,
-                        @ptrCast(code_slot),
-                        searcher.scan_queries[i..],
-                        self.table.scale,
-                        padded,
-                        mse_terms[i..],
-                    );
+                if (take == tile) {
+                    while (i + group <= n) : (i += group) {
+                        scan.scoreExpandedTiled(
+                            tile,
+                            group,
+                            @ptrCast(self.codes.items.ptr + v0 * stride),
+                            stride,
+                            searcher.scan_queries[i..],
+                            self.table.scale,
+                            padded,
+                            mse_block[i..],
+                            max_batch,
+                        );
+                    }
                 }
+                // Query and vector tails both fall back to the one-vector kernel.
                 while (i < n) : (i += 1) {
-                    mse_terms[i] = scan.scoreExpanded(
-                        @ptrCast(code_slot),
-                        searcher.scan_queries[i],
-                        self.table.scale,
-                        padded,
-                    );
+                    for (0..take) |u| {
+                        mse_block[u * max_batch + i] = scan.scoreExpanded(
+                            @ptrCast(self.codes.items[(v0 + u) * stride ..][0..stride]),
+                            searcher.scan_queries[i],
+                            self.table.scale,
+                            padded,
+                        );
+                    }
                 }
             } else if (use_simd) {
                 // The unpack is query-independent, so the group shares it.
-                var i: usize = 0;
-                while (i + compact_width <= n) : (i += compact_width) {
-                    scan.scoreInt8Multi(
-                        self.layout,
-                        searcher.table,
-                        searcher.scan_queries[i..],
-                        code_slot,
-                        padded,
-                        mse_terms[i..],
-                    );
-                }
-                while (i < n) : (i += 1) {
-                    mse_terms[i] = scan.scoreInt8(
-                        self.layout,
-                        searcher.table,
-                        searcher.scan_queries[i],
-                        code_slot,
-                        padded,
-                    );
+                for (0..take) |u| {
+                    const slot = self.codes.items[(v0 + u) * stride ..][0..stride];
+                    var i: usize = 0;
+                    while (i + compact_width <= n) : (i += compact_width) {
+                        scan.scoreInt8Multi(
+                            self.layout,
+                            searcher.table,
+                            searcher.scan_queries[i..],
+                            slot,
+                            padded,
+                            mse_block[u * max_batch + i ..],
+                        );
+                    }
+                    while (i < n) : (i += 1) {
+                        mse_block[u * max_batch + i] = scan.scoreInt8(
+                            self.layout,
+                            searcher.table,
+                            searcher.scan_queries[i],
+                            slot,
+                            padded,
+                        );
+                    }
                 }
             }
 
-            for (0..n) |i| {
-                const mse_term = switch (self.residency) {
-                    .expanded => mse_terms[i],
-                    .compact => if (use_simd)
-                        mse_terms[i]
-                    else
-                        scan.scoreExact(self.layout, centroids, searcher.query_states[i].rotated, code_slot),
-                };
+            for (0..take) |u| {
+                const v = v0 + u;
+                const scalars = self.scalars.items[v];
+                const code_slot = self.codes.items[v * stride ..][0..stride];
+                const sketch_slot = self.sketches.items[v * sketch_len ..][0..sketch_len];
+                const norm: f32 = scalars.norm;
+                const gamma: f32 = scalars.gamma;
 
-                const estimate = switch (self.correction) {
-                    // α scales the whole reconstruction ⟨p, x̂⟩ = mse_term + shift_term,
-                    // not just one of its two halves: x̂ = c/scale − shift, so both
-                    // terms come from the same reconstruction and share its error.
-                    .scalar => norm * gamma * (shift_terms[i] + mse_term),
-                    .qjl_sketch => blk: {
-                        const sketch_term = if (!self.use_sketch)
-                            0
-                        else if (use_simd)
-                            sketch_kernel.signDot(searcher.sketch_queries[i], sketch_slot, padded)
-                        else
-                            sketch_kernel.signDotExact(searcher.query_states[i].sketched, sketch_slot);
-                        break :blk norm * (mse_term + gamma * self.quantizer.sketch_scale * sketch_term);
-                    },
-                };
-                collectors[i].offer(self.score(estimate, norm, query_norms[i]), @intCast(v));
+                for (0..n) |i| {
+                    const mse_term = if (self.residency == .expanded or use_simd)
+                        mse_block[u * max_batch + i]
+                    else
+                        scan.scoreExact(self.layout, centroids, searcher.query_states[i].rotated, code_slot);
+
+                    const estimate = switch (self.correction) {
+                        // α scales the whole reconstruction ⟨p, x̂⟩ = mse_term + shift_term,
+                        // not just one of its two halves: x̂ = c/scale − shift, so both
+                        // terms come from the same reconstruction and share its error.
+                        .scalar => norm * gamma * (shift_terms[i] + mse_term),
+                        .qjl_sketch => blk: {
+                            const sketch_term = if (!self.use_sketch)
+                                0
+                            else if (use_simd)
+                                sketch_kernel.signDot(searcher.sketch_queries[i], sketch_slot, padded)
+                            else
+                                sketch_kernel.signDotExact(searcher.query_states[i].sketched, sketch_slot);
+                            break :blk norm * (mse_term + gamma * self.quantizer.sketch_scale * sketch_term);
+                        },
+                    };
+                    collectors[i].offer(self.score(estimate, norm, query_norms[i]), @intCast(v));
+                }
             }
         }
-
         for (0..n) |i| _ = collectors[i].drain();
         const found = @min(searcher.k, self.count());
         return searcher.heap_store[0 .. (n - 1) * searcher.k + found];

@@ -1427,3 +1427,53 @@ So the gap is not instruction selection and not the kernel. It is that our index
 of peak where our own kernel sustains 76%, and the largest identified piece of that is
 collection at depth: retrieval at k=100 costs 18% on nytimes and 55% on SIFT. That is the
 lever, and it is not a SIMD problem.
+
+
+## Top-k collection at depth: measured properly, fixed partially
+
+Retrieval depth was the largest identified cost outside the kernel — at d=256, n=100k,
+throughput as a fraction of the isolated scan kernel fell 86% → 81% → 73% → 63% across
+k = 10, 50, 100, 200.
+
+**First, the accept model was confirmed rather than assumed.** Counting actual `offer` calls
+gave 88, 374, 688, 1239 accepts per query against the predicted `k·ln(n/k)` of 92, 380, 690,
+1243 — a match. Dividing the *time* difference by the *accept* difference gives **~55 ns per
+accept**, which is over 200 cycles. Far too slow for a heap sift, and squarely in cache-miss
+territory: between two accepts for one query the scan walks thousands of vectors and evicts
+that query's heap. The cost tracks the collectors' footprint, `batch · k` — 2.5 KB at k=10 but
+51 KB at k=200, past L1.
+
+**Reservoir collection: implemented, measured, reverted.** Replacing the heap with an
+append-and-compact reservoir was the plan, on the theory that the accept path's `log k`
+dependent accesses were the cost. It is not a win:
+
+| k | heap | reservoir (2k) |
+|---|---|---|
+| 10 | 148.8 | 158.3 |
+| 50 | 140.6 | 140.4 |
+| 100 | 126.2 | 126.4 |
+| 200 | 109.5 | **105.7** |
+
+Neutral in the middle and *worse* at depth, because it doubles the very footprint that causes
+the misses. Tuning the slack to `k + k/4` landed within noise of the heap at every depth.
+Reverted — the theory was wrong, and it was wrong in an informative direction: it confirmed
+footprint, not sift depth, is what matters.
+
+**What did help, modestly.** Two changes that both reduce work per accept without growing the
+footprint:
+
+- Iterate only the lanes whose compare passed (`@ctz` over the mask) instead of descending
+  into all eight. Almost always exactly one lane passed.
+- Stage accepts in a fixed-width per-query buffer (`hot_slots = 8`, 8 KB total *regardless of
+  k*) and flush into the cold heap in batches, so the heap is touched once per flush rather
+  than once per accept.
+
+Together, against the heap baseline: +0.5% at k=10, +3.6% at k=100, +3.3% at k=200 (compact);
++4.1% and +5.9% at k=100/200 (expanded). End to end on nytimes at k=100, parallel throughput
+30,141 → 31,272, so 1.22× behind turbovec at matched memory rather than 1.26×.
+
+**This is a partial result and should not be read as a fix.** The depth cost was ~26% between
+k=10 and k=100; a few points of that are now recovered and the rest is not explained. The
+staging buffer should have helped more than it did — it cuts cold-heap touches eightfold —
+so something beyond heap locality is still involved. Branch misprediction on the mask test
+accounts for perhaps a seventh of the gap by arithmetic, which leaves most of it open.

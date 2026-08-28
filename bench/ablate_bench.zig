@@ -134,17 +134,35 @@ pub fn main() !void {
             }
         }
 
-        // Full searchBatch for the same work.
+        const work_pre: f64 = @floatFromInt(n * dim * nq);
+
+        // Full searchBatch across retrieval depths. Depth is the one knob that moved
+        // the index without moving the kernel - 18% on nytimes and 55% on SIFT - and
+        // the sift arithmetic is far too small to explain it, so this measures rather
+        // than assumes.
         var full_ns: u64 = std.math.maxInt(u64);
-        for (0..trials) |_| {
-            var t = Timer.start();
-            std.mem.doNotOptimizeAway(index.searchBatch(queries, &searcher));
-            full_ns = @min(full_ns, t.read());
+        for ([_]usize{ 10, 50, 100, 200 }) |kk| {
+            var s2 = try zq.flat.FlatIndex.BatchSearcher.init(a, index, nq, kk);
+            defer s2.deinit();
+            var best: u64 = std.math.maxInt(u64);
+            for (0..trials) |_| {
+                var t = Timer.start();
+                std.mem.doNotOptimizeAway(index.searchBatch(queries, &s2));
+                best = @min(best, t.read());
+            }
+            if (kk == 10) full_ns = best;
+            const g = work_pre / @as(f64, @floatFromInt(best));
+            std.debug.print("{s:>10}k={d:<4} {d:>12.1} {d:>9.0}% {d:>11.1}%\n", .{
+                "searchBatch ", kk, g,
+                g / (work_pre / @as(f64, @floatFromInt(stage_ns[0]))) * 100,
+                (@as(f64, @floatFromInt(best)) - @as(f64, @floatFromInt(stage_ns[0]))) /
+                    @as(f64, @floatFromInt(stage_ns[0])) * 100,
+            });
         }
 
         std.mem.doNotOptimizeAway(sink);
 
-        const work: f64 = @floatFromInt(n * dim * nq);
+        const work = work_pre;
         const names = [_][]const u8{ "kernel only", "+ estimate", "+ compare" };
         std.debug.print("\n{s} residency, d={d} n={d} batch={d}\n", .{ @tagName(residency), dim, n, nq });
         std.debug.print("{s:>16} {s:>12} {s:>10} {s:>12}\n", .{ "stage", "G dim/s", "vs kernel", "added cost" });
@@ -158,13 +176,6 @@ pub fn main() !void {
                     @as(f64, @floatFromInt(stage_ns[0])) * 100,
             });
         }
-        const gf = work / @as(f64, @floatFromInt(full_ns));
-        std.debug.print("{s:>16} {d:>12.1} {d:>9.0}% {d:>11.1}%\n", .{
-            "searchBatch",
-            gf,
-            gf / (work / @as(f64, @floatFromInt(stage_ns[0]))) * 100,
-            (@as(f64, @floatFromInt(full_ns)) - @as(f64, @floatFromInt(stage_ns[0]))) /
-                @as(f64, @floatFromInt(stage_ns[0])) * 100,
-        });
+        std.mem.doNotOptimizeAway(full_ns);
     }
 }

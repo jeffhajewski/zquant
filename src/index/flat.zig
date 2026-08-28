@@ -155,6 +155,22 @@ pub const max_batch: usize = 128;
 /// replaces `lanes` scalar compares and branches.
 const lanes = 8;
 const Lane = @Vector(lanes, f32);
+const LaneMask = std.meta.Int(.unsigned, lanes);
+
+/// Accepted candidates are staged here per query and flushed into the collector in
+/// batches.
+///
+/// Accepts are rare but expensive — measured at ~55 ns each, far more than a heap sift
+/// costs — because between two accepts for the same query the scan walks thousands of
+/// vectors and evicts that query's heap. The cost therefore tracks the collectors'
+/// total footprint, `batch * k`: 2.5 KB at k=10 but 51 KB at k=200, well past L1. That
+/// is why retrieval depth costs throughput at all, and why a wider reservoir did not
+/// help — it made the footprint larger, not smaller.
+///
+/// A staging buffer of fixed width does not grow with k. `max_batch * hot_slots` is
+/// 8 KB whatever the depth, so it stays resident, and the cold heap is touched once
+/// per flush rather than once per accept.
+const hot_slots = 8;
 
 pub const FlatIndex = struct {
     quantizer: prod_mod.Prod,
@@ -695,6 +711,8 @@ pub const FlatIndex = struct {
         // so the epilogue was a large fraction of the loop it followed. Almost every
         // candidate is rejected, so the cache is refreshed only on the rare accept.
         var thresholds: [max_batch]f32 = @splat(-std.math.inf(f32));
+        var hot: [max_batch][hot_slots]Entry = undefined;
+        var hot_len: [max_batch]usize = @splat(0);
         for (0..n) |i| {
             collectors[i] = topk.TopK.init(searcher.heap_store[i * searcher.k ..][0..searcher.k]);
         }
@@ -854,12 +872,22 @@ pub const FlatIndex = struct {
                         const sh: Lane = shift_terms[i..][0..lanes].*;
                         const th: Lane = thresholds[i..][0..lanes].*;
                         const sc = ngv * (sh + m);
-                        if (!@reduce(.Or, sc > th)) continue;
+                        // Visit only the lanes that actually passed. Descending into
+                        // all `lanes` on any hit costs eight unpredictable branches to
+                        // service what is almost always a single accept, and hits get
+                        // steadily more frequent as k rises and thresholds fall — which
+                        // is where the cost of retrieval depth lives.
+                        var mask: LaneMask = @bitCast(sc > th);
+                        if (mask == 0) continue;
                         const each: [lanes]f32 = sc;
-                        inline for (0..lanes) |j| {
-                            if (each[j] > thresholds[i + j]) {
-                                collectors[i + j].offer(each[j], @intCast(v));
-                                thresholds[i + j] = collectors[i + j].threshold();
+                        while (mask != 0) {
+                            const j = @ctz(mask);
+                            mask &= mask - 1;
+                            const q = i + j;
+                            hot[q][hot_len[q]] = .{ .id = @intCast(v), .score = each[j] };
+                            hot_len[q] += 1;
+                            if (hot_len[q] == hot_slots) {
+                                flushHot(&collectors[q], &hot[q], &hot_len[q], &thresholds[q]);
                             }
                         }
                     }
@@ -905,6 +933,7 @@ pub const FlatIndex = struct {
                 }
             }
         }
+        for (0..n) |i| flushHot(&collectors[i], &hot[i], &hot_len[i], &thresholds[i]);
         for (0..n) |i| _ = collectors[i].drain();
         const found = @min(searcher.k, self.count());
         return searcher.heap_store[0 .. (n - 1) * searcher.k + found];
@@ -1172,6 +1201,18 @@ pub const FlatIndex = struct {
         };
     }
 };
+
+/// Drain staged candidates into a collector and refresh its cached threshold.
+inline fn flushHot(
+    collector: *topk.TopK,
+    staged: *[hot_slots]Entry,
+    len: *usize,
+    threshold: *f32,
+) void {
+    for (staged[0..len.*]) |e| collector.offer(e.score, e.id);
+    len.* = 0;
+    threshold.* = collector.threshold();
+}
 
 fn euclideanNorm(x: []const f32) f32 {
     var sum: f64 = 0;

@@ -344,14 +344,27 @@ it was caught.
 
 ## Reproducing
 
+Everything below needs real corpora and their dependencies. For a check that needs neither,
+`zig build quickbench -Doptimize=ReleaseFast` generates its own data and runs in about a
+minute.
+
+**Environment for every measurement in this document:** Apple M5 (4 performance + 6
+efficiency cores), macOS 26.5, Zig 0.16.0, aarch64, `-Doptimize=ReleaseFast`. Some results
+are specific to it — `SMMLA` and `SDOT` have identical int8 MAC throughput on this core, so
+the conclusion that there is no faster instruction available does not transfer to hardware
+where that is untrue. Parallel throughput drifts with thermal state by up to 25% across
+consecutive runs; single-thread figures are stable to roughly 5%, and are the better basis
+for comparison.
+
 ```sh
 tools/fetch_datasets.sh
 python bench/py/prepare.py                 # SIFT10K
 python bench/py/prepare.py nytimes-256     # or an ann-benchmarks HDF5
 python bench/py/baselines.py       # PQ, RaBitQ, turbovec  -> data/baselines.csv
 zig build compare_bench            # zquant                -> data/zquant.csv
-python bench/py/compare.py         # merged table
+python bench/py/compare.py         # merged table; refuses to merge mismatched runs
 zig build diagnose                 # rotation moments, D_mse, estimator RMS
+python bench/py/synth.py spectrum --alpha 1.0   # synthetic corpus with one property varied
 ```
 
 Requires `numpy`, `faiss-cpu`, `turbovec` in a virtualenv.

@@ -10,6 +10,24 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // C ABI: a static and a shared library, plus the header. This is what the Python,
+    // JavaScript and Go clients link against; see include/zquant.h.
+    const c_api = b.createModule(.{
+        .root_source_file = b.path("src/c_api.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    c_api.link_libc = true;
+    const lib_static = b.addLibrary(.{ .name = "zquant", .root_module = c_api, .linkage = .static });
+    const lib_shared = b.addLibrary(.{ .name = "zquant", .root_module = c_api, .linkage = .dynamic });
+    lib_static.installHeader(b.path("include/zquant.h"), "zquant.h");
+    b.installArtifact(lib_static);
+    b.installArtifact(lib_shared);
+
+    const lib_step = b.step("lib", "Build the C ABI static and shared libraries");
+    lib_step.dependOn(&b.addInstallArtifact(lib_static, .{}).step);
+    lib_step.dependOn(&b.addInstallArtifact(lib_shared, .{}).step);
+
     const unit_tests = b.addTest(.{
         .name = "zquant-test",
         .root_module = zquant,
@@ -18,6 +36,18 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+
+    // The C ABI's own smoke test, compiled as C and linked against the library, so the
+    // header and the exported symbols are checked the way a binding author meets them
+    // rather than through Zig's type system.
+    const c_smoke_mod = b.createModule(.{ .target = target, .optimize = optimize });
+    c_smoke_mod.addCSourceFile(.{ .file = b.path("tests/c/smoke.c"), .flags = &.{"-std=c11"} });
+    c_smoke_mod.addIncludePath(b.path("include"));
+    c_smoke_mod.linkLibrary(lib_static);
+    c_smoke_mod.link_libc = true;
+    const c_smoke = b.addExecutable(.{ .name = "c-smoke", .root_module = c_smoke_mod });
+    test_step.dependOn(&b.addRunArtifact(c_smoke).step);
+
 
     // Integration tests live outside the module so they exercise the public API
     // across seams, rather than reaching into internals.

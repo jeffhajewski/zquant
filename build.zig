@@ -33,6 +33,23 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(lib_static);
     b.installArtifact(lib_shared);
 
+    // A pkg-config file, so an installed library can be consumed without every
+    // downstream build hardcoding paths. The Go client's default build uses it.
+    const pc = b.addWriteFiles();
+    const pc_file = pc.add("zquant.pc", b.fmt(
+        \\prefix={s}
+        \\libdir=${{prefix}}/lib
+        \\includedir=${{prefix}}/include
+        \\
+        \\Name: zquant
+        \\Description: TurboQuant vector quantization
+        \\Version: 0.1.0
+        \\Libs: -L${{libdir}} -lzquant
+        \\Cflags: -I${{includedir}}
+        \\
+    , .{b.install_prefix}));
+    b.getInstallStep().dependOn(&b.addInstallFileWithDir(pc_file, .{ .custom = "lib/pkgconfig" }, "zquant.pc").step);
+
     const lib_step = b.step("lib", "Build the C ABI static and shared libraries");
     lib_step.dependOn(&b.addInstallArtifact(lib_static, .{}).step);
     lib_step.dependOn(&b.addInstallArtifact(lib_shared, .{}).step);

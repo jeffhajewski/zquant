@@ -135,6 +135,70 @@ jobs:
         run: npm test
 
   # ============================================
+  # Go client
+  # ============================================
+  go-test:
+    name: Go Client
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build library
+        run: zig build lib
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: clients/go/go.mod
+
+      - name: Vet
+        working-directory: clients/go
+        run: go vet -tags repolocal ./...
+
+      - name: Run tests (repository-local)
+        working-directory: clients/go
+        run: go test -tags repolocal ./...
+
+  # Both linking paths are supported, so both are exercised: the repo-local build above
+  # and the pkg-config one a downstream consumer would actually use.
+  go-installed:
+    name: Go Installed Workflow
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: clients/go/go.mod
+
+      - name: Install to a prefix
+        run: zig build install --prefix /tmp/zquant-install
+
+      - name: Run tests via pkg-config
+        working-directory: clients/go
+        env:
+          PKG_CONFIG_PATH: /tmp/zquant-install/lib/pkgconfig
+          LD_LIBRARY_PATH: /tmp/zquant-install/lib
+        run: go test ./...
+
+  # ============================================
   # End-to-end benchmark
   # ============================================
   #

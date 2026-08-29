@@ -25,12 +25,37 @@ at 0.648. Real embeddings span that range (nytimes-256 is 0.12, SIFT is 0.65).
 For the competitive comparison against FAISS PQ, FAISS RaBitQ and turbovec, see
 [docs/comparison.md](docs/comparison.md); it needs real corpora and their dependencies.
 
-## What you can use it for today
+## Clients
 
-A flat (exhaustive) index and a standalone quantizer, **callable from Zig only** — there is
-no C ABI and no Python/JS/Go bindings yet, so none of the results below are reachable from
-those languages. KV-cache compression is in scope for the algorithm and is a stated goal,
-but is not yet benchmarked.
+| language | how it binds | tests |
+|---|---|---|
+| [Zig](src/root.zig) | native | 175 |
+| [Python](clients/python) | ctypes over the C ABI | 9 |
+| [TypeScript / Node](clients/typescript) | koffi over the C ABI | 8 |
+| [Go](clients/go) | cgo over the C ABI | 9 |
+
+```python
+import zquant
+index = zquant.Index(dim=256, bits=5)
+index.add(vectors)
+ids, scores = index.search(queries, k=10, threads=8)
+```
+
+All three sit on the same [C ABI](include/zquant.h), so a mistake in it surfaces in every
+binding rather than hiding in one. Measured on 100k × 256 vectors at `bits=5`, an Apple M5:
+
+| | build | 1 thread | 10 threads |
+|---|---|---|---|
+| Zig (native) | — | 5,492 | ~27,000 |
+| Python | 225k vec/s | 5,492 | 28,927 |
+| TypeScript | 227k vec/s | 5,539 | 27,951 |
+| Go | 227k vec/s | 5,655 | 28,127 |
+
+Every binding lands within noise of the library and of each other, so none of them costs
+anything measurable. Storage is 132 B/vector — 13 MB against 102 MB as float32.
+
+A flat (exhaustive) index and a standalone quantizer. KV-cache compression is in scope for
+the algorithm and is a stated goal, but is not yet benchmarked.
 
 ## Benchmark results
 

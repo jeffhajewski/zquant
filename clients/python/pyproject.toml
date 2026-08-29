@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zquant"
+version = "0.1.0"
+description = "TurboQuant vector quantization: a flat quantized index for vector search"
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.20"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["zquant*"]
+
+[tool.setuptools.package-data]
+zquant = ["*.dylib", "*.so", "*.dll"]

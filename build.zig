@@ -12,10 +12,19 @@ pub fn build(b: *std.Build) void {
 
     // C ABI: a static and a shared library, plus the header. This is what the Python,
     // JavaScript and Go clients link against; see include/zquant.h.
+    // The shipped library defaults to ReleaseFast, not to the build's default of Debug.
+    // A Debug build of this library is ~500x slower - measured, via the Python client
+    // reporting 51 QPS where the Zig benchmark reports 27,000 on the same corpus - and
+    // nothing about a language binding makes that visible to the person hitting it.
+    const lib_optimize = b.option(
+        std.builtin.OptimizeMode,
+        "lib-opt",
+        "Optimization mode for the C ABI library (default ReleaseFast)",
+    ) orelse .ReleaseFast;
     const c_api = b.createModule(.{
         .root_source_file = b.path("src/c_api.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = lib_optimize,
     });
     c_api.link_libc = true;
     const lib_static = b.addLibrary(.{ .name = "zquant", .root_module = c_api, .linkage = .static });

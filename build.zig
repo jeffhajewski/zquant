@@ -91,6 +91,13 @@ pub fn build(b: *std.Build) void {
 
     // Benches default to ReleaseFast; `-Dbench-opt=Debug` turns on safety checks,
     // which is how a crash in a bench gets a usable panic message.
+    //
+    // `-Doptimize` does *not* affect benchmarks. The imported `zquant` module follows
+    // the bench executable's root module, so this is the only knob that matters here,
+    // in either direction: `-Doptimize=Debug` still yields an optimized benchmark.
+    // Verified rather than assumed — `-Dbench-opt=Debug` measures 97 QPS on quickbench
+    // against 10,450, so a benchmark that had silently fallen back to Debug could not
+    // be mistaken for one that had not.
     const bench_optimize = b.option(
         std.builtin.OptimizeMode,
         "bench-opt",

@@ -345,8 +345,12 @@ it was caught.
 ## Reproducing
 
 Everything below needs real corpora and their dependencies. For a check that needs neither,
-`zig build quickbench -Doptimize=ReleaseFast` generates its own data and runs in about a
-minute.
+`zig build quickbench` generates its own data and runs in about a minute.
+
+Every number in this document is from a ReleaseFast build. Benchmarks default to it and
+`-Doptimize` does not change them — `-Dbench-opt` is the knob. Debug is roughly 100x
+slower, which is far too large a gap for a Debug measurement to be mistaken for a real
+one.
 
 **Environment for every measurement in this document:** Apple M5 (4 performance + 6
 efficiency cores), macOS 26.5, Zig 0.16.0, aarch64, `-Doptimize=ReleaseFast`. Some results

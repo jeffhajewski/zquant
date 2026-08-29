@@ -13,8 +13,13 @@ and got wrong along the way.
 ## Try it
 
 ```sh
-zig build quickbench -Doptimize=ReleaseFast     # ~1 min, no downloads, no Python
+zig build quickbench     # ~1 min, no downloads, no Python
 ```
+
+Benchmarks are built ReleaseFast by default; `-Doptimize` does not affect them, and
+`-Dbench-opt` is the knob if you want otherwise. The difference is not subtle —
+`-Dbench-opt=Debug` measures 97 QPS where the default measures 10,450 — so a benchmark
+that had quietly fallen back to Debug would be obvious rather than merely disappointing.
 
 Generates its own corpora, computes exact ground truth, and prints recall against storage
 and throughput. It runs two corpora that differ only in **centroid norm** — how far the

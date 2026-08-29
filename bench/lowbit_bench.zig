@@ -128,7 +128,10 @@ pub fn main() !void {
                     var hit: usize = 0;
                     for (res) |e| {
                         for (gt[0..K]) |g| {
-                            if (e.id == g) { hit += 1; break; }
+                            if (e.id == g) {
+                                hit += 1;
+                                break;
+                            }
                         }
                     }
                     recall += @as(f64, @floatFromInt(hit)) / @as(f64, K);
@@ -167,7 +170,10 @@ pub fn main() !void {
                 var hit: usize = 0;
                 for (res) |e| {
                     for (gt[0..K]) |g| {
-                        if (e.id == g) { hit += 1; break; }
+                        if (e.id == g) {
+                            hit += 1;
+                            break;
+                        }
                     }
                 }
                 recall += @as(f64, @floatFromInt(hit)) / @as(f64, K);

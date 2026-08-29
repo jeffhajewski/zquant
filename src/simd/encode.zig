@@ -174,10 +174,10 @@ test "extreme and non-finite inputs agree with the reference" {
     defer cb.deinit();
 
     const src = [_]f32{
-        -std.math.inf(f32),  std.math.inf(f32),
-        std.math.nan(f32),   -std.math.nan(f32),
-        -1e30,               1e30,
-        0.0,                 -0.0,
+        -std.math.inf(f32),     std.math.inf(f32),
+        std.math.nan(f32),      -std.math.nan(f32),
+        -1e30,                  1e30,
+        0.0,                    -0.0,
         std.math.floatMin(f32), -std.math.floatMin(f32),
     };
     var fast: [src.len]u8 = undefined;

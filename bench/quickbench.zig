@@ -122,8 +122,7 @@ pub fn main() !void {
             centroidNorm(corpus),
             if (corpus_kind.offset == 0) "calibration should be neutral" else "calibration should pay",
         });
-        std.debug.print("  {s:>5} {s:>10} {s:>8} {s:>8} {s:>11} {s:>11}\n",
-            .{ "bits", "calibrate", "B/vec", "R@10", "QPS 1-thr", "QPS all" });
+        std.debug.print("  {s:>5} {s:>10} {s:>8} {s:>8} {s:>11} {s:>11}\n", .{ "bits", "calibrate", "B/vec", "R@10", "QPS 1-thr", "QPS all" });
 
         for ([_]u6{ 2, 3, 4, 5 }) |bits| {
             for ([_]bool{ false, true }) |calibrated| {

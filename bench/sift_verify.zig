@@ -31,7 +31,10 @@ fn readIvecs(a: std.mem.Allocator, io: std.Io, path: []const u8) !struct { data:
 
 fn l2sq(a: []const f32, b: []const f32) f64 {
     var s: f64 = 0;
-    for (a, b) |x, y| { const d = @as(f64, x) - y; s += d * d; }
+    for (a, b) |x, y| {
+        const d = @as(f64, x) - y;
+        s += d * d;
+    }
     return s;
 }
 
@@ -58,17 +61,21 @@ pub fn main() !void {
     var gt_ok: usize = 0;
     var gt_bad: usize = 0;
     for (0..q.count) |qi| {
-        var best: u32 = 0; var bd: f64 = 1e300;
+        var best: u32 = 0;
+        var bd: f64 = 1e300;
         for (0..base.count) |i| {
-            const dist = l2sq(q.data[qi*d..][0..d], base.data[i*d..][0..d]);
-            if (dist < bd) { bd = dist; best = @intCast(i); }
+            const dist = l2sq(q.data[qi * d ..][0..d], base.data[i * d ..][0..d]);
+            if (dist < bd) {
+                bd = dist;
+                best = @intCast(i);
+            }
         }
-        if (best == gt.data[qi*gt.width]) gt_ok += 1 else {
+        if (best == gt.data[qi * gt.width]) gt_ok += 1 else {
             gt_bad += 1;
-            if (gt_bad <= 3) std.debug.print("  q{d}: brute={d} gt={d}\n", .{qi, best, gt.data[qi*gt.width]});
+            if (gt_bad <= 3) std.debug.print("  q{d}: brute={d} gt={d}\n", .{ qi, best, gt.data[qi * gt.width] });
         }
     }
-    std.debug.print("CHECK 1  ground truth vs brute force: {d}/{d} agree\n", .{gt_ok, q.count});
+    std.debug.print("CHECK 1  ground truth vs brute force: {d}/{d} agree\n", .{ gt_ok, q.count });
 
     // ---- CHECK 2: how separated is the true NN from the 100th? ----
     var ratio_sum: f64 = 0;
@@ -76,14 +83,13 @@ pub fn main() !void {
     const dists = try a.alloc(f64, base.count);
     defer a.free(dists);
     for (0..q.count) |qi| {
-        for (0..base.count) |i| dists[i] = l2sq(q.data[qi*d..][0..d], base.data[i*d..][0..d]);
+        for (0..base.count) |i| dists[i] = l2sq(q.data[qi * d ..][0..d], base.data[i * d ..][0..d]);
         std.mem.sort(f64, dists, {}, std.sort.asc(f64));
         const r = @sqrt(dists[0]) / @sqrt(dists[99]);
         ratio_sum += r;
         min_ratio = @min(min_ratio, r);
     }
-    std.debug.print("CHECK 2  dist(NN)/dist(100th): mean={d:.3} worst={d:.3}\n",
-        .{ ratio_sum/@as(f64,@floatFromInt(q.count)), min_ratio });
+    std.debug.print("CHECK 2  dist(NN)/dist(100th): mean={d:.3} worst={d:.3}\n", .{ ratio_sum / @as(f64, @floatFromInt(q.count)), min_ratio });
 
     // ---- CHECK 3: actual rank of the true NN in our results ----
     for ([_]u6{ 2, 4 }) |bits| {
@@ -101,18 +107,19 @@ pub fn main() !void {
         var sum: usize = 0;
         var not_found: usize = 0;
         for (0..q.count) |qi| {
-            const res = index.search(q.data[qi*d..][0..d], &searcher);
+            const res = index.search(q.data[qi * d ..][0..d], &searcher);
             var rank: usize = res.len; // sentinel: absent
-            for (res, 0..) |e, r| if (e.id == gt.data[qi*gt.width]) { rank = r; break; };
+            for (res, 0..) |e, r| if (e.id == gt.data[qi * gt.width]) {
+                rank = r;
+                break;
+            };
             if (rank == res.len) not_found += 1;
             ranks[qi] = rank;
             sum += rank;
             worst = @max(worst, rank);
         }
         std.mem.sort(usize, ranks, {}, std.sort.asc(usize));
-        std.debug.print("CHECK 3  b={d}: true-NN rank  mean={d:.1} median={d} p90={d} worst={d} absent={d} (n={d})\n",
-            .{ bits, @as(f64,@floatFromInt(sum))/@as(f64,@floatFromInt(q.count)),
-               ranks[q.count/2], ranks[q.count*9/10], worst, not_found, base.count });
+        std.debug.print("CHECK 3  b={d}: true-NN rank  mean={d:.1} median={d} p90={d} worst={d} absent={d} (n={d})\n", .{ bits, @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(q.count)), ranks[q.count / 2], ranks[q.count * 9 / 10], worst, not_found, base.count });
     }
 
     // ---- CHECK 4: a deliberately broken index must score badly ----
@@ -127,18 +134,20 @@ pub fn main() !void {
         // Shuffle the corpus rows so ids no longer correspond to ground-truth ids.
         for (0..base.count) |i| {
             const j = prng.random().uintLessThan(usize, base.count);
-            for (0..d) |c| std.mem.swap(f32, &shuffled[i*d+c], &shuffled[j*d+c]);
+            for (0..d) |c| std.mem.swap(f32, &shuffled[i * d + c], &shuffled[j * d + c]);
         }
         try index.addBatch(shuffled);
         var searcher = try zq.flat.FlatIndex.Searcher.init(a, index, 100);
         defer searcher.deinit();
         var hits: usize = 0;
         for (0..q.count) |qi| {
-            for (index.search(q.data[qi*d..][0..d], &searcher)) |e| {
-                if (e.id == gt.data[qi*gt.width]) { hits += 1; break; }
+            for (index.search(q.data[qi * d ..][0..d], &searcher)) |e| {
+                if (e.id == gt.data[qi * gt.width]) {
+                    hits += 1;
+                    break;
+                }
             }
         }
-        std.debug.print("CHECK 4  shuffled-corpus control: 1@100 = {d:.2} (must be near 0.01)\n",
-            .{ @as(f64,@floatFromInt(hits))/@as(f64,@floatFromInt(q.count)) });
+        std.debug.print("CHECK 4  shuffled-corpus control: 1@100 = {d:.2} (must be near 0.01)\n", .{@as(f64, @floatFromInt(hits)) / @as(f64, @floatFromInt(q.count))});
     }
 }

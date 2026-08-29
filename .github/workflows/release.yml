@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  ZIG_VERSION: "0.16.0"
+
+jobs:
+  # Zig cross-compiles every target from one runner, so the release matrix does not need
+  # a machine per platform and every artifact is produced by the same compiler build.
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-linux-gnu,   name: linux-x86_64 }
+          - { target: aarch64-linux-gnu,  name: linux-aarch64 }
+          - { target: x86_64-macos,       name: macos-x86_64 }
+          - { target: aarch64-macos,      name: macos-aarch64 }
+          - { target: x86_64-windows-gnu, name: windows-x86_64 }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build
+        run: zig build lib -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
+
+      - name: Package
+        run: |
+          staging="zquant-${{ matrix.name }}"
+          mkdir -p "$staging"
+          cp -r zig-out/lib "$staging/"
+          cp -r zig-out/include "$staging/"
+          cp README.md LICENSE "$staging/" 2>/dev/null || cp README.md "$staging/"
+          tar czf "$staging.tar.gz" "$staging"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zquant-${{ matrix.name }}
+          path: zquant-${{ matrix.name }}.tar.gz
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
+          generate_release_notes: true

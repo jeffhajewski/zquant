@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  ZIG_VERSION: "0.16.0"
+
+jobs:
+  # ============================================
+  # Zig library and tests
+  # ============================================
+  zig-build:
+    name: Zig Build & Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Check formatting
+        run: zig fmt --check build.zig src bench tests
+
+      # Covers the Zig unit and integration suites and, through the same step, the C ABI
+      # smoke test — compiled as C and linked against the static library, so the header
+      # and exported symbols are exercised the way a binding author meets them.
+      - name: Run tests
+        run: zig build test
+
+      - name: Build C ABI library
+        run: zig build lib
+
+      - name: Upload library
+        uses: actions/upload-artifact@v4
+        with:
+          name: lib-${{ matrix.os }}
+          path: |
+            zig-out/lib/
+            zig-out/include/
+
+  # ============================================
+  # Python client
+  # ============================================
+  python-test:
+    name: Python Client
+    needs: zig-build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+        python-version: ['3.9', '3.11', '3.13']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download library
+        uses: actions/download-artifact@v4
+        with:
+          name: lib-${{ matrix.os }}
+          path: zig-out
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install client
+        working-directory: clients/python
+        run: pip install -e ".[test]"
+
+      - name: Run tests
+        working-directory: clients/python
+        env:
+          ZQUANT_LIBRARY: ${{ github.workspace }}/zig-out/lib/libzquant${{ matrix.os == 'macos-14' && '.dylib' || '.so' }}
+        run: pytest -q
+
+  # ============================================
+  # End-to-end benchmark
+  # ============================================
+  #
+  # The quickbench is a correctness check that happens to report throughput: it builds
+  # its own corpora, computes exact ground truth, and would fail loudly if recall
+  # collapsed. Running it on CI hardware also keeps the README's claim that cloning and
+  # running one command works on a machine that is not the author's.
+  quickbench:
+    name: End-to-end benchmark
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Run quickbench
+        run: zig build quickbench -Doptimize=ReleaseFast
+
+  # ============================================
+  # Cross-compilation
+  # ============================================
+  #
+  # Zig cross-compiles without a toolchain per target, so the release artifacts can be
+  # checked on every push rather than discovered to be broken at tag time.
+  cross-compile:
+    name: Cross-compile ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-linux-gnu
+          - aarch64-linux-gnu
+          - x86_64-macos
+          - aarch64-macos
+          - x86_64-windows-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build library
+        run: zig build lib -Dtarget=${{ matrix.target }}

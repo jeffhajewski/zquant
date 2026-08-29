@@ -79,8 +79,7 @@ pub fn main() !void {
             const gdims = work / @as(f64, @floatFromInt(best));
             if (Q == 1) base = gdims;
             const spread = (@as(f64, @floatFromInt(worst - best)) / @as(f64, @floatFromInt(best))) * 100.0;
-            std.debug.print("{d:>6} {d:>4} {d:>12.1} {d:>9.2}x {d:>7.0}%\n",
-                .{ dim, Q, gdims, gdims / base, spread });
+            std.debug.print("{d:>6} {d:>4} {d:>12.1} {d:>9.2}x {d:>7.0}%\n", .{ dim, Q, gdims, gdims / base, spread });
         }
         // Vector tiling: Q query chunks stay in registers across V stored vectors.
         inline for ([_]usize{ 2, 4 }) |V| {
@@ -96,8 +95,15 @@ pub fn main() !void {
                         var i: usize = 0;
                         while (i + V <= n) : (i += V) {
                             zq.simd_scan.scoreExpandedTiled(
-                                V, Q, store.ptr + i * dim, dim,
-                                queries[0..], table.scale, dim, tout[0..], Q,
+                                V,
+                                Q,
+                                store.ptr + i * dim,
+                                dim,
+                                queries[0..],
+                                table.scale,
+                                dim,
+                                tout[0..],
+                                Q,
                             );
                             sink += tout[0];
                         }
@@ -108,8 +114,7 @@ pub fn main() !void {
                 }
                 const gdims = @as(f64, @floatFromInt(per_pass)) / @as(f64, @floatFromInt(best));
                 const spread = (@as(f64, @floatFromInt(worst - best)) / @as(f64, @floatFromInt(best))) * 100.0;
-                std.debug.print("{d:>6} {s:>4} {d:>12.1} {d:>9.2}x {d:>7.0}%\n",
-                    .{ dim, std.fmt.comptimePrint("{d}x{d}", .{ V, Q }), gdims, gdims / base, spread });
+                std.debug.print("{d:>6} {s:>4} {d:>12.1} {d:>9.2}x {d:>7.0}%\n", .{ dim, std.fmt.comptimePrint("{d}x{d}", .{ V, Q }), gdims, gdims / base, spread });
             }
         }
 

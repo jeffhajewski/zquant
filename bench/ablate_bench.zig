@@ -153,7 +153,7 @@ pub fn main() !void {
             if (kk == 10) full_ns = best;
             const g = work_pre / @as(f64, @floatFromInt(best));
             std.debug.print("{s:>10}k={d:<4} {d:>12.1} {d:>9.0}% {d:>11.1}%\n", .{
-                "searchBatch ", kk, g,
+                "searchBatch ",                                              kk, g,
                 g / (work_pre / @as(f64, @floatFromInt(stage_ns[0]))) * 100,
                 (@as(f64, @floatFromInt(best)) - @as(f64, @floatFromInt(stage_ns[0]))) /
                     @as(f64, @floatFromInt(stage_ns[0])) * 100,

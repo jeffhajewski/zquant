@@ -29,7 +29,6 @@ pub fn main() !void {
 
         const scalar_rate = @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(scalar_ns));
         const simd_rate = @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(simd_ns));
-        std.debug.print("b={d}: scalar {d:.2} Gcoord/s | simd {d:.2} Gcoord/s | {d:.2}x\n",
-            .{ bits, scalar_rate, simd_rate, simd_rate / scalar_rate });
+        std.debug.print("b={d}: scalar {d:.2} Gcoord/s | simd {d:.2} Gcoord/s | {d:.2}x\n", .{ bits, scalar_rate, simd_rate, simd_rate / scalar_rate });
     }
 }

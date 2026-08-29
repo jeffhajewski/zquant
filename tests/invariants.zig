@@ -101,16 +101,26 @@ test "adversarial inputs do not produce garbage" {
     var x = [_]f32{0} ** dim;
     const cases = [_]struct { name: []const u8, fill: *const fn ([]f32) void }{
         .{ .name = "zero", .fill = struct {
-            fn f(v: []f32) void { @memset(v, 0); }
+            fn f(v: []f32) void {
+                @memset(v, 0);
+            }
         }.f },
         .{ .name = "axis-aligned", .fill = struct {
-            fn f(v: []f32) void { @memset(v, 0); v[0] = 1; }
+            fn f(v: []f32) void {
+                @memset(v, 0);
+                v[0] = 1;
+            }
         }.f },
         .{ .name = "last-axis", .fill = struct {
-            fn f(v: []f32) void { @memset(v, 0); v[v.len - 1] = 1; }
+            fn f(v: []f32) void {
+                @memset(v, 0);
+                v[v.len - 1] = 1;
+            }
         }.f },
         .{ .name = "constant", .fill = struct {
-            fn f(v: []f32) void { @memset(v, 1.0); }
+            fn f(v: []f32) void {
+                @memset(v, 1.0);
+            }
         }.f },
         .{ .name = "alternating", .fill = struct {
             fn f(v: []f32) void {
@@ -118,13 +128,20 @@ test "adversarial inputs do not produce garbage" {
             }
         }.f },
         .{ .name = "tiny", .fill = struct {
-            fn f(v: []f32) void { @memset(v, 1e-30); }
+            fn f(v: []f32) void {
+                @memset(v, 1e-30);
+            }
         }.f },
         .{ .name = "huge", .fill = struct {
-            fn f(v: []f32) void { @memset(v, 1e30); }
+            fn f(v: []f32) void {
+                @memset(v, 1e30);
+            }
         }.f },
         .{ .name = "one-huge-rest-tiny", .fill = struct {
-            fn f(v: []f32) void { @memset(v, 1e-20); v[3] = 1e20; }
+            fn f(v: []f32) void {
+                @memset(v, 1e-20);
+                v[3] = 1e20;
+            }
         }.f },
     };
 

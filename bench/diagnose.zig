@@ -56,12 +56,9 @@ pub fn main() !void {
     const fc: f64 = @floatFromInt(count);
     const fd: f64 = @floatFromInt(q.padded);
     std.debug.print("rotated SIFT coordinates (d={d}, n={d})\n", .{ d, n });
-    std.debug.print("  E[y^2]  measured {e:.4}   theory 1/d = {e:.4}   ratio {d:.3}\n",
-        .{ sum2 / fc, 1.0 / fd, (sum2 / fc) * fd });
-    std.debug.print("  E[y^4]  measured {e:.4}   theory 3/(d(d+2)) = {e:.4}   ratio {d:.3}\n",
-        .{ sum4 / fc, 3.0 / (fd * (fd + 2.0)), (sum4 / fc) / (3.0 / (fd * (fd + 2.0))) });
-    std.debug.print("  kurtosis {d:.3} (3.0 = gaussian; higher = heavy tails)\n",
-        .{ (sum4 / fc) / ((sum2 / fc) * (sum2 / fc)) });
+    std.debug.print("  E[y^2]  measured {e:.4}   theory 1/d = {e:.4}   ratio {d:.3}\n", .{ sum2 / fc, 1.0 / fd, (sum2 / fc) * fd });
+    std.debug.print("  E[y^4]  measured {e:.4}   theory 3/(d(d+2)) = {e:.4}   ratio {d:.3}\n", .{ sum4 / fc, 3.0 / (fd * (fd + 2.0)), (sum4 / fc) / (3.0 / (fd * (fd + 2.0))) });
+    std.debug.print("  kurtosis {d:.3} (3.0 = gaussian; higher = heavy tails)\n", .{(sum4 / fc) / ((sum2 / fc) * (sum2 / fc))});
     std.debug.print("  max|y| {d:.4} = {d:.2} sigma\n", .{ max_abs, max_abs / @sqrt(sum2 / fc) });
 
     // 1b. How much does the reconstruction's norm vary between vectors?
@@ -91,8 +88,7 @@ pub fn main() !void {
         const fn_: f64 = @floatFromInt(n);
         const mean = sum / fn_;
         const sd = @sqrt(sumsq / fn_ - mean * mean);
-        std.debug.print("\n||y_hat|| across vectors (b=4): mean {d:.4} sd {d:.4} -> cv {d:.4}\n",
-            .{ mean, sd, sd / mean });
+        std.debug.print("\n||y_hat|| across vectors (b=4): mean {d:.4} sd {d:.4} -> cv {d:.4}\n", .{ mean, sd, sd / mean });
         std.debug.print("  a uniform shrink is harmless for ranking; this cv is the part that is not\n", .{});
     }
 
@@ -146,8 +142,7 @@ pub fn main() !void {
         std.debug.print("\nestimator error vs score gaps (b=5)\n", .{});
         std.debug.print("  RMS estimate error      {d:.5}\n", .{rms});
         std.debug.print("  mean sim(1st)-sim(10th) {d:.5}  (over a 400-vector sample)\n", .{gap});
-        std.debug.print("  error / gap             {d:.2}  -> top-10 ordering is {s}\n",
-            .{ rms / gap, if (rms > gap) "dominated by noise" else "partially resolvable" });
+        std.debug.print("  error / gap             {d:.2}  -> top-10 ordering is {s}\n", .{ rms / gap, if (rms > gap) "dominated by noise" else "partially resolvable" });
     }
 
     // 1d. Estimator RMS measured EXACTLY as turbovec's was: a 400-vector index,
@@ -187,8 +182,7 @@ pub fn main() !void {
                     cnt += 1;
                 }
             }
-            std.debug.print("  bits={d} ({d}B): RMS {d:.5}\n",
-                .{ bits, index.bytesPerVector(), @sqrt(err2 / @as(f64, @floatFromInt(cnt))) });
+            std.debug.print("  bits={d} ({d}B): RMS {d:.5}\n", .{ bits, index.bytesPerVector(), @sqrt(err2 / @as(f64, @floatFromInt(cnt))) });
         }
         std.debug.print("  turbovec, same protocol: bits=2 0.02677  bits=3 0.01370  bits=4 0.00718\n", .{});
     }
@@ -288,7 +282,6 @@ pub fn main() !void {
             for (row, back) |x, y| dist += (@as(f64, x) - y) * (@as(f64, x) - y);
         }
         dist /= @floatFromInt(n);
-        std.debug.print("  b={d}: measured {d:.4}   paper {d:.4}   ratio {d:.2}x\n",
-            .{ bits, dist, want[bits - 1], dist / want[bits - 1] });
+        std.debug.print("  b={d}: measured {d:.4}   paper {d:.4}   ratio {d:.2}x\n", .{ bits, dist, want[bits - 1], dist / want[bits - 1] });
     }
 }

@@ -57,7 +57,6 @@ pub fn build(b: *std.Build) void {
     const c_smoke = b.addExecutable(.{ .name = "c-smoke", .root_module = c_smoke_mod });
     test_step.dependOn(&b.addRunArtifact(c_smoke).step);
 
-
     // Integration tests live outside the module so they exercise the public API
     // across seams, rather than reaching into internals.
     for ([_][]const u8{ "pipeline", "invariants", "golden" }) |name| {

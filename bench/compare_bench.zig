@@ -13,7 +13,6 @@ const K = 10;
 /// Retrieve deeper than K so the true-NN rank distribution is not censored at K.
 const RETRIEVE = 100;
 
-
 fn readFvecs(a: std.mem.Allocator, io: std.Io, path: []const u8) !struct { data: []f32, dim: u32, count: usize } {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 31));
     defer a.free(bytes);
@@ -126,8 +125,7 @@ pub fn main() !void {
             }
             recall += @as(f64, @floatFromInt(overlap)) / @as(f64, K);
         }
-        std.debug.print("  CONTROL exact f32 scan: R@10 = {d:.4} (must be 1.0000)\n",
-            .{recall / @as(f64, @floatFromInt(nq))});
+        std.debug.print("  CONTROL exact f32 scan: R@10 = {d:.4} (must be 1.0000)\n", .{recall / @as(f64, @floatFromInt(nq))});
     }
 
     for ([_]u6{ 2, 3, 4, 5 }) |bits| {
@@ -136,143 +134,143 @@ pub fn main() !void {
         // `.compact` was comparing our memory-optimal point against their speed-optimal
         // one and calling the throughput difference a deficit.
         for ([_]zq.flat.Residency{ .compact, .expanded }) |residency| {
-        for ([_]usize{ 0, 10000 }) |calib_rows| {
-            const calibrated = calib_rows > 0;
-            const exact = false;
-            const sketch = true;
-            const correction: zq.flat.Correction = .scalar;
-            var index = try zq.flat.FlatIndex.init(a, .{
-                .dim = d,
-                .bits = bits,
-                .metric = .inner_product,
-                .seed = 0x5EED,
-                .exact_scan = exact,
-                .use_sketch = sketch,
-                .correction = correction,
-                .residency = residency,
-            });
-            defer index.deinit();
-            if (calibrated) {
-                // Uniform draw from the corpus, as the fit requires.
-                const rows = @min(base.count, calib_rows);
-                const stride = base.count / rows;
-                const sample = try a.alloc(f32, rows * d);
-                defer a.free(sample);
-                for (0..rows) |i| {
-                    @memcpy(sample[i * d ..][0..d], base.data[i * stride * d ..][0..d]);
+            for ([_]usize{ 0, 10000 }) |calib_rows| {
+                const calibrated = calib_rows > 0;
+                const exact = false;
+                const sketch = true;
+                const correction: zq.flat.Correction = .scalar;
+                var index = try zq.flat.FlatIndex.init(a, .{
+                    .dim = d,
+                    .bits = bits,
+                    .metric = .inner_product,
+                    .seed = 0x5EED,
+                    .exact_scan = exact,
+                    .use_sketch = sketch,
+                    .correction = correction,
+                    .residency = residency,
+                });
+                defer index.deinit();
+                if (calibrated) {
+                    // Uniform draw from the corpus, as the fit requires.
+                    const rows = @min(base.count, calib_rows);
+                    const stride = base.count / rows;
+                    const sample = try a.alloc(f32, rows * d);
+                    defer a.free(sample);
+                    for (0..rows) |i| {
+                        @memcpy(sample[i * d ..][0..d], base.data[i * stride * d ..][0..d]);
+                    }
+                    try index.calibrate(sample);
                 }
-                try index.calibrate(sample);
-            }
-            try index.addBatch(base.data);
+                try index.addBatch(base.data);
 
-            var searcher = try zq.flat.FlatIndex.Searcher.init(a, index, RETRIEVE);
-            defer searcher.deinit();
+                var searcher = try zq.flat.FlatIndex.Searcher.init(a, index, RETRIEVE);
+                defer searcher.deinit();
 
-            const ranks = try a.alloc(usize, nq);
-            defer a.free(ranks);
-            var recall: f64 = 0;
+                const ranks = try a.alloc(usize, nq);
+                defer a.free(ranks);
+                var recall: f64 = 0;
 
-            // Batched timing, matching how the Python baselines are measured: they
-            // hand every query to one call, so timing ours one at a time was
-            // comparing different things.
-            var batch_searcher = try zq.flat.FlatIndex.BatchSearcher.init(a, index, 32, K);
-            defer batch_searcher.deinit();
-            _ = index.searchBatch(queries.data[0 .. 32 * d], &batch_searcher);
-            var batch_timer = Timer.start();
-            {
-                var off: usize = 0;
-                while (off < nq) : (off += 32) {
-                    const take = @min(32, nq - off);
-                    std.mem.doNotOptimizeAway(
-                        index.searchBatch(queries.data[off * d ..][0 .. take * d], &batch_searcher),
-                    );
-                }
-            }
-            const batch_ns = batch_timer.read();
-
-            // Query-parallel across 10 threads.
-            const threads = 10;
-            const per_thread = 100;
-            var par = try zq.flat.FlatIndex.ParallelSearcher.init(a, index, threads, per_thread, RETRIEVE);
-            defer par.deinit();
-            _ = try index.searchBatchParallel(queries.data[0 .. 32 * d], &par);
-            var par_timer = Timer.start();
-            {
-                var off: usize = 0;
-                const chunk = threads * per_thread;
-                while (off < nq) : (off += chunk) {
-                    const take = @min(chunk, nq - off);
-                    std.mem.doNotOptimizeAway(
-                        try index.searchBatchParallel(queries.data[off * d ..][0 .. take * d], &par),
-                    );
-                }
-            }
-            const par_ns = par_timer.read();
-
-            _ = index.search(queries.data[0..d], &searcher);
-            var timer = Timer.start();
-            for (0..nq) |qi| {
-                const res = index.search(queries.data[qi * d ..][0..d], &searcher);
-                const gt = truth.data[qi * truth.width ..][0..truth.width];
-
-                ranks[qi] = res.len;
-                for (res, 0..) |e, r| {
-                    if (e.id == gt[0]) {
-                        ranks[qi] = r;
-                        break;
+                // Batched timing, matching how the Python baselines are measured: they
+                // hand every query to one call, so timing ours one at a time was
+                // comparing different things.
+                var batch_searcher = try zq.flat.FlatIndex.BatchSearcher.init(a, index, 32, K);
+                defer batch_searcher.deinit();
+                _ = index.searchBatch(queries.data[0 .. 32 * d], &batch_searcher);
+                var batch_timer = Timer.start();
+                {
+                    var off: usize = 0;
+                    while (off < nq) : (off += 32) {
+                        const take = @min(32, nq - off);
+                        std.mem.doNotOptimizeAway(
+                            index.searchBatch(queries.data[off * d ..][0 .. take * d], &batch_searcher),
+                        );
                     }
                 }
-                var overlap: usize = 0;
-                for (res[0..@min(K, res.len)]) |e| {
-                    for (gt[0..K]) |g| {
-                        if (e.id == g) {
-                            overlap += 1;
+                const batch_ns = batch_timer.read();
+
+                // Query-parallel across 10 threads.
+                const threads = 10;
+                const per_thread = 100;
+                var par = try zq.flat.FlatIndex.ParallelSearcher.init(a, index, threads, per_thread, RETRIEVE);
+                defer par.deinit();
+                _ = try index.searchBatchParallel(queries.data[0 .. 32 * d], &par);
+                var par_timer = Timer.start();
+                {
+                    var off: usize = 0;
+                    const chunk = threads * per_thread;
+                    while (off < nq) : (off += chunk) {
+                        const take = @min(chunk, nq - off);
+                        std.mem.doNotOptimizeAway(
+                            try index.searchBatchParallel(queries.data[off * d ..][0 .. take * d], &par),
+                        );
+                    }
+                }
+                const par_ns = par_timer.read();
+
+                _ = index.search(queries.data[0..d], &searcher);
+                var timer = Timer.start();
+                for (0..nq) |qi| {
+                    const res = index.search(queries.data[qi * d ..][0..d], &searcher);
+                    const gt = truth.data[qi * truth.width ..][0..truth.width];
+
+                    ranks[qi] = res.len;
+                    for (res, 0..) |e, r| {
+                        if (e.id == gt[0]) {
+                            ranks[qi] = r;
                             break;
                         }
                     }
+                    var overlap: usize = 0;
+                    for (res[0..@min(K, res.len)]) |e| {
+                        for (gt[0..K]) |g| {
+                            if (e.id == g) {
+                                overlap += 1;
+                                break;
+                            }
+                        }
+                    }
+                    recall += @as(f64, @floatFromInt(overlap)) / @as(f64, K);
                 }
-                recall += @as(f64, @floatFromInt(overlap)) / @as(f64, K);
+                const elapsed = timer.read();
+
+                std.mem.sort(usize, ranks, {}, std.sort.asc(usize));
+                const fnq: f64 = @floatFromInt(nq);
+                const qps = fnq / (@as(f64, @floatFromInt(elapsed)) / 1e9);
+                const batch_qps = fnq / (@as(f64, @floatFromInt(batch_ns)) / 1e9);
+                const par_qps = fnq / (@as(f64, @floatFromInt(par_ns)) / 1e9);
+
+                try out.print(a, "{s},{d},{d},{d},{d},{d},zquant,bits={d} {s}{s},{d},{d:.4},{d},{d},{d},{d:.1},{d:.1},{d:.1}\n", .{
+                    dir,
+                    base.count,
+                    d,
+                    nq,
+                    RETRIEVE,
+                    threads,
+                    bits,
+                    @tagName(residency),
+                    if (calib_rows == 0) "" else " +cal",
+                    index.bytesPerVector(),
+                    recall / fnq,
+                    ranks[nq / 2],
+                    ranks[nq * 9 / 10],
+                    ranks[nq - 1],
+                    par_qps,
+                    qps,
+                    batch_qps,
+                });
+                std.debug.print("  bits={d} {s:<9}{s:<5} {d:>4}B  R@10={d:.3}  med={d} p90={d} worst={d}  {d:>6.0} QPS  {d:>7.0} par\n", .{
+                    bits,
+                    @tagName(residency),
+                    if (calib_rows == 0) "" else "+cal",
+                    index.bytesPerVector(),
+                    recall / fnq,
+                    ranks[nq / 2],
+                    ranks[nq * 9 / 10],
+                    ranks[nq - 1],
+                    qps,
+                    par_qps,
+                });
             }
-            const elapsed = timer.read();
-
-            std.mem.sort(usize, ranks, {}, std.sort.asc(usize));
-            const fnq: f64 = @floatFromInt(nq);
-            const qps = fnq / (@as(f64, @floatFromInt(elapsed)) / 1e9);
-            const batch_qps = fnq / (@as(f64, @floatFromInt(batch_ns)) / 1e9);
-            const par_qps = fnq / (@as(f64, @floatFromInt(par_ns)) / 1e9);
-
-            try out.print(a, "{s},{d},{d},{d},{d},{d},zquant,bits={d} {s}{s},{d},{d:.4},{d},{d},{d},{d:.1},{d:.1},{d:.1}\n", .{
-                dir,
-                base.count,
-                d,
-                nq,
-                RETRIEVE,
-                threads,
-                bits,
-                @tagName(residency),
-                if (calib_rows == 0) "" else " +cal",
-                index.bytesPerVector(),
-                recall / fnq,
-                ranks[nq / 2],
-                ranks[nq * 9 / 10],
-                ranks[nq - 1],
-                par_qps,
-                qps,
-                batch_qps,
-            });
-            std.debug.print("  bits={d} {s:<9}{s:<5} {d:>4}B  R@10={d:.3}  med={d} p90={d} worst={d}  {d:>6.0} QPS  {d:>7.0} par\n", .{
-                bits,
-                @tagName(residency),
-                if (calib_rows == 0) "" else "+cal",
-                index.bytesPerVector(),
-                recall / fnq,
-                ranks[nq / 2],
-                ranks[nq * 9 / 10],
-                ranks[nq - 1],
-                qps,
-                par_qps,
-            });
-        }
         }
     }
 

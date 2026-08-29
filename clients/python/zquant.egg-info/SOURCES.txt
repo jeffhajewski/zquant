@@ -1,0 +1,10 @@
+README.md
+pyproject.toml
+tests/test_basic.py
+zquant/__init__.py
+zquant/_lib.py
+zquant.egg-info/PKG-INFO
+zquant.egg-info/SOURCES.txt
+zquant.egg-info/dependency_links.txt
+zquant.egg-info/requires.txt
+zquant.egg-info/top_level.txt

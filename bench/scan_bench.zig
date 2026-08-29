@@ -40,8 +40,7 @@ pub fn main() !void {
     const table = zq.simd_scan.Table.init(cb.centroids);
 
     const bytes = layout.totalBytes(n);
-    std.debug.print("d={d} n={d} b={d} | corpus {d:.1} MB ({d} B/vector)\n",
-        .{ dim, n, bits, @as(f64, @floatFromInt(bytes)) / 1e6, layout.stride() });
+    std.debug.print("d={d} n={d} b={d} | corpus {d:.1} MB ({d} B/vector)\n", .{ dim, n, bits, @as(f64, @floatFromInt(bytes)) / 1e6, layout.stride() });
 
     // --- int8 SIMD kernel
     var sink: f32 = 0;
@@ -74,11 +73,8 @@ pub fn main() !void {
     const exact_vps = @as(f64, @floatFromInt(n)) / (@as(f64, @floatFromInt(exact_ns)) / 1e9);
     const flat_vps = 20_000.0 / (@as(f64, @floatFromInt(flat_ns)) / 1e9);
 
-    std.debug.print("  int8 simd : {d:>9.0} vec/s  {d:>6.1} GB/s  {d:.2} ns/vector\n",
-        .{ simd_vps, simd_vps * @as(f64, @floatFromInt(layout.stride())) / 1e9,
-           @as(f64, @floatFromInt(simd_ns)) / @as(f64, @floatFromInt(n)) });
+    std.debug.print("  int8 simd : {d:>9.0} vec/s  {d:>6.1} GB/s  {d:.2} ns/vector\n", .{ simd_vps, simd_vps * @as(f64, @floatFromInt(layout.stride())) / 1e9, @as(f64, @floatFromInt(simd_ns)) / @as(f64, @floatFromInt(n)) });
     std.debug.print("  exact f32 : {d:>9.0} vec/s  ({d:.1}x slower)\n", .{ exact_vps, simd_vps / exact_vps });
-    std.debug.print("  f32 brute : {d:>9.0} vec/s  ({d:.1}x slower than int8, {d:.1} GB/s)\n",
-        .{ flat_vps, simd_vps / flat_vps, flat_vps * @as(f64, dim) * 4.0 / 1e9 });
+    std.debug.print("  f32 brute : {d:>9.0} vec/s  ({d:.1}x slower than int8, {d:.1} GB/s)\n", .{ flat_vps, simd_vps / flat_vps, flat_vps * @as(f64, dim) * 4.0 / 1e9 });
     std.debug.print("  [sink {d}]\n", .{sink});
 }

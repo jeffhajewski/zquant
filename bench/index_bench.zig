@@ -4,12 +4,18 @@ const Timer = @import("timer.zig").Timer;
 
 fn randomUnit(buf: []f32, r: std.Random) void {
     var n: f64 = 0;
-    for (buf) |*v| { const g = r.floatNorm(f32); v.* = g; n += @as(f64,g)*g; }
-    const inv: f32 = @floatCast(1.0/@sqrt(n));
+    for (buf) |*v| {
+        const g = r.floatNorm(f32);
+        v.* = g;
+        n += @as(f64, g) * g;
+    }
+    const inv: f32 = @floatCast(1.0 / @sqrt(n));
     for (buf) |*v| v.* *= inv;
 }
 fn dot(a: []const f32, b: []const f32) f64 {
-    var s: f64 = 0; for (a,b) |x,y| s += @as(f64,x)*y; return s;
+    var s: f64 = 0;
+    for (a, b) |x, y| s += @as(f64, x) * y;
+    return s;
 }
 
 pub fn main() !void {
@@ -25,27 +31,30 @@ pub fn main() !void {
     const corpus = try a.alloc(f32, n * dim);
     defer a.free(corpus);
     var prng = std.Random.DefaultPrng.init(1);
-    for (0..n) |i| randomUnit(corpus[i*dim..][0..dim], prng.random());
+    for (0..n) |i| randomUnit(corpus[i * dim ..][0..dim], prng.random());
 
     const queries = try a.alloc(f32, nq * dim);
     defer a.free(queries);
-    for (0..nq) |i| randomUnit(queries[i*dim..][0..dim], prng.random());
+    for (0..nq) |i| randomUnit(queries[i * dim ..][0..dim], prng.random());
 
     // Ground truth.
     const truth = try a.alloc(u32, nq);
     defer a.free(truth);
     for (0..nq) |qi| {
-        var best: u32 = 0; var bs: f64 = -1e300;
+        var best: u32 = 0;
+        var bs: f64 = -1e300;
         for (0..n) |i| {
-            const s = dot(queries[qi*dim..][0..dim], corpus[i*dim..][0..dim]);
-            if (s > bs) { bs = s; best = @intCast(i); }
+            const s = dot(queries[qi * dim ..][0..dim], corpus[i * dim ..][0..dim]);
+            if (s > bs) {
+                bs = s;
+                best = @intCast(i);
+            }
         }
         truth[qi] = best;
     }
 
     std.debug.print("\nFlatIndex: d={d} n={d} k={d}, {d} queries\n", .{ dim, n, k, nq });
-    std.debug.print("{s:>5} {s:>8} {s:>8} {s:>9} {s:>9} {s:>8} {s:>7}\n",
-        .{ "bits", "B/vector", "corpus", "1-thread", "batched", "10-thr", "speedup" });
+    std.debug.print("{s:>5} {s:>8} {s:>8} {s:>9} {s:>9} {s:>8} {s:>7}\n", .{ "bits", "B/vector", "corpus", "1-thread", "batched", "10-thr", "speedup" });
 
     for ([_]u6{ 2, 3, 4, 5 }) |bits| {
         var index = try zq.flat.FlatIndex.init(a, .{ .dim = dim, .bits = bits, .seed = 0x5EED });
@@ -66,8 +75,11 @@ pub fn main() !void {
         var hits: usize = 0;
         t.reset();
         for (0..nq) |qi| {
-            const res = index.search(queries[qi*dim..][0..dim], &searcher);
-            for (res) |e| if (e.id == truth[qi]) { hits += 1; break; };
+            const res = index.search(queries[qi * dim ..][0..dim], &searcher);
+            for (res) |e| if (e.id == truth[qi]) {
+                hits += 1;
+                break;
+            };
         }
         const search_ns = t.read();
 
@@ -103,7 +115,7 @@ pub fn main() !void {
         }
         const par_ns = t.read();
 
-        const qps = @as(f64, @floatFromInt(nq)) / (@as(f64,@floatFromInt(search_ns))/1e9);
+        const qps = @as(f64, @floatFromInt(nq)) / (@as(f64, @floatFromInt(search_ns)) / 1e9);
         // Retained: the sweep now reports speedup against its own 1-thread run.
         std.mem.doNotOptimizeAway(qps);
 
@@ -123,8 +135,7 @@ pub fn main() !void {
                 @memcpy(sweep_queries[i * dim ..][0..dim], queries[(i % nq) * dim ..][0..dim]);
             }
 
-            std.debug.print("  thread sweep at bits=5 ({d} queries, 32 per thread per call):\n",
-                .{sweep_n});
+            std.debug.print("  thread sweep at bits=5 ({d} queries, 32 per thread per call):\n", .{sweep_n});
             var base_qps: f64 = 0;
             for ([_]usize{ 1, 2, 4, 6, 8, 10 }) |tc| {
                 var sweep = try zq.flat.FlatIndex.ParallelSearcher.init(a, index, tc, 32, k);
@@ -142,8 +153,7 @@ pub fn main() !void {
                 const ns = st.read();
                 const tq = @as(f64, @floatFromInt(sweep_n)) / (@as(f64, @floatFromInt(ns)) / 1e9);
                 if (tc == 1) base_qps = tq;
-                std.debug.print("    {d:>2} threads: {d:>8.0} QPS  {d:>5.2}x  ({d:.0}% eff)\n",
-                    .{ tc, tq, tq / base_qps, tq / base_qps / @as(f64, @floatFromInt(tc)) * 100 });
+                std.debug.print("    {d:>2} threads: {d:>8.0} QPS  {d:>5.2}x  ({d:.0}% eff)\n", .{ tc, tq, tq / base_qps, tq / base_qps / @as(f64, @floatFromInt(tc)) * 100 });
             }
         }
 

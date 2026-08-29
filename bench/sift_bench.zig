@@ -86,12 +86,10 @@ pub fn main() !void {
     const truth = try readIvecs(a, io, "data/siftsmall/siftsmall_groundtruth.ivecs");
     defer a.free(truth.data);
 
-    std.debug.print("\nSIFT10K: {d} base x {d}d, {d} queries, top-{d} exact L2 ground truth\n",
-        .{ base.count, base.dim, queries.count, truth.width });
+    std.debug.print("\nSIFT10K: {d} base x {d}d, {d} queries, top-{d} exact L2 ground truth\n", .{ base.count, base.dim, queries.count, truth.width });
     // Rank of the true nearest neighbour in our results: median, p90, and worst.
     // The worst case is what a rerank candidate count has to be sized against.
-    std.debug.print("{s:>5} {s:>7} {s:>7} {s:>6} {s:>6} {s:>7} {s:>7} {s:>7} {s:>8}\n",
-        .{ "bits", "totalB", "ratio", "med", "p90", "worst", "1@10", "R@10", "QPS" });
+    std.debug.print("{s:>5} {s:>7} {s:>7} {s:>6} {s:>6} {s:>7} {s:>7} {s:>7} {s:>8}\n", .{ "bits", "totalB", "ratio", "med", "p90", "worst", "1@10", "R@10", "QPS" });
 
     for ([_]u6{ 2, 3, 4, 5, 6 }) |bits| {
         var index = try zq.flat.FlatIndex.init(a, .{

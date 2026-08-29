@@ -95,6 +95,46 @@ jobs:
         run: pytest -q
 
   # ============================================
+  # TypeScript client
+  # ============================================
+  typescript-test:
+    name: TypeScript Client
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+        node-version: ['18', '20', '22']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build library
+        run: zig build lib
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install
+        working-directory: clients/typescript
+        run: npm install
+
+      - name: Check types
+        working-directory: clients/typescript
+        run: npx tsc --noEmit
+
+      - name: Run tests
+        working-directory: clients/typescript
+        run: npm test
+
+  # ============================================
   # End-to-end benchmark
   # ============================================
   #

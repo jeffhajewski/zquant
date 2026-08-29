@@ -32,41 +32,71 @@ no C ABI and no Python/JS/Go bindings yet, so none of the results below are reac
 those languages. KV-cache compression is in scope for the algorithm and is a stated goal,
 but is not yet benchmarked.
 
+## Benchmark results
+
+Every number below comes from a **single merged run per corpus**, with both systems on the
+same data, the same retrieval depth (k=100) and the same core count. `bench/py/compare.py`
+refuses to merge results measured under different conditions, because three earlier
+comparisons in this project were wrong for exactly that reason.
+
+Environment: **Apple M5** (4 performance + 6 efficiency cores), macOS 26.5, Zig 0.16.0,
+aarch64, `-Doptimize=ReleaseFast`. Throughput is full-machine for every system — turbovec
+and FAISS both use all cores inside `search()`.
+
+### SIFT10K — 10,000 × 128, image descriptors
+
+| B/vec | system | R@10 | QPS |
+|---|---|---|---|
+| 16 | **FAISS PQ** M=16,nbits=8 | **0.511** | 90,509 |
+| 20 | zquant bits=2 +cal | 0.356 | 184,945 |
+| 24 | FAISS RaBitQ qb=5 | 0.356 | 63,416 |
+| 32 | FAISS PQ M=32,nbits=8 | 0.648 | 59,826 |
+| 36 | **zquant** bits=3 +cal | **0.691** | **186,081** |
+| 36 | turbovec bits=2 +cal | 0.682 | 100,022 |
+| 52 | **zquant** bits=4 +cal | **0.832** | 131,320 |
+| 64 | FAISS PQ M=64,nbits=8 | 0.844 | 32,692 |
+| 68 | **zquant** bits=5 +cal | **0.907** | **194,024** |
+| 68 | turbovec bits=4 +cal | 0.904 | 106,105 |
+
+### nytimes-256 — 100,000 × 256, text embeddings
+
+| B/vec | system | R@10 | QPS |
+|---|---|---|---|
+| 16 | **FAISS PQ** M=16,nbits=8 | **0.393** | 17,063 |
+| 32 | **FAISS PQ** M=32,nbits=8 | **0.563** | 10,427 |
+| 36 | zquant bits=2 +cal | 0.532 | 26,938 |
+| 40 | FAISS RaBitQ qb=5 | 0.537 | 5,617 |
+| 64 | **FAISS PQ** M=64,nbits=8 | **0.752** | 5,043 |
+| 68 | turbovec bits=2 +cal | 0.743 | 21,691 |
+| 68 | zquant bits=3 +cal | 0.737 | 26,565 |
+| 100 | **zquant** bits=4 +cal | **0.857** | 13,040 |
+| 132 | **zquant** bits=5 +cal | **0.916** | **27,013** |
+| 132 | turbovec bits=4 +cal | 0.914 | 21,715 |
+
+### Reading these honestly
+
+**Against turbovec, recall is a tie and throughput is ours.** 0.907 against 0.904 at 68 B on
+SIFT; 0.916 against 0.914 at 132 B on nytimes; 0.737 against 0.743 at 68 B on nytimes, where
+*they* are ahead by 0.6 points. Storage is identical — their serialized form is the same size
+as our compact one. Throughput is **1.2–1.8× ours** across every matched pair. Their resident
+footprint is larger (270 B against our 132 B) because they dequantize to int8 in memory; our
+`expanded` mode at 260 B is what corresponds to their in-memory form.
+
+**Against FAISS PQ, the two systems win at opposite ends.** PQ has better recall per byte at
+low storage — decisively on SIFT (0.511 against 0.356 at 16–20 B, a 15-point gap) and modestly
+on nytimes (0.563 against 0.532 at 32–36 B). Its learned sub-vector codebooks represent
+correlations that a per-coordinate scalar quantizer cannot express at ~1 bit per dimension;
+that is structural and is [documented rather than treated as open](docs/comparison.md).
+zquant wins the high-recall end on both corpora, and is **3–6× faster** throughout.
+
+**What we would not claim.** These are two corpora at d=128 and d=256, on one machine. The
+sub-25 B band belongs to PQ. Parallel throughput drifts with thermal state by up to 25% across
+consecutive runs, so treat the QPS column as approximate; single-thread figures are stable to
+about 5%. d=1536–3072 and corpora beyond 100k vectors are untested.
+
 ## Status
 
 **P0 (reference core) and P1 (kernels, flat index, comparison) complete.** 175 tests passing.
-
-Measured against turbovec on identical corpora, retrieval depth and core count, in a single
-merged run each (the harness refuses to merge results measured under different conditions):
-
-| corpus | | B/vec | R@10 | QPS |
-|---|---|---|---|---|
-| SIFT10K | **zquant** bits=5 +cal | 68 | **0.907** | **193,386** |
-| | turbovec bits=4 +cal | 68 | 0.904 | 108,715 |
-| nytimes-256 | **zquant** bits=5 +cal | 132 | **0.916** | **27,013** |
-| | turbovec bits=4 +cal | 132 | 0.914 | ~22,000 |
-
-FAISS PQ leads below 25 B/vector (0.511 against 0.357 at 16–20 B); that is conceded with
-evidence rather than open — see [docs/comparison.md](docs/comparison.md).
-
-Measured on an **Apple M5 (4 performance + 6 efficiency cores), macOS 26.5, Zig 0.16.0,
-aarch64**. Several findings are specific to that hardware — notably that `SMMLA` and `SDOT`
-have identical int8 MAC throughput there, so the wider matrix instruction buys nothing.
-Parallel figures drift with thermal state by as much as 25% across consecutive runs;
-single-thread figures are stable to about 5%.
-
-Implemented:
-
-| | |
-|---|---|
-| `math/rng` | Philox4x32-10, counter-based, pinned by Random123 KAT vectors |
-| `math/quadrature` | Composite Gauss-Legendre, nodes solved at comptime |
-| `math/density` | Exact sphere-coordinate density and its N(0,1/d) limit |
-| `math/lloyd_max` | Continuous 1-D k-means, with guarded Aitken acceleration |
-| `math/rotation` | 3-round randomized Hadamard; dense Haar reference |
-| `quant/codebook` | Lloyd-Max solution narrowed to f32 |
-| `quant/mse` | TurboQuant_mse (Algorithm 1) |
-| `quant/prod` | TurboQuant_prod (Algorithm 2) with QJL residual sketch |
 
 Reproduced from the paper: Lloyd-Max levels (the classic Max table to six decimals),
 `D_mse` of 0.36/0.117/0.03/0.009 for b=1..4 measured end to end, the 2/π inner-product

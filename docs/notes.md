@@ -1714,3 +1714,55 @@ harness can now reproduce on demand, which the previous two could not be.
 The general point: every one of these errors was available to the harness and none of them
 were available to me by inspection. Correctness of a comparison is a property worth enforcing
 in code, not in discipline.
+
+
+## Retraction: turbovec is not faster on nytimes, and does not use twice the storage
+
+Re-running nytimes through the provenance-guarded harness overturned both halves of the
+headline I had been carrying.
+
+**Matched run, nytimes-256, n=100k, d=256, k=100, full machine:**
+
+| | B/vec | R@10 | QPS |
+|---|---|---|---|
+| **zquant** bits=5 compact +cal | **132** | **0.916** | **27,013** |
+| turbovec bits=4 +cal | 132 | 0.914 | 23,810 |
+
+Repeated twice more for turbovec: 22,565 and 21,715. So **~1.2× in our favour**, at equal
+storage and equal recall — against the "1.22× behind" reported for weeks.
+
+**Two errors, and they were independent.**
+
+*The throughput figure.* 38,052 QPS is not reproducible; three matched runs land in
+21,700–23,800. It was recorded before the provenance guard existed and its pairing cannot be
+reconstructed, so it is withdrawn rather than explained. Everything derived from it goes with
+it: "1.34× behind", "1.22× behind", and the fixed-cost/scan-rate crossover model — which was
+*fitted* on that number, and whose fitted 1637 G dim/s I had already flagged as
+hardware-implausible. That flag was the right instinct pointed at the wrong culprit: the
+model was not absorbing scaling effects, it was absorbing a bad input.
+
+*The storage figure.* turbovec's `to_bytes()` is **132 B/vector**, identical to our compact
+form. The 270 B I quoted is its **resident** footprint (RSS delta), because it dequantizes to
+int8 in memory. Both numbers are real and were measured correctly; I compared our storage
+against their residency and called it a 2× advantage. The memory advantage survives, but it
+is 132 B resident against 270 B resident — our `expanded` mode at 260 B is the one that
+matches their in-memory form.
+
+**Corrected standing, both corpora, matched runs:**
+
+| corpus | zquant | turbovec | |
+|---|---|---|---|
+| SIFT10K, 68 B | 0.907 @ 193,386 | 0.904 @ 108,715 | **1.78× faster** |
+| nytimes, 132 B | 0.916 @ 27,013 | 0.914 @ ~22,000 | **~1.2× faster** |
+
+Ahead on recall and throughput at matched storage on both, and ahead on resident memory.
+
+**What survives, because it was measured independently:** SMMLA has identical MAC throughput
+to SDOT; both of turbovec's collection mechanisms are worse than ours at k=100; the scan
+kernel sustains 89% of its isolated rate inside the index; parallel scaling is 97% across the
+performance cores. None of those rest on the withdrawn figure.
+
+**What this says about the process.** The guard was built to stop exactly this and found it
+on first use — but only because the nytimes numbers were re-measured through it. Building the
+check was not sufficient; running the old claims back through it was the step that mattered,
+and it was nearly skipped as housekeeping.

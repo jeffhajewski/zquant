@@ -128,12 +128,13 @@ On nytimes-256 it wins recall and memory but still trails on throughput:
 
 | | B/vec | R@10 | QPS (10 threads) |
 |---|---|---|---|
-| zquant bits=5 compact | **132** | **0.916** | 28,689 |
-| zquant bits=5 expanded | 260 | **0.916** | 32,982 |
-| turbovec | 270 | 0.914 | **38,052** |
+| **zquant** bits=5 compact +cal | **132** | **0.916** | **27,013** |
+| turbovec bits=4 +cal | 132 | 0.914 | 21,700–23,800 |
 
-1.15× behind at matched memory, from 4.2× before the scan was rebuilt, with equal recall and
-half the memory in the compact configuration.
+Ahead on both, at identical serialized storage. turbovec still holds **270 B resident**
+against our 132 B, because it dequantizes to int8 in memory; that is a real memory advantage
+but it is a *resident* one, not a storage one, and this document previously conflated the
+two.
 
 The split is corpus size: SIFT10K is 680 KB and cache-resident, nytimes-256 is 13 MB compact.
 The remaining gap is per-core kernel work — the index reaches 134 G dim/s against the
@@ -322,6 +323,13 @@ it was caught.
   Higher dimensions (768–3072), where the design's assumptions are strongest, remain
   unrun.
 - Results differ substantially between the two, so neither generalizes on its own.
+- **Correction (supersedes the paragraph below).** The figure of 38,052 QPS for turbovec on
+  nytimes is not reproducible: three matched runs give 23,810, 22,565 and 21,715. It was
+  recorded before `compare.py` enforced provenance, and its pairing cannot be reconstructed.
+  Every comparison derived from it — "1.34× behind", "1.22× behind", and the fixed-cost /
+  scan-rate crossover model — is withdrawn. And turbovec's *serialized* size is 132 B, the
+  same as ours; only its *resident* footprint is 270 B.
+
 - **Throughput and storage are one tradeoff, not two axes.** turbovec keeps **270 B per
   vector resident** at `bit_width=4` on nytimes — twice what it serializes (135 B), and
   twice zquant's 132 B. The in-memory form is dequantized int8, which removes the table

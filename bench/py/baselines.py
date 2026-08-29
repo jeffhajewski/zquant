@@ -14,6 +14,11 @@ import faiss
 import turbovec
 
 DATA = "data/" + open("data/dataset.txt").read().strip()
+# Stamped into every row so `compare.py` can refuse to merge results measured on
+# different corpora. Comparing numbers taken under different conditions is how a
+# 1.15x figure got reported that was really 1.26x; see docs/notes.md.
+N_BASE = 0
+D_BASE = 0
 K = 10
 # Retrieve deeper than K so the true-NN rank distribution is not censored at K:
 # with RETRIEVE == K, "worst rank = 10" only ever means "absent", which hides how
@@ -42,6 +47,7 @@ def score(name, config, per_vector, ids, elapsed, gt, nq):
         ranks.append(int(hit[0]) if len(hit) else len(ids[i]))
     ranks = np.array(ranks)
     return dict(
+        dataset=DATA, n=N_BASE, d=D_BASE, nq=nq, k=RETRIEVE, threads=0,
         system=name, config=config, bytes_per_vector=round(per_vector, 1),
         recall_at_10=round(float(recall), 4),
         rank_median=int(np.median(ranks)), rank_p90=int(np.percentile(ranks, 90)),
@@ -50,11 +56,13 @@ def score(name, config, per_vector, ids, elapsed, gt, nq):
 
 
 def main():
+    global N_BASE, D_BASE
     base, query, gt = (read_fvecs(f"{DATA}/base.fvecs"),
                        read_fvecs(f"{DATA}/query.fvecs"),
                        read_ivecs(f"{DATA}/groundtruth.ivecs"))
     n, d = base.shape
     nq = query.shape[0]
+    N_BASE, D_BASE = n, d
     print(f"corpus {n}x{d}, {nq} queries, k={K}, metric=inner product", file=sys.stderr)
 
     rows = []

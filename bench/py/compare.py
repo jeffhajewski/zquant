@@ -1,14 +1,43 @@
-"""Merge the four systems' results into one table, ordered by storage."""
-import csv
+"""Merge the four systems' results into one table, ordered by storage.
+
+Refuses to merge results whose provenance differs. The two CSVs are produced by separate
+commands, so nothing stops one from being stale — and a merged table that silently mixes
+turbovec measured on 25,000 vectors with zquant measured on 100,000 looks entirely
+plausible. That failure mode is not hypothetical: a reported 1.15x gap was really 1.26x
+because the two sides were measured at different retrieval depths (docs/notes.md).
+"""
+import csv, sys
+
+PROVENANCE = ("dataset", "n", "d", "nq", "k")
+# `threads` is recorded but deliberately not part of the match key: the baselines manage
+# their own pool and report 0, while zquant names its thread count. Both columns are
+# full-machine throughput, which is what makes them comparable.
 
 rows = []
+seen = {}
 for path in ("data/baselines.csv", "data/zquant.csv"):
     with open(path) as f:
-        for r in csv.DictReader(f):
+        reader = csv.DictReader(f)
+        if not set(PROVENANCE) <= set(reader.fieldnames or ()):
+            sys.exit(f"{path} predates provenance stamping - regenerate it before merging")
+        for r in reader:
+            key = tuple(r[c] for c in PROVENANCE)
+            seen.setdefault(key, []).append(path)
             r["bytes_per_vector"] = float(r["bytes_per_vector"])
             r["recall_at_10"] = float(r["recall_at_10"])
             r["rms"] = float(r.get("rms") or 0) or None
             rows.append(r)
+
+if len(seen) > 1:
+    print("refusing to merge: these results were not measured under the same conditions\n")
+    for key, paths in seen.items():
+        where = ", ".join(sorted(set(paths)))
+        print("  " + "  ".join(f"{c}={v}" for c, v in zip(PROVENANCE, key)) + f"   [{where}]")
+    sys.exit("\nre-run whichever side is stale, then merge")
+
+cond = next(iter(seen))
+print("  ".join(f"{c}={v}" for c, v in zip(PROVENANCE, cond)))
+print()
 
 rows.sort(key=lambda r: (r["bytes_per_vector"], -r["recall_at_10"]))
 

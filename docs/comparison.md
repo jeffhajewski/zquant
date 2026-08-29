@@ -114,11 +114,15 @@ R@10, 1000 queries, standard error ≈ 0.30 points.
 
 | | B/vec | R@10 | QPS |
 |---|---|---|---|
-| **zquant bits=5 +calibrate** | **68** | **0.907** | **335,121** |
-| turbovec bits=4 +calibrate | 68 | 0.904 | 87,522 |
+| **zquant bits=5 +calibrate** | **68** | **0.907** | **193,386** |
+| turbovec bits=4 +calibrate | 68 | 0.904 | 108,715 |
+
+Both rows above come from a single merged run at the same corpus, retrieval depth and
+core count — `compare.py` now refuses to print a table whose two halves were measured
+under different conditions, so a figure here cannot be assembled from separate runs.
 
 zquant wins this corpus on all three axes at once — better recall at identical storage, and
-**3.8× the throughput**.
+**1.78× the throughput**.
 
 On nytimes-256 it wins recall and memory but still trails on throughput:
 

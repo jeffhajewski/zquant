@@ -80,7 +80,15 @@ pub fn main() !void {
 
     var out = std.ArrayList(u8).empty;
     defer out.deinit(a);
-    try out.appendSlice(a, "system,config,bytes_per_vector,recall_at_10,rank_median,rank_p90,rank_worst,qps,batched_qps\n");
+    // Provenance columns so `compare.py` can refuse to merge results measured on
+    // different corpora. Comparing numbers taken under different conditions is how a
+    // 1.15x figure got reported that was really 1.26x; see docs/notes.md.
+    // `qps` is the full-machine parallel figure, because that is what the baselines
+    // report: turbovec's search() and FAISS both use every core internally. Writing the
+    // single-thread number into a column named `qps` put 22,818 next to turbovec's
+    // 110,499 in the merged table and made the comparison meaningless. The
+    // single-thread and batched figures are kept alongside, under names that say so.
+    try out.appendSlice(a, "dataset,n,d,nq,k,threads,system,config,bytes_per_vector,recall_at_10,rank_median,rank_p90,rank_worst,qps,qps_1thread,qps_1thread_batched\n");
 
     std.debug.print("zquant on {s}: {d}x{d}, {d} queries, k={d}\n", .{ dir, base.count, d, nq, K });
 
@@ -233,7 +241,13 @@ pub fn main() !void {
             const batch_qps = fnq / (@as(f64, @floatFromInt(batch_ns)) / 1e9);
             const par_qps = fnq / (@as(f64, @floatFromInt(par_ns)) / 1e9);
 
-            try out.print(a, "zquant,bits={d} {s}{s},{d},{d:.4},{d},{d},{d},{d:.1},{d:.1}\n", .{
+            try out.print(a, "{s},{d},{d},{d},{d},{d},zquant,bits={d} {s}{s},{d},{d:.4},{d},{d},{d},{d:.1},{d:.1},{d:.1}\n", .{
+                dir,
+                base.count,
+                d,
+                nq,
+                RETRIEVE,
+                threads,
                 bits,
                 @tagName(residency),
                 if (calib_rows == 0) "" else " +cal",
@@ -242,6 +256,7 @@ pub fn main() !void {
                 ranks[nq / 2],
                 ranks[nq * 9 / 10],
                 ranks[nq - 1],
+                par_qps,
                 qps,
                 batch_qps,
             });

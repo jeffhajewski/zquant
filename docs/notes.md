@@ -1679,3 +1679,38 @@ So the mechanism is two things, not one. The centroid explains *which corpora* c
 helps on — that result stands, and predicted both real corpora to within half a point. It does
 not follow that the shift is doing all the work once you are on such a corpus, and the
 temptation to carry that inference across was worth one experiment to resist.
+
+
+## Making the harness refuse to compare unlike things
+
+Three of this session's wrong numbers share one cause: figures measured under different
+conditions were put side by side. The 1.15× nytimes gap was our k=10 against turbovec's
+k=100. The 3.8× SIFT lead was the same mistake. A later 1.70× used a turbovec number from an
+older run. Each was caught eventually, by hand, after being reported.
+
+`compare.py` merged `baselines.csv` and `zquant.csv` with no check that they described the
+same measurement, and the two are produced by separate commands — so a stale one merges
+silently into a plausible-looking table. Both CSVs now carry `dataset, n, d, nq, k` and the
+merge refuses unless every row agrees, printing the conflicting sets.
+
+It found a second problem immediately. zquant's `qps` column held the *single-thread* figure
+while the baselines report full-machine throughput, because turbovec and FAISS both use every
+core inside `search()`. The merged table was printing 22,818 next to turbovec's 110,499 as
+though they were comparable. `qps` is now the full-machine number on both sides, with
+`qps_1thread` and `qps_1thread_batched` kept under names that say what they are.
+
+**Matched properly, SIFT10K at k=100, one merged run:**
+
+| | B/vec | R@10 | QPS |
+|---|---|---|---|
+| zquant bits=5 +cal | 68 | **0.907** | **193,386** |
+| turbovec bits=4 +cal | 68 | 0.904 | 108,715 |
+| zquant bits=3 +cal | 36 | **0.691** | **189,179** |
+| turbovec bits=2 +cal | 36 | 0.682 | 105,459 |
+
+**1.78×**, not the 3.8× first reported nor the 1.70× that replaced it. This is the number the
+harness can now reproduce on demand, which the previous two could not be.
+
+The general point: every one of these errors was available to the harness and none of them
+were available to me by inspection. Correctness of a comparison is a property worth enforcing
+in code, not in discipline.

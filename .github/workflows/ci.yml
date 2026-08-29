@@ -54,7 +54,6 @@ jobs:
   # ============================================
   python-test:
     name: Python Client
-    needs: zig-build
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -65,11 +64,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download library
-        uses: actions/download-artifact@v4
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
         with:
-          name: lib-${{ matrix.os }}
-          path: zig-out
+          version: ${{ env.ZIG_VERSION }}
+
+      # Built in-job rather than downloaded from zig-build. actions/upload-artifact does
+      # not preserve file permissions, and the library arrived without its executable
+      # bit; the job is self-contained now and the library takes seconds to build.
+      - name: Build library
+        run: zig build lib
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -80,10 +84,14 @@ jobs:
         working-directory: clients/python
         run: pip install -e ".[test]"
 
+      # Separated from the test run so a failure to load the library is distinguishable
+      # from a test that ran and failed.
+      - name: Check the library loads
+        working-directory: clients/python
+        run: python -c "import zquant; print('zquant', zquant.version())"
+
       - name: Run tests
         working-directory: clients/python
-        env:
-          ZQUANT_LIBRARY: ${{ github.workspace }}/zig-out/lib/libzquant${{ matrix.os == 'macos-14' && '.dylib' || '.so' }}
         run: pytest -q
 
   # ============================================

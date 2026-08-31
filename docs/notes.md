@@ -1766,3 +1766,63 @@ performance cores. None of those rest on the withdrawn figure.
 on first use — but only because the nytimes numbers were re-measured through it. Building the
 check was not sufficient; running the old claims back through it was the step that mattered,
 and it was nearly skipped as housekeeping.
+
+
+## KV cache: the use case the README claimed and never measured
+
+Measured on real attention tensors — Q, K and V dumped from SmolLM2-135M over 936 tokens,
+three layers, GQA with 3 KV heads and d_head=64 (`bench/py/dump_kv.py`). Synthetic data
+would have begged the question: a KV cache has structure that is hard to guess, and the
+structure turned out to be the whole story.
+
+A KV cache is not a retrieval problem and recall@10 says nothing about it. Attention needs
+*every* score, because they pass through a softmax, and then a weighted sum of value rows.
+So there are two problems, and they are measured separately: keys are an inner-product
+problem, values are a *reconstruction* problem.
+
+**Layer 15, error in the attention output relative to fp16:**
+
+| scheme | B/token/head | score RMSE | weight TV | output error |
+|---|---|---|---|---|
+| fp16 | 256 | — | — | — |
+| int8 per-row | 136 | 0.042 | 0.012 | 0.013 |
+| int4 per-row | 72 | 0.756 | 0.202 | 0.228 |
+| **zquant b=5 decode+dot** | **72** | **0.215** | **0.050** | **0.057** |
+| zquant b=3 decode+dot | 40 | 0.830 | 0.223 | 0.310 |
+
+**4× lower output error than int4 at identical memory**, and b=3 at 40 B is roughly int4's
+accuracy for 1.8× less. Layer 7 agrees: 0.063 against 0.257.
+
+**Two configuration findings, and the first run got both wrong.**
+
+The first attempt used the index's estimator with calibration on — the defaults that suit
+retrieval — and measured 0.409, which is *worse than int4* and would have been published as
+"not competitive". Both defaults are wrong here:
+
+| b=5 configuration | output error |
+|---|---|
+| estimator + calibration | 0.409 |
+| estimator | 0.106 |
+| **decode + exact dot** | **0.057** |
+
+*Calibration hurts*, which the earlier synthetic sweep predicts: it cost recall on low-rank
+zero-mean data, and these tensors have **effective rank 6.4 of 64**. *The estimator hurts*
+because its per-vector α is fitted to preserve ranking, and attention needs accurate
+absolute scores across all keys, not a good ordering. Plain reconstruction is the right
+tool and the library already exposes it.
+
+**The near-miss worth recording.** The low-rank structure looked at first like a reason
+zquant *should* lose — a data-oblivious rotation spends bits uniformly across 64 coordinates
+when six carry the signal, which is the same argument that explains losing to PQ below 25 B.
+That argument is sound and led to the wrong prediction here, because it was applied to a
+measurement taken with two wrong knobs. The explanation arrived before the configuration was
+checked.
+
+**An API gap this exposes.** The winning configuration is `Mse.encode` plus `Mse.decode`,
+neither of which the C ABI exports — so a Python, JavaScript or Go user cannot do KV-cache
+compression today even though the Zig library does it well. Retrieval and KV want different
+entry points, and only the retrieval one is exposed.
+
+**Scope.** One model at 135M parameters, 936 tokens, three layers. Whether the picture holds
+at 7B and 128k context is untested, and larger models are known to have more extreme outlier
+channels than this one (key channel spread here is only 3.8×).

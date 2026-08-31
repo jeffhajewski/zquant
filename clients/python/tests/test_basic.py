@@ -108,3 +108,62 @@ def test_accepts_non_float32_input():
         assert len(ix) == 100
         ids, _ = ix.search(list(x[0]), k=3)   # a plain Python list, 1-D
         assert ids.shape == (1, 3)
+
+
+def test_codec_round_trip():
+    x = corpus(500, 64, seed=20)
+    with zquant.Codec(dim=64, bits=5) as c:
+        codes, norms = c.encode(x)
+        assert codes.shape == (500, c.code_bytes) and codes.dtype == np.uint8
+        assert norms.shape == (500,) and norms.dtype == np.float32
+        back = c.decode(codes, norms)
+    assert back.shape == x.shape
+    rel = np.linalg.norm(x - back) / np.linalg.norm(x)
+    assert rel < 0.1, f"reconstruction error {rel:.3f}"
+
+
+def test_codec_bits_control_size_and_error():
+    """More bits must cost more storage and buy less error, monotonically."""
+    x = corpus(400, 64, seed=21)
+    sizes, errs = [], []
+    for bits in (2, 3, 4, 5):
+        with zquant.Codec(dim=64, bits=bits) as c:
+            back = c.decode(*c.encode(x))
+            sizes.append(c.code_bytes)
+            errs.append(float(np.linalg.norm(x - back) / np.linalg.norm(x)))
+    assert sizes == sorted(sizes) and len(set(sizes)) == 4, sizes
+    assert errs == sorted(errs, reverse=True), errs
+
+
+def test_codec_beats_int4_on_reconstruction():
+    """The KV-cache claim, as a test: at matched storage, beat per-row int4.
+
+    int4 with a per-row scale is what KV quantization usually means in practice. At
+    d=64 it costs 36 B/vector (32 packed + a 4-byte scale), which is what Codec(bits=4)
+    costs (32 packed + a 4-byte norm).
+    """
+    x = corpus(1000, 64, seed=22)
+
+    amax = np.abs(x).max(axis=1, keepdims=True)
+    scale = np.where(amax > 0, amax / 7.0, 1.0)          # int4 symmetric: 7 levels
+    int4 = np.round(x / scale) * scale
+    int4_err = np.linalg.norm(x - int4) / np.linalg.norm(x)
+
+    with zquant.Codec(dim=64, bits=4) as c:
+        assert c.code_bytes == 32, c.code_bytes        # matched storage with int4
+        back = c.decode(*c.encode(x))
+    zq_err = np.linalg.norm(x - back) / np.linalg.norm(x)
+
+    assert zq_err < int4_err, f"zquant {zq_err:.4f} not better than int4 {int4_err:.4f}"
+
+
+def test_codec_errors():
+    x = corpus(50, 32, seed=23)
+    with zquant.Codec(dim=32, bits=5) as c:
+        codes, norms = c.encode(x)
+        with pytest.raises(ValueError, match="codes must be"):
+            c.decode(codes[:, :-1], norms)
+        with pytest.raises(ValueError, match="norms must be"):
+            c.decode(codes, norms[:-1])
+        with pytest.raises(ValueError, match="dim"):
+            c.encode(np.zeros((4, 33), dtype=np.float32))

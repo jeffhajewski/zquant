@@ -114,7 +114,12 @@ pub const Layout = struct {
     pub fn pack(self: Layout, codes: []const u8, dst: []u8) void {
         std.debug.assert(codes.len == self.dim);
         std.debug.assert(dst.len >= self.codeBytes());
-        @memset(dst[0..self.stride()], 0);
+        // Zero exactly what the caller handed over, not `stride()`. The stride rounds
+        // `codeBytes()` up to the alignment, so zeroing it overran any caller that
+        // allocated the true code size — which the index never did, because it stores
+        // vectors at stride intervals, and which the C ABI codec does, because packed
+        // bytes are the storage it exists to save.
+        @memset(dst, 0);
 
         const limit = @as(u16, 1) << @as(u4, @intCast(self.bits));
         switch (self.kind()) {
@@ -416,6 +421,52 @@ test "bit field helpers handle every offset and width" {
                 writeBits(&buf, offset, bits, value);
                 try testing.expectEqual(value, readBits(&buf, offset, bits));
             }
+        }
+    }
+}
+
+test "pack writes only the slice it is given" {
+    // `stride()` rounds `codeBytes()` up to the alignment, and `pack` used to zero the
+    // stride regardless of how much space the caller actually provided. The index never
+    // noticed because it stores vectors at stride intervals; the C ABI codec allocates
+    // `codeBytes()` per vector, since packed bytes are the storage it exists to save, so
+    // every vector overran the next and the last overran the buffer.
+    //
+    // A canary rather than a length assertion: the failure was a write past the end, and
+    // in ReleaseFast the assertions this file is full of are compiled out.
+    for ([_]u6{ 1, 2, 3, 4, 5 }) |bits| {
+        for ([_]u32{ 16, 32, 48, 64, 96 }) |dim| {
+            const layout = Layout.init(dim, bits);
+            const code_bytes = layout.codeBytes();
+            if (layout.stride() == code_bytes) continue; // no padding, nothing to prove
+
+            const canary: u8 = 0xA5;
+            const buf = try testing.allocator.alloc(u8, layout.stride() + 16);
+            defer testing.allocator.free(buf);
+            @memset(buf, canary);
+
+            const codes = try testing.allocator.alloc(u8, dim);
+            defer testing.allocator.free(codes);
+            const limit: u8 = @intCast((@as(u16, 1) << @intCast(bits)) - 1);
+            for (codes, 0..) |*c, i| c.* = @intCast(i % (@as(usize, limit) + 1));
+
+            layout.pack(codes, buf[0..code_bytes]);
+
+            for (buf[code_bytes..], code_bytes..) |b, i| {
+                if (b != canary) {
+                    std.debug.print(
+                        "dim={d} bits={d}: pack wrote at offset {d}, past codeBytes {d} (stride {d})\n",
+                        .{ dim, bits, i, code_bytes, layout.stride() },
+                    );
+                    return error.PackOverranDestination;
+                }
+            }
+
+            // And it still round-trips through the narrow slice.
+            const back = try testing.allocator.alloc(u8, dim);
+            defer testing.allocator.free(back);
+            layout.unpack(buf[0..code_bytes], back);
+            try testing.expectEqualSlices(u8, codes, back);
         }
     }
 }

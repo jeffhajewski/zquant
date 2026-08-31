@@ -109,9 +109,17 @@ jobs:
         working-directory: clients/python
         run: pytest -q -k "codec_beats_int4"
 
-      - name: Test codec errors
+      - name: Test codec error - code width
         working-directory: clients/python
-        run: pytest -q -k "codec_errors"
+        run: pytest -q -k "codec_errors_bad_code_width"
+
+      - name: Test codec error - norm count
+        working-directory: clients/python
+        run: pytest -q -k "codec_errors_bad_norm_count"
+
+      - name: Test codec error - dim
+        working-directory: clients/python
+        run: pytest -q -k "codec_errors_bad_dim"
 
   # ============================================
   # TypeScript client

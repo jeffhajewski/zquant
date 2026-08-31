@@ -157,13 +157,23 @@ def test_codec_beats_int4_on_reconstruction():
     assert zq_err < int4_err, f"zquant {zq_err:.4f} not better than int4 {int4_err:.4f}"
 
 
-def test_codec_errors():
+def test_codec_errors_bad_code_width():
     x = corpus(50, 32, seed=23)
     with zquant.Codec(dim=32, bits=5) as c:
         codes, norms = c.encode(x)
         with pytest.raises(ValueError, match="codes must be"):
             c.decode(codes[:, :-1], norms)
+
+
+def test_codec_errors_bad_norm_count():
+    x = corpus(50, 32, seed=23)
+    with zquant.Codec(dim=32, bits=5) as c:
+        codes, norms = c.encode(x)
         with pytest.raises(ValueError, match="norms must be"):
             c.decode(codes, norms[:-1])
+
+
+def test_codec_errors_bad_dim():
+    with zquant.Codec(dim=32, bits=5) as c:
         with pytest.raises(ValueError, match="dim"):
             c.encode(np.zeros((4, 33), dtype=np.float32))

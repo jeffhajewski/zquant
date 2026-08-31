@@ -90,9 +90,28 @@ jobs:
         working-directory: clients/python
         run: python -c "import zquant; print('zquant', zquant.version())"
 
-      - name: Run tests
+      # Split so a failure names itself. Job logs need admin rights on this repository,
+      # so the step name is the only diagnostic that survives to the API - and a CI-only
+      # failure with no readable log is otherwise a guessing game.
+      - name: Test index
         working-directory: clients/python
-        run: pytest -q
+        run: pytest -q -k "not codec"
+
+      - name: Test codec round trip
+        working-directory: clients/python
+        run: pytest -q -k "codec_round_trip"
+
+      - name: Test codec bit widths
+        working-directory: clients/python
+        run: pytest -q -k "codec_bits_control"
+
+      - name: Test codec beats int4
+        working-directory: clients/python
+        run: pytest -q -k "codec_beats_int4"
+
+      - name: Test codec errors
+        working-directory: clients/python
+        run: pytest -q -k "codec_errors"
 
   # ============================================
   # TypeScript client

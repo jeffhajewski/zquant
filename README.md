@@ -59,8 +59,35 @@ binding rather than hiding in one. Measured on 100k × 256 vectors at `bits=5`, 
 Every binding lands within noise of the library and of each other, so none of them costs
 anything measurable. Storage is 132 B/vector — 13 MB against 102 MB as float32.
 
-A flat (exhaustive) index and a standalone quantizer. KV-cache compression is in scope for
-the algorithm and is a stated goal, but is not yet benchmarked.
+A flat (exhaustive) index and a standalone quantizer.
+
+## KV-cache compression
+
+Measured on real attention tensors — Q, K and V from SmolLM2-135M over 936 tokens
+(`bench/py/dump_kv.py`, then `zig build kv_bench`). A KV cache is not a retrieval problem:
+attention needs every score, because they pass through a softmax, so the metric is error in
+the attention output against fp16, not recall.
+
+| scheme | B/token/head | output error |
+|---|---|---|
+| fp16 | 256 | — |
+| int8 per-row | 136 | 0.013 |
+| int4 per-row | 72 | 0.228 |
+| **zquant b=5** | **72** | **0.057** |
+| zquant b=3 | 40 | 0.310 |
+
+**4× lower output error than int4 at identical memory**; b=3 reaches roughly int4's accuracy
+for 1.8× less memory.
+
+Two things differ from the retrieval defaults, and both matter a great deal: **turn
+calibration off** (these tensors have effective rank 6.4 of 64, and calibration costs
+accuracy on low-rank data), and **reconstruct rather than estimate** — the index's
+per-vector correction is fitted to preserve *ranking*, where attention needs accurate
+absolute scores. Using the retrieval defaults instead measures 0.409, worse than int4.
+
+That path is `Mse.encode` plus `Mse.decode`, which **the C ABI does not export**, so this is
+reachable from Zig only for now. Measured on one 135M-parameter model over three layers;
+whether it holds at 7B and long context is untested.
 
 ## Benchmark results
 

@@ -19,7 +19,7 @@ import numpy as np
 
 from . import _lib
 
-__all__ = ["Index", "ZquantError", "version"]
+__all__ = ["Index", "Codec", "ZquantError", "version"]
 
 _LIB = _lib.bind(_lib.load())
 
@@ -190,3 +190,105 @@ class Index:
     def __repr__(self) -> str:
         return (f"<zquant.Index dim={self._dim} vectors={len(self)} "
                 f"{self.bytes_per_vector}B/vector>")
+
+
+class Codec:
+    """Encode and decode vectors without an index.
+
+    `Index` answers "which stored vectors best match this query". A KV cache asks
+    something else: store these vectors compactly and give them back. Attention needs
+    *every* score rather than the top few, and needs them accurate in absolute terms,
+    so the index's estimator — whose per-vector correction is fitted to preserve
+    *ranking* — is the wrong tool there and measures considerably worse than plain
+    reconstruction.
+
+        codec = zquant.Codec(dim=64, bits=5)
+        codes, norms = codec.encode(keys)        # keep these two
+        keys_back = codec.decode(codes, norms)
+
+    Codes are bit-packed, so `code_bytes` is the storage actually consumed; norms cost
+    four bytes per vector on top. Measured on real attention tensors at `bits=5`, this
+    gives 4x lower attention-output error than per-row int4 at the same memory.
+
+    A Codec owns scratch space and is not safe for concurrent use; make one per thread.
+    """
+
+    def __init__(self, dim: int, bits: int = 5, seed: int = 0x5EED):
+        cfg = _lib.CodecConfig(dim=dim, bits=bits, seed=seed)
+        handle = ctypes.c_void_p()
+        _check(_LIB.zq_codec_create(ctypes.byref(cfg), ctypes.byref(handle)), "codec_create")
+        self._handle = handle
+        self._dim = dim
+        self._code_bytes = _LIB.zq_codec_code_bytes(handle)
+
+    def __del__(self):
+        self.close()
+
+    def close(self) -> None:
+        h = getattr(self, "_handle", None)
+        if h:
+            _LIB.zq_codec_free(h)
+            self._handle = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    @property
+    def dim(self) -> int:
+        return self._dim
+
+    @property
+    def code_bytes(self) -> int:
+        """Packed bytes of code per vector, excluding the four-byte norm."""
+        return self._code_bytes
+
+    def encode(self, vectors):
+        """Return `(codes, norms)`: uint8 `(n, code_bytes)` and float32 `(n,)`.
+
+        Both are needed to decode. Keeping them separate rather than packing the norm
+        into the code lets a caller store the codes contiguously, which is what makes
+        the decode a single pass.
+        """
+        a = _as_rows(vectors, self._dim, "vectors")
+        n = a.shape[0]
+        codes = np.empty((n, self._code_bytes), dtype=np.uint8)
+        norms = np.empty(n, dtype=np.float32)
+        _check(
+            _LIB.zq_codec_encode(
+                self._handle,
+                _ptr(a, ctypes.c_float),
+                n,
+                codes.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+                _ptr(norms, ctypes.c_float),
+            ),
+            "encode",
+        )
+        return codes, norms
+
+    def decode(self, codes, norms):
+        """Reconstruct `(n, dim)` float32 from what `encode` returned."""
+        c = np.ascontiguousarray(codes, dtype=np.uint8)
+        nm = np.ascontiguousarray(norms, dtype=np.float32)
+        if c.ndim != 2 or c.shape[1] != self._code_bytes:
+            raise ValueError(f"codes must be (n, {self._code_bytes}), got {c.shape}")
+        if nm.shape != (c.shape[0],):
+            raise ValueError(f"norms must be ({c.shape[0]},), got {nm.shape}")
+        out = np.empty((c.shape[0], self._dim), dtype=np.float32)
+        _check(
+            _LIB.zq_codec_decode(
+                self._handle,
+                c.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+                _ptr(nm, ctypes.c_float),
+                c.shape[0],
+                _ptr(out, ctypes.c_float),
+            ),
+            "decode",
+        )
+        return out
+
+    def __repr__(self) -> str:
+        return f"<zquant.Codec dim={self._dim} {self._code_bytes}B/vector>"

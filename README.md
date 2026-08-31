@@ -73,11 +73,12 @@ the attention output against fp16, not recall.
 | fp16 | 256 | — |
 | int8 per-row | 136 | 0.013 |
 | int4 per-row | 72 | 0.228 |
-| **zquant b=5** | **72** | **0.057** |
-| zquant b=3 | 40 | 0.310 |
+| **zquant b=4** | **72** | **0.108** |
+| zquant b=5 | 88 | 0.057 |
+| zquant b=3 | 56 | 0.310 |
 
-**4× lower output error than int4 at identical memory**; b=3 reaches roughly int4's accuracy
-for 1.8× less memory.
+**About 2× lower output error than int4 at identical memory** — 0.108 against 0.228 on
+layer 15, and 0.127 against 0.257 on layer 7.
 
 Two things differ from the retrieval defaults, and both matter a great deal: **turn
 calibration off** (these tensors have effective rank 6.4 of 64, and calibration costs
@@ -85,9 +86,16 @@ accuracy on low-rank data), and **reconstruct rather than estimate** — the ind
 per-vector correction is fitted to preserve *ranking*, where attention needs accurate
 absolute scores. Using the retrieval defaults instead measures 0.409, worse than int4.
 
-That path is `Mse.encode` plus `Mse.decode`, which **the C ABI does not export**, so this is
-reachable from Zig only for now. Measured on one 135M-parameter model over three layers;
-whether it holds at 7B and long context is untested.
+```python
+codec = zquant.Codec(dim=64, bits=4)
+codes, norms = codec.encode(keys)      # keep both; codes are bit-packed
+keys_back = codec.decode(codes, norms)
+```
+
+Note that `Codec` takes the codebook width directly, where `Index` reserves a bit for its
+residual sketch — so `Codec(bits=4)` and `Index(bits=5)` pack the same number of bits per
+coordinate. Measured on one 135M-parameter model over three layers; whether it holds at 7B
+and long context is untested.
 
 ## Benchmark results
 

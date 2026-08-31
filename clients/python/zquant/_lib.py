@@ -44,6 +44,14 @@ def load() -> ctypes.CDLL:
     )
 
 
+class CodecConfig(ctypes.Structure):
+    _fields_ = [
+        ("dim", ctypes.c_uint32),
+        ("bits", ctypes.c_uint8),
+        ("seed", ctypes.c_uint64),
+    ]
+
+
 class Config(ctypes.Structure):
     _fields_ = [
         ("dim", ctypes.c_uint32),
@@ -86,4 +94,17 @@ def bind(lib: ctypes.CDLL) -> ctypes.CDLL:
 
     lib.zq_search.argtypes = [vp, vp, f32p, ctypes.c_size_t, u32p, f32p]
     lib.zq_search.restype = ctypes.c_int
+
+    u8p = ctypes.POINTER(ctypes.c_uint8)
+    lib.zq_codec_create.argtypes = [ctypes.POINTER(CodecConfig), ctypes.POINTER(vp)]
+    lib.zq_codec_create.restype = ctypes.c_int
+    lib.zq_codec_free.argtypes = [vp]
+    lib.zq_codec_code_bytes.argtypes = [vp]
+    lib.zq_codec_code_bytes.restype = ctypes.c_size_t
+    lib.zq_codec_dim.argtypes = [vp]
+    lib.zq_codec_dim.restype = ctypes.c_uint32
+    lib.zq_codec_encode.argtypes = [vp, f32p, ctypes.c_size_t, u8p, f32p]
+    lib.zq_codec_encode.restype = ctypes.c_int
+    lib.zq_codec_decode.argtypes = [vp, u8p, f32p, ctypes.c_size_t, f32p]
+    lib.zq_codec_decode.restype = ctypes.c_int
     return lib

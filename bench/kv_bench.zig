@@ -304,9 +304,16 @@ pub fn main() !void {
                     agg_both.add(try evaluate(a, q, k, v, seq, d, scores, approx_v, random));
                 }
 
-                var probe = try zq.flat.FlatIndex.init(a, .{ .dim = @intCast(d), .bits = bits, .metric = .inner_product });
-                defer probe.deinit();
-                const per = 2 * probe.bytesPerVector();
+                // Bytes actually consumed by the path being measured: packed codes at
+                // this codebook width plus a four-byte norm, doubled for K and V.
+                //
+                // Previously this asked a FlatIndex for its bytesPerVector, which is a
+                // different number: the index reserves a bit for the residual sketch and
+                // so packs at `bits - 1`. Encoding here happens through Mse at the full
+                // width, so the memory was understated by a factor of 1.22 and the
+                // comparison against int4 was not at matched storage.
+                const layout = zq.packing.Layout.init(@intCast(d), bits);
+                const per = 2 * (layout.codeBytes() + 4);
                 const mk = agg_k.mean();
                 const mb = agg_both.mean();
                 var buf: [40]u8 = undefined;

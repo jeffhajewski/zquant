@@ -64,6 +64,34 @@ int main(void) {
     printf("self-retrieval: %d/%zu  top score %.4f\n", self_hits, nq, scores[0]);
     if (self_hits < (int)nq - 1) { printf("FAIL: self-retrieval too low\n"); return 1; }
 
+    /* Codec round-trip: the KV-cache path. Checks that decoding reconstructs the input
+     * to within quantization error, and that the packed size is what the header says. */
+    zq_codec_config ccfg = { .dim = DIM, .bits = 5, .seed = 7 };
+    zq_codec *cd = NULL;
+    if (zq_codec_create(&ccfg, &cd) != ZQ_OK) { printf("FAIL codec create\n"); return 1; }
+    size_t cb = zq_codec_code_bytes(cd);
+    printf("codec: %zu code bytes/vector (%d floats = %zu bytes raw)\n", cb, DIM, sizeof(float)*DIM);
+    if (cb == 0 || cb > sizeof(float) * DIM) { printf("FAIL: implausible code size\n"); return 1; }
+
+    const size_t rows = 256;
+    unsigned char *cbuf = malloc(cb * rows);
+    float *nbuf = malloc(sizeof(float) * rows);
+    float *back = malloc(sizeof(float) * rows * DIM);
+    if (zq_codec_encode(cd, base, rows, cbuf, nbuf) != ZQ_OK) { printf("FAIL encode\n"); return 1; }
+    if (zq_codec_decode(cd, cbuf, nbuf, rows, back) != ZQ_OK) { printf("FAIL decode\n"); return 1; }
+
+    double num = 0, den = 0;
+    for (size_t i = 0; i < rows * DIM; i++) {
+        double e = base[i] - back[i];
+        num += e * e; den += (double)base[i] * base[i];
+    }
+    double rel = sqrt(num / den);
+    printf("codec round-trip relative error: %.4f\n", rel);
+    if (!(rel < 0.25)) { printf("FAIL: reconstruction error too large\n"); return 1; }
+    if (zq_codec_encode(cd, NULL, rows, cbuf, nbuf) != ZQ_ERR_INVALID) { printf("FAIL: null rows accepted\n"); return 1; }
+    zq_codec_free(cd);
+    free(cbuf); free(nbuf); free(back);
+
     zq_searcher_free(se);
     zq_index_free(ix);
     free(base); free(ids); free(scores);

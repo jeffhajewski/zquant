@@ -74,6 +74,46 @@ zq_status zq_search(zq_index *index, zq_searcher *searcher,
                     const float *queries, size_t nq,
                     uint32_t *out_ids, float *out_scores);
 
+/* ── Codec: encode and decode without an index ──────────────────────────────────
+ *
+ * The index answers "which stored vectors best match this query". A KV cache asks
+ * something else: store these vectors compactly and give them back. Attention needs
+ * every score rather than the top few, and needs them accurate in absolute terms, so
+ * the index's estimator - whose per-vector correction is fitted to preserve ranking -
+ * is the wrong tool there and measured considerably worse than reconstruction.
+ *
+ * Codes are bit-packed, so zq_codec_code_bytes is the storage actually consumed.
+ *
+ * A codec owns its scratch space and is not safe for concurrent use; create one per
+ * thread, as with zq_searcher.
+ */
+
+typedef struct zq_codec zq_codec;
+
+typedef struct {
+    uint32_t dim;
+    /* 2..6, the codebook width directly: unlike the index there is no residual
+     * sketch reserving a bit. */
+    uint8_t  bits;
+    uint64_t seed;
+} zq_codec_config;
+
+zq_status zq_codec_create(const zq_codec_config *config, zq_codec **out);
+void      zq_codec_free(zq_codec *codec);
+
+/* Packed bytes of code per vector. Norms are stored separately, one float each, and
+ * both are required to decode. */
+size_t   zq_codec_code_bytes(const zq_codec *codec);
+uint32_t zq_codec_dim(const zq_codec *codec);
+
+/* Encode n row-major vectors: codes holds n*zq_codec_code_bytes(), norms holds n. */
+zq_status zq_codec_encode(zq_codec *codec, const float *rows, size_t n,
+                          uint8_t *codes, float *norms);
+
+/* Decode n vectors into rows, which holds n*dim floats. */
+zq_status zq_codec_decode(zq_codec *codec, const uint8_t *codes, const float *norms,
+                          size_t n, float *rows);
+
 #ifdef __cplusplus
 }
 #endif

@@ -234,3 +234,125 @@ export fn zq_search(
     }
     return ZQ_OK;
 }
+
+// ── Codec: encode and decode without an index ───────────────────────────────────
+//
+// The index answers "which stored vectors best match this query". A KV cache asks
+// something else: store these vectors compactly and give them back. Attention needs every
+// score rather than the top few, and it needs them accurately in absolute terms, so the
+// index's per-vector correction — which is fitted to preserve *ranking* — is the wrong
+// tool and measured 7x worse than plain reconstruction (docs/notes.md).
+//
+// Codes are bit-packed, so `zq_codec_code_bytes` is the storage actually consumed. The
+// unpacked form is one byte per coordinate and would silently cost twice the memory.
+
+const Codec = struct {
+    mse: zq.mse.Mse,
+    workspace: zq.mse.Workspace,
+    layout: zq.packing.Layout,
+    scratch: []u8,
+};
+
+pub const ZqCodecConfig = extern struct {
+    dim: u32,
+    /// 2..6. Unlike the index this is the codebook width directly: there is no residual
+    /// sketch to reserve a bit for.
+    bits: u8,
+    seed: u64,
+};
+
+export fn zq_codec_create(config: ?*const ZqCodecConfig, out: ?**Codec) c_int {
+    const cfg = config orelse return ZQ_ERR_INVALID;
+    const slot = out orelse return ZQ_ERR_INVALID;
+    if (cfg.dim == 0 or cfg.bits < 1 or cfg.bits > 6) return ZQ_ERR_INVALID;
+
+    const codec = allocator.create(Codec) catch return ZQ_ERR_ALLOC;
+    codec.mse = zq.mse.Mse.init(allocator, .{
+        .dim = cfg.dim,
+        .bits = @intCast(cfg.bits),
+        .seed = cfg.seed,
+    }) catch {
+        allocator.destroy(codec);
+        return ZQ_ERR_ALLOC;
+    };
+    codec.workspace = zq.mse.Workspace.init(allocator, codec.mse) catch {
+        codec.mse.deinit();
+        allocator.destroy(codec);
+        return ZQ_ERR_ALLOC;
+    };
+    codec.layout = zq.packing.Layout.init(codec.mse.padded, @intCast(cfg.bits));
+    codec.scratch = allocator.alloc(u8, codec.mse.codeLen()) catch {
+        codec.workspace.deinit();
+        codec.mse.deinit();
+        allocator.destroy(codec);
+        return ZQ_ERR_ALLOC;
+    };
+    slot.* = codec;
+    return ZQ_OK;
+}
+
+export fn zq_codec_free(codec: ?*Codec) void {
+    const c = codec orelse return;
+    allocator.free(c.scratch);
+    c.workspace.deinit();
+    c.mse.deinit();
+    allocator.destroy(c);
+}
+
+/// Packed bytes of code per vector. Norms are stored separately, one float each.
+export fn zq_codec_code_bytes(codec: ?*const Codec) usize {
+    const c = codec orelse return 0;
+    return c.layout.codeBytes();
+}
+
+export fn zq_codec_dim(codec: ?*const Codec) u32 {
+    const c = codec orelse return 0;
+    return c.mse.dim;
+}
+
+/// Encode `n` row-major vectors. `codes` holds `n * zq_codec_code_bytes()` bytes and
+/// `norms` holds `n` floats; both are caller-owned and both are needed to decode.
+export fn zq_codec_encode(
+    codec: ?*Codec,
+    rows: ?[*]const f32,
+    n: usize,
+    codes: ?[*]u8,
+    norms: ?[*]f32,
+) c_int {
+    const c = codec orelse return ZQ_ERR_INVALID;
+    const src = rows orelse return ZQ_ERR_INVALID;
+    const dst = codes orelse return ZQ_ERR_INVALID;
+    const nrm = norms orelse return ZQ_ERR_INVALID;
+    if (n == 0) return ZQ_OK;
+
+    const d = c.mse.dim;
+    const stride = c.layout.codeBytes();
+    for (0..n) |i| {
+        nrm[i] = c.mse.encode(src[i * d ..][0..d], c.scratch, &c.workspace);
+        c.layout.pack(c.scratch, dst[i * stride ..][0..stride]);
+    }
+    return ZQ_OK;
+}
+
+/// Decode `n` vectors into `rows`, which holds `n * dim` floats.
+export fn zq_codec_decode(
+    codec: ?*Codec,
+    codes: ?[*]const u8,
+    norms: ?[*]const f32,
+    n: usize,
+    rows: ?[*]f32,
+) c_int {
+    const c = codec orelse return ZQ_ERR_INVALID;
+    const src = codes orelse return ZQ_ERR_INVALID;
+    const nrm = norms orelse return ZQ_ERR_INVALID;
+    const dst = rows orelse return ZQ_ERR_INVALID;
+    if (n == 0) return ZQ_OK;
+
+    const d = c.mse.dim;
+    const stride = c.layout.codeBytes();
+    for (0..n) |i| {
+        c.layout.unpack(src[i * stride ..][0..stride], c.scratch);
+        c.mse.decode(c.scratch, nrm[i], dst[i * d ..][0..d], &c.workspace);
+    }
+    return ZQ_OK;
+}

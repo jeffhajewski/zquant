@@ -1787,11 +1787,21 @@ problem, values are a *reconstruction* problem.
 | fp16 | 256 | — | — | — |
 | int8 per-row | 136 | 0.042 | 0.012 | 0.013 |
 | int4 per-row | 72 | 0.756 | 0.202 | 0.228 |
-| **zquant b=5 decode+dot** | **72** | **0.215** | **0.050** | **0.057** |
-| zquant b=3 decode+dot | 40 | 0.830 | 0.223 | 0.310 |
+| **zquant b=4 decode+dot** | **72** | **0.434** | **0.104** | **0.108** |
+| zquant b=5 decode+dot | 88 | 0.215 | 0.050 | 0.057 |
+| zquant b=3 decode+dot | 56 | 0.830 | 0.223 | 0.310 |
 
-**4× lower output error than int4 at identical memory**, and b=3 at 40 B is roughly int4's
-accuracy for 1.8× less. Layer 7 agrees: 0.063 against 0.257.
+**About 2× lower output error than int4 at identical memory** — 0.108 against 0.228 here,
+and 0.127 against 0.257 on layer 7.
+
+**Correction to the first version of this section**, which claimed 4× at identical memory.
+It compared b=5 against int4 while reporting b=5's memory as 72 B, and b=5 costs 88 B. The
+memory came from `FlatIndex.bytesPerVector`, which packs at `bits - 1` because the index
+reserves a bit for its residual sketch, while the encoding went through `Mse` at the full
+width — two different meanings of `bits` that happen to share a name. Exporting the codec
+through the C ABI is what surfaced it: the header had to state what `bits` meant, and the
+two definitions could not both be right. At matched storage it is b=4 that competes with
+int4, and the honest factor is 2, not 4.
 
 **Two configuration findings, and the first run got both wrong.**
 

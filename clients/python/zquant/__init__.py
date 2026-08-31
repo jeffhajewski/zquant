@@ -220,6 +220,9 @@ class Codec:
         self._handle = handle
         self._dim = dim
         self._code_bytes = _LIB.zq_codec_code_bytes(handle)
+        if self._code_bytes <= 0:
+            self.close()
+            raise ZquantError(-4, f"codec reported {self._code_bytes} code bytes for dim={dim} bits={bits}")
 
     def __del__(self):
         self.close()

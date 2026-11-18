@@ -16,8 +16,9 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc",
-    "test": "npm run build && node --test dist/tests/*.test.js",
+    "build": "node scripts/clean.mjs dist && tsc -p tsconfig.build.json",
+    "build:test": "node scripts/clean.mjs build-test && tsc -p tsconfig.json",
+    "test": "npm run build && npm run build:test && node --test build-test/tests/*.test.js",
     "prepare": "npm run build"
   },
   "dependencies": {

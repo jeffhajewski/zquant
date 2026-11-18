@@ -1,9 +1,13 @@
 {
+  // Type-checks everything (`npx tsc --noEmit`) and compiles the tests, with the
+  // sources they import, into build-test/. The published package is built by
+  // tsconfig.build.json instead, so its output sits at dist/index.js where
+  // package.json points, with no tests in it.
   "compilerOptions": {
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "outDir": "dist",
+    "outDir": "build-test",
     "rootDir": ".",
     "strict": true,
     "declaration": true,

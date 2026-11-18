@@ -13,12 +13,14 @@ without copying is accepted; anything else is converted, which costs a copy.
 from __future__ import annotations
 
 import ctypes
+import threading
 from pathlib import Path
 from typing import Literal, NamedTuple
 
 import numpy as np
 
 from . import _lib
+from ._sync import RWLock, SearcherPool
 from ._errors import (
     ZQ_ERR_STATE,
     ZQ_OK,
@@ -160,6 +162,22 @@ def _ptr(a: np.ndarray, ctype):
     return a.ctypes.data_as(ctypes.POINTER(ctype))
 
 
+# How many queries one native search call takes per worker. Larger batches amortize the
+# corpus scan over more queries; 32 is well inside the library's limit of 128.
+_SEARCH_BATCH = 32
+
+
+def _create_searcher(index: int, k: int, threads: int) -> int:
+    handle = ctypes.c_void_p()
+    _check(_LIB.zq_searcher_create(index, _SEARCH_BATCH, k, threads, ctypes.byref(handle)),
+           "searcher_create")
+    return handle.value
+
+
+def _free_searcher(handle: int) -> None:
+    _LIB.zq_searcher_free(handle)
+
+
 class Index:
     """A flat (exhaustive) quantized index.
 
@@ -171,6 +189,10 @@ class Index:
 
     `compact=False` stores dequantized int8 instead, roughly doubling memory in exchange
     for some throughput. On a 100k x 256 corpus that trade was worth about 20%.
+
+    An Index can be shared between threads. Searches run in parallel, each on its own
+    native searcher drawn from a pool. `add`, `calibrate` and `close` wait for running
+    searches to finish and hold off new ones until they are done.
     """
 
     def __init__(
@@ -190,21 +212,45 @@ class Index:
                           compact=1 if compact else 0)
         handle = ctypes.c_void_p()
         _check(_LIB.zq_index_create(ctypes.byref(cfg), ctypes.byref(handle)), "index_create")
+        self._adopt(handle.value)
+
+    def _adopt(self, handle: int) -> None:
         self._handle = handle
-        self._dim = dim
-        self._searchers: dict[tuple[int, int], ctypes.c_void_p] = {}
+        self._dim = int(_LIB.zq_index_dim(handle))
+        self._rw = RWLock()
+        self._pool = SearcherPool(_create_searcher, _free_searcher)
+
+    def _live(self) -> int:
+        """The native handle. Call with the lock held, read or write."""
+        if not self._handle:
+            raise StateError("the index is closed", ZQ_ERR_STATE)
+        return self._handle
 
     def __del__(self):
-        self.close()
+        # No lock: nothing else can hold a reference to an object being finalized.
+        # Guarded because at interpreter exit the module globals may already be gone.
+        try:
+            pool, handle = self.__dict__.get("_pool"), self.__dict__.get("_handle")
+            if pool is not None:
+                pool.free_all()
+            if handle:
+                self._handle = None
+                _LIB.zq_index_free(handle)
+        except Exception:
+            pass
 
     def close(self) -> None:
-        for s in getattr(self, "_searchers", {}).values():
-            _LIB.zq_searcher_free(s)
-        self._searchers = {}
-        h = getattr(self, "_handle", None)
-        if h:
-            _LIB.zq_index_free(h)
-            self._handle = None
+        """Free the native index and its searchers. Waits for running searches; later
+        calls raise `StateError`. Closing twice is harmless."""
+        with self._rw.write():
+            self._pool.free_all()
+            if self._handle:
+                handle, self._handle = self._handle, None
+                _LIB.zq_index_free(handle)
+
+    @property
+    def closed(self) -> bool:
+        return not self._handle
 
     def __enter__(self):
         return self
@@ -218,11 +264,13 @@ class Index:
         return self._dim
 
     def __len__(self) -> int:
-        return _LIB.zq_index_count(self._handle)
+        with self._rw.read():
+            return _LIB.zq_index_count(self._live())
 
     @property
     def bytes_per_vector(self) -> int:
-        return _LIB.zq_index_bytes_per_vector(self._handle)
+        with self._rw.read():
+            return _LIB.zq_index_bytes_per_vector(self._live())
 
     def calibrate(self, sample) -> None:
         """Fit per-coordinate shift and scale from a sample. Must precede `add`.
@@ -234,67 +282,66 @@ class Index:
         are enough; more did not measurably help.
         """
         a = _as_rows(sample, self._dim, "sample")
-        _check_rows(_LIB.zq_index_calibrate(self._handle, _ptr(a, ctypes.c_float), a.shape[0]),
-                    a, "calibrate", "sample")
+        with self._rw.write():
+            h = self._live()
+            _check_rows(_LIB.zq_index_calibrate(h, _ptr(a, ctypes.c_float), a.shape[0]),
+                        a, "calibrate", "sample")
 
     def add(self, vectors) -> None:
         a = _as_rows(vectors, self._dim, "vectors")
-        _check_rows(_LIB.zq_index_add(self._handle, _ptr(a, ctypes.c_float), a.shape[0]),
-                    a, "add", "vectors")
-
-    def _searcher(self, k: int, threads: int):
-        key = (k, threads)
-        if key not in self._searchers:
-            handle = ctypes.c_void_p()
-            batch = 32
-            _check(
-                _LIB.zq_searcher_create(self._handle, batch, k, threads, ctypes.byref(handle)),
-                "searcher_create",
-            )
-            self._searchers[key] = handle
-        return self._searchers[key]
+        with self._rw.write():
+            h = self._live()
+            _check_rows(_LIB.zq_index_add(h, _ptr(a, ctypes.c_float), a.shape[0]),
+                        a, "add", "vectors")
 
     def search(self, queries, k: int = 10, threads: int = 1):
         """Return `(ids, scores)`, each shape `(n_queries, k)`, best first.
 
         Where the index holds fewer than `k` vectors the tail is `2**32-1` / `-inf`.
         `threads > 1` splits the batch across workers, which only pays for batches at
-        least that large.
+        least that large. Separate Python threads calling `search` at once also run in
+        parallel, each on its own searcher.
         """
         k = _int_arg(k, "k", 1, 1 << 32)
         threads = _threads_arg(threads)
-        if len(self) == 0:
-            raise StateError("search on an empty index", ZQ_ERR_STATE)
         q = _as_rows(queries, self._dim, "queries")
         nq = q.shape[0]
-
-        searcher = self._searcher(k, threads)
-        capacity = _LIB.zq_searcher_capacity(searcher)
-
         ids = np.empty((nq, k), dtype=np.uint32)
         scores = np.empty((nq, k), dtype=np.float32)
-        # The native call takes at most `capacity` queries, so long inputs are chunked
-        # here rather than making that the caller's problem.
-        for start in range(0, nq, capacity):
-            n = min(capacity, nq - start)
-            _check_rows(
-                _LIB.zq_search(
-                    self._handle,
-                    searcher,
-                    _ptr(q[start:start + n], ctypes.c_float),
-                    n,
-                    _ptr(ids[start:start + n], ctypes.c_uint32),
-                    _ptr(scores[start:start + n], ctypes.c_float),
-                ),
-                q[start:start + n],
-                "search",
-                "queries",
-            )
+
+        with self._rw.read():
+            h = self._live()
+            if _LIB.zq_index_count(h) == 0:
+                raise StateError("search on an empty index", ZQ_ERR_STATE)
+            with self._pool.borrow(h, k, threads) as searcher:
+                capacity = _LIB.zq_searcher_capacity(searcher)
+                # The native call takes at most `capacity` queries, so long inputs are
+                # chunked here rather than making that the caller's problem.
+                for start in range(0, nq, capacity):
+                    n = min(capacity, nq - start)
+                    chunk = q[start:start + n]
+                    _check_rows(
+                        _LIB.zq_search(
+                            h,
+                            searcher,
+                            _ptr(chunk, ctypes.c_float),
+                            n,
+                            _ptr(ids[start:start + n], ctypes.c_uint32),
+                            _ptr(scores[start:start + n], ctypes.c_float),
+                        ),
+                        chunk,
+                        "search",
+                        "queries",
+                    )
         return ids, scores
 
     def __repr__(self) -> str:
-        return (f"<zquant.Index dim={self._dim} vectors={len(self)} "
-                f"{self.bytes_per_vector}B/vector>")
+        with self._rw.read():
+            if not self._handle:
+                return f"<zquant.Index dim={self._dim} closed>"
+            n = _LIB.zq_index_count(self._handle)
+            bpv = _LIB.zq_index_bytes_per_vector(self._handle)
+        return f"<zquant.Index dim={self._dim} vectors={n} {bpv}B/vector>"
 
 
 class Codec:
@@ -315,7 +362,9 @@ class Codec:
     four bytes per vector on top. Measured on real attention tensors at `bits=5`, this
     gives 4x lower attention-output error than per-row int4 at the same memory.
 
-    A Codec owns scratch space and is not safe for concurrent use; make one per thread.
+    A Codec owns native scratch space that two calls cannot share, so its calls take a
+    lock: sharing one between threads is safe, but they take turns. To encode on
+    several threads at once, give each its own Codec.
     """
 
     def __init__(self, dim: int, bits: int = 5, seed: int = 0x5EED):
@@ -323,9 +372,10 @@ class Codec:
         bits = _int_arg(bits, "bits", 1, 6)
         seed = _seed_arg(seed)
         cfg = _lib.CodecConfig(dim=dim, bits=bits, seed=seed)
+        self._lock = threading.Lock()
         handle = ctypes.c_void_p()
         _check(_LIB.zq_codec_create(ctypes.byref(cfg), ctypes.byref(handle)), "codec_create")
-        self._handle = handle
+        self._handle = handle.value
         self._dim = dim
         self._code_bytes = _LIB.zq_codec_code_bytes(handle)
         if self._code_bytes <= 0:
@@ -334,13 +384,25 @@ class Codec:
                 f"codec reported {self._code_bytes} code bytes for dim={dim} bits={bits}")
 
     def __del__(self):
-        self.close()
+        try:
+            handle = self.__dict__.get("_handle")
+            if handle:
+                self._handle = None
+                _LIB.zq_codec_free(handle)
+        except Exception:
+            pass
 
     def close(self) -> None:
-        h = getattr(self, "_handle", None)
-        if h:
-            _LIB.zq_codec_free(h)
-            self._handle = None
+        """Free the native codec. Later calls raise `StateError`."""
+        with self._lock:
+            if self._handle:
+                handle, self._handle = self._handle, None
+                _LIB.zq_codec_free(handle)
+
+    def _live(self) -> int:
+        if not self._handle:
+            raise StateError("the codec is closed", ZQ_ERR_STATE)
+        return self._handle
 
     def __enter__(self):
         return self
@@ -369,18 +431,19 @@ class Codec:
         n = a.shape[0]
         codes = np.empty((n, self._code_bytes), dtype=np.uint8)
         norms = np.empty(n, dtype=np.float32)
-        _check_rows(
-            _LIB.zq_codec_encode(
-                self._handle,
-                _ptr(a, ctypes.c_float),
-                n,
-                codes.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
-                _ptr(norms, ctypes.c_float),
-            ),
-            a,
-            "encode",
-            "vectors",
-        )
+        with self._lock:
+            _check_rows(
+                _LIB.zq_codec_encode(
+                    self._live(),
+                    _ptr(a, ctypes.c_float),
+                    n,
+                    _ptr(codes, ctypes.c_uint8),
+                    _ptr(norms, ctypes.c_float),
+                ),
+                a,
+                "encode",
+                "vectors",
+            )
         return codes, norms
 
     def decode(self, codes, norms):
@@ -392,16 +455,17 @@ class Codec:
         if nm.shape != (c.shape[0],):
             raise ValueError(f"norms must be ({c.shape[0]},), got {nm.shape}")
         out = np.empty((c.shape[0], self._dim), dtype=np.float32)
-        _check(
-            _LIB.zq_codec_decode(
-                self._handle,
-                c.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
-                _ptr(nm, ctypes.c_float),
-                c.shape[0],
-                _ptr(out, ctypes.c_float),
-            ),
-            "decode",
-        )
+        with self._lock:
+            _check(
+                _LIB.zq_codec_decode(
+                    self._live(),
+                    _ptr(c, ctypes.c_uint8),
+                    _ptr(nm, ctypes.c_float),
+                    c.shape[0],
+                    _ptr(out, ctypes.c_float),
+                ),
+                "decode",
+            )
         return out
 
     def __repr__(self) -> str:

@@ -1993,8 +1993,8 @@ AMD Zen 5 once and a Zen 3 once, each with 4 vCPUs.
 **The 4×4 tile stays.** `tile_bench` times every kernel at seven tile shapes on the same
 codes and queries. On both x86 CPUs 4×4 was the fastest shape in most rows and never more
 than 6% behind the fastest, which was 3×3 or 2×4 when it was not 4×4. The one exception
-was the Zen 3's 1-bit row at x86_64_v2, where 2×4 measured 11% ahead. The same kernel compiled at x86_64_v3, in the same job,
-had the two shapes level, so I read that row as noise. The 256-bit kernels below favour
+was the Zen 3's 1-bit row at x86_64_v2, where 2×4 measured 11% ahead. I first read that
+row as noise, and it was not; see the 1-bit cliff below. The 256-bit kernels below favour
 4×4 as well. The stack traffic in the x86_64_v3 disassembly was real, but it did not cost
 what it suggested. Apple M5 and Neoverse N2 agreed.
 
@@ -2069,6 +2069,20 @@ How it was verified:
   calls both copies through the seam and requires identical output.
 - **Release checks:** they now require the AVX2 copy's marker string in every
   non-portable x86_64 library.
+
+**A 1-bit cliff without AVX.** After the dispatch landed, the release build on its own
+kernels (`ZQUANT_KERNELS=none`) measured 1,460 QPS at bits=2 against 1,986 before. Three
+alternating rounds on one runner confirmed it, while bits 3–5 were unchanged. The hot
+loops of the two builds were nearly identical, about 1,110 instructions and 250 stack
+accesses each, and `tile_bench`, which calls the kernel directly, showed the 1-bit 4×4
+tile at 68 M scores/s in the new build and 95 in the old. The same kernel runs at 109
+with AVX encodings. Its 16 accumulators fill the 16 SSE registers, and without AVX's
+three-operand forms the spills make its speed depend on where the code happens to land.
+The dispatch had only moved it. On x86 without AVX the 1-bit batch tile is now scored as
+two 2×4 halves, which measured 104–106 in every run. Over three rounds on the same Zen 3,
+before the dispatch / after with the split / dispatched to AVX2, at bits=2:
+1,929–1,996 / 1,922–1,928 / 3,210–3,224 QPS. That is about 3% short of the old build's
+lucky placement, which is what a layout that cannot fall off the cliff costs.
 
 **Not done.** The VNNI form of the kernels (`vpdpbusd`, one instruction in place of two)
 compiles for x86_64_v4 and for CPUs with AVX-VNNI, and the disassembly shows it in use.

@@ -1,0 +1,59 @@
+name: Benchmarks
+
+# Throughput on hardware other than the author's machine, x86_64 above all, where
+# nothing else in CI measures speed. Run it from the Actions tab (Benchmarks > Run
+# workflow) or by pushing to a bench/ branch. Results go to the job summary.
+#
+# CI runners are shared virtual machines, so expect a few percent of noise between
+# runs. Each benchmark takes the best of several trials, which helps, and the
+# comparisons that matter (tile shapes, CPU levels) are made within one job, on one
+# machine.
+on:
+  workflow_dispatch:
+  push:
+    branches: ['bench/**']
+
+env:
+  ZIG_VERSION: "0.16.0"
+
+jobs:
+  bench:
+    name: Benchmarks on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The release CPU level first, then everything this runner has.
+          - { os: ubuntu-latest,    cpus: "x86_64_v2 native" }
+          - { os: ubuntu-24.04-arm, cpus: "generic+dotprod native" }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Run
+        run: |
+          set -o pipefail
+          {
+            echo "### ${{ matrix.os }}"
+            echo '```'
+            lscpu | grep -E '^(Model name|CPU\(s\)):'
+            echo "Relevant features: $(grep -o -w -E 'ssse3|avx2|avx512f|avx512vnni|avx_vnni|asimddp' /proc/cpuinfo | sort -u | tr '\n' ' ')"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          for cpu in ${{ matrix.cpus }}; do
+            for bench in tile_bench quickbench; do
+              zig build "$bench" -Dcpu="$cpu" 2>&1 | tee out.txt
+              {
+                echo "#### $bench, -Dcpu=$cpu"
+                echo '```'
+                cat out.txt
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+            done
+          done

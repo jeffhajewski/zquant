@@ -6,6 +6,7 @@ one copied into zquant/ (scripts/build_wheel.sh does that) the wheel only works 
 platform the library was built for, so it is tagged for that platform. The tag is
 `py3-none-<platform>` rather than CPython-specific: ctypes has no Python ABI to match.
 """
+import os
 import platform
 import sys
 from pathlib import Path
@@ -45,6 +46,17 @@ class platform_wheel(bdist_wheel):
         explicit = getattr(self, "plat_name_supplied", False)
         if sys.platform == "darwin" and plat.endswith("universal2") and not explicit:
             plat = plat[: -len("universal2")] + platform.machine()
+        # bdist_wheel will not tag below the macOS the *interpreter* was built for, which
+        # is right for a compiled extension and wrong here: the only native code is our
+        # library, built for MACOSX_DEPLOYMENT_TARGET by scripts/build_wheel.sh. Without
+        # this, a wheel built with Homebrew's Python on macOS 26 claims to need 26.
+        target = os.environ.get("MACOSX_DEPLOYMENT_TARGET")
+        if sys.platform == "darwin" and target and not explicit:
+            major, _, minor = target.partition(".")
+            minor = minor.split(".")[0] if minor else "0"
+            if int(major) >= 11:
+                minor = "0"
+            plat = "macosx_{}_{}_{}".format(major, minor, platform.machine())
         return "py3", "none", plat
 
 

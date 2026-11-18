@@ -13,48 +13,147 @@ without copying is accepted; anything else is converted, which costs a copy.
 from __future__ import annotations
 
 import ctypes
-from typing import Literal
+from pathlib import Path
+from typing import Literal, NamedTuple
 
 import numpy as np
 
 from . import _lib
+from ._errors import (
+    ZQ_ERR_STATE,
+    ZQ_OK,
+    CpuNotSupportedError,
+    FormatError,
+    InvalidArgumentError,
+    LibraryNotFoundError,
+    OutOfMemoryError,
+    StateError,
+    UnsupportedError,
+    ZquantError,
+    error_for,
+)
 
-__all__ = ["Index", "Codec", "ZquantError", "version"]
+__all__ = [
+    "Index",
+    "Codec",
+    "ZquantError",
+    "OutOfMemoryError",
+    "InvalidArgumentError",
+    "StateError",
+    "UnsupportedError",
+    "CpuNotSupportedError",
+    "FormatError",
+    "LibraryNotFoundError",
+    "BuildInfo",
+    "build_info",
+    "version",
+    "MAX_DIM",
+    "MAX_THREADS",
+]
 
-_LIB = _lib.bind(_lib.load())
+_LIB, _LIB_PATH, _LIB_PORTABLE = _lib.load()
+
+#: Largest dimension the library accepts (ZQ_MAX_DIM).
+MAX_DIM = 65536
+#: Largest worker count for search or add (ZQ_MAX_THREADS).
+MAX_THREADS = 1024
 
 _METRICS = {"ip": 0, "inner_product": 0, "cosine": 1, "l2": 2}
+_U64_MAX = (1 << 64) - 1
 
-OK = 0
 
-
-class ZquantError(RuntimeError):
-    """A native call failed. The message is the library's own status string."""
-
-    def __init__(self, status: int, context: str):
-        self.status = status
-        text = _LIB.zq_status_string(status).decode()
-        super().__init__(f"{context}: {text} ({status})")
+def _status_text(status: int) -> str:
+    return _LIB.zq_status_string(status).decode()
 
 
 def _check(status: int, context: str) -> None:
-    if status != OK:
-        raise ZquantError(status, context)
+    if status != ZQ_OK:
+        raise error_for(status, context, _status_text)
 
 
 def version() -> str:
     return _LIB.zq_version().decode()
 
 
+class BuildInfo(NamedTuple):
+    """Which native library was loaded, and what it was built for."""
+
+    version: str
+    #: The CPU model the library was compiled for, e.g. "x86_64_v2" or "apple_m1".
+    cpu: str
+    #: Which scan kernels it uses; "scalar" in here means the slow portable fallback.
+    kernels: str
+    #: The file that was loaded.
+    library: Path
+    #: True if this CPU could not run the release build and the portable one was loaded.
+    portable: bool
+
+
+def build_info() -> BuildInfo:
+    """Describe the loaded library. Handy in a bug report, or to check you are not
+    running the scalar fallback by accident."""
+    return BuildInfo(
+        version=version(),
+        cpu=_LIB.zq_build_cpu().decode(),
+        kernels=_LIB.zq_build_kernels().decode(),
+        library=_LIB_PATH,
+        portable=_LIB_PORTABLE,
+    )
+
+
+# ── Argument checks ─────────────────────────────────────────────────────────────────
+#
+# The library rejects all of these too, but only with "invalid argument". Checking here
+# first says which argument and what range it should be in.
+
+
+def _int_arg(value, name: str, lo: int, hi: int) -> int:
+    # bool is an int subclass; Index(dim=True) is a mistake, not a 1-dimensional index.
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise TypeError(f"{name} must be an integer, got {type(value).__name__}")
+    v = int(value)
+    if not lo <= v <= hi:
+        raise ValueError(f"{name} must be in {lo}..{hi}, got {v}")
+    return v
+
+
+def _dim_arg(dim) -> int:
+    return _int_arg(dim, "dim", 1, MAX_DIM)
+
+
+def _seed_arg(seed) -> int:
+    # ctypes would silently keep the low 64 bits of anything larger, or wrap a negative.
+    return _int_arg(seed, "seed", 0, _U64_MAX)
+
+
+def _threads_arg(threads) -> int:
+    return _int_arg(threads, "threads", 0, MAX_THREADS)
+
+
 def _as_rows(x, dim: int, name: str) -> np.ndarray:
-    a = np.ascontiguousarray(x, dtype=np.float32)
+    """Any array-like of real numbers as C-contiguous float32 rows of `dim` columns."""
+    a = np.asarray(x)
+    if a.dtype.kind not in "fiub":
+        # Complex would lose its imaginary part with only a warning; strings and objects
+        # would fail later with a less useful message.
+        raise TypeError(f"{name} must hold real numbers, got dtype {a.dtype}")
+    a = np.ascontiguousarray(a, dtype=np.float32)
     if a.ndim == 1:
         a = a.reshape(1, -1)
     if a.ndim != 2:
         raise ValueError(f"{name} must be 1-D or 2-D, got {a.ndim}-D")
     if a.shape[1] != dim:
-        raise ValueError(f"{name} has dim {a.shape[1]}, index expects {dim}")
+        raise ValueError(f"{name} has dim {a.shape[1]}, expected {dim}")
     return a
+
+
+def _check_rows(status: int, a: np.ndarray, context: str, name: str) -> None:
+    """`_check`, explaining the usual cause of an invalid argument when it is that."""
+    if status != ZQ_OK and not np.isfinite(a).all():
+        raise InvalidArgumentError(
+            f"{context}: {name} contain NaN or infinity, which the library refuses", status
+        )
+    _check(status, context)
 
 
 def _ptr(a: np.ndarray, ctype):
@@ -82,6 +181,9 @@ class Index:
         seed: int = 0x5EED,
         compact: bool = True,
     ):
+        dim = _dim_arg(dim)
+        bits = _int_arg(bits, "bits", 2, 6)
+        seed = _seed_arg(seed)
         if metric not in _METRICS:
             raise ValueError(f"metric must be one of {sorted(_METRICS)}, got {metric!r}")
         cfg = _lib.Config(dim=dim, bits=bits, metric=_METRICS[metric], seed=seed,
@@ -132,12 +234,13 @@ class Index:
         are enough; more did not measurably help.
         """
         a = _as_rows(sample, self._dim, "sample")
-        _check(_LIB.zq_index_calibrate(self._handle, _ptr(a, ctypes.c_float), a.shape[0]),
-               "calibrate")
+        _check_rows(_LIB.zq_index_calibrate(self._handle, _ptr(a, ctypes.c_float), a.shape[0]),
+                    a, "calibrate", "sample")
 
     def add(self, vectors) -> None:
         a = _as_rows(vectors, self._dim, "vectors")
-        _check(_LIB.zq_index_add(self._handle, _ptr(a, ctypes.c_float), a.shape[0]), "add")
+        _check_rows(_LIB.zq_index_add(self._handle, _ptr(a, ctypes.c_float), a.shape[0]),
+                    a, "add", "vectors")
 
     def _searcher(self, k: int, threads: int):
         key = (k, threads)
@@ -158,10 +261,10 @@ class Index:
         `threads > 1` splits the batch across workers, which only pays for batches at
         least that large.
         """
-        if k < 1:
-            raise ValueError("k must be at least 1")
+        k = _int_arg(k, "k", 1, 1 << 32)
+        threads = _threads_arg(threads)
         if len(self) == 0:
-            raise ZquantError(-3, "search on an empty index")
+            raise StateError("search on an empty index", ZQ_ERR_STATE)
         q = _as_rows(queries, self._dim, "queries")
         nq = q.shape[0]
 
@@ -174,7 +277,7 @@ class Index:
         # here rather than making that the caller's problem.
         for start in range(0, nq, capacity):
             n = min(capacity, nq - start)
-            _check(
+            _check_rows(
                 _LIB.zq_search(
                     self._handle,
                     searcher,
@@ -183,7 +286,9 @@ class Index:
                     _ptr(ids[start:start + n], ctypes.c_uint32),
                     _ptr(scores[start:start + n], ctypes.c_float),
                 ),
+                q[start:start + n],
                 "search",
+                "queries",
             )
         return ids, scores
 
@@ -214,6 +319,9 @@ class Codec:
     """
 
     def __init__(self, dim: int, bits: int = 5, seed: int = 0x5EED):
+        dim = _dim_arg(dim)
+        bits = _int_arg(bits, "bits", 1, 6)
+        seed = _seed_arg(seed)
         cfg = _lib.CodecConfig(dim=dim, bits=bits, seed=seed)
         handle = ctypes.c_void_p()
         _check(_LIB.zq_codec_create(ctypes.byref(cfg), ctypes.byref(handle)), "codec_create")
@@ -222,7 +330,8 @@ class Codec:
         self._code_bytes = _LIB.zq_codec_code_bytes(handle)
         if self._code_bytes <= 0:
             self.close()
-            raise ZquantError(-4, f"codec reported {self._code_bytes} code bytes for dim={dim} bits={bits}")
+            raise UnsupportedError(
+                f"codec reported {self._code_bytes} code bytes for dim={dim} bits={bits}")
 
     def __del__(self):
         self.close()
@@ -260,7 +369,7 @@ class Codec:
         n = a.shape[0]
         codes = np.empty((n, self._code_bytes), dtype=np.uint8)
         norms = np.empty(n, dtype=np.float32)
-        _check(
+        _check_rows(
             _LIB.zq_codec_encode(
                 self._handle,
                 _ptr(a, ctypes.c_float),
@@ -268,7 +377,9 @@ class Codec:
                 codes.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
                 _ptr(norms, ctypes.c_float),
             ),
+            a,
             "encode",
+            "vectors",
         )
         return codes, norms
 

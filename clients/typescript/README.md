@@ -14,11 +14,17 @@ installing it needs no compiler.
 
 ## Install
 
-From a tarball built with the native library inside it:
+Each GitHub release has an npm tarball carrying the native library for every platform
+it supports: Linux x86_64 and arm64 (glibc 2.17 or newer), macOS 13+ on arm64 and
+x86_64, and Windows x86_64.
 
 ```sh
 npm install ./zquant-0.1.0.tgz
 ```
+
+The Linux and Windows libraries come with a portable build, which the binding loads
+instead on a CPU without SSSE3 (x86_64) or the dot-product extension (arm64).
+`buildInfo().portable` says which you got.
 
 During development, against the repository's own build:
 

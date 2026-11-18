@@ -10,6 +10,19 @@ ids, scores = index.search(queries, k=10)
 
 ## Install
 
+Each GitHub release has a wheel per platform, with the native library inside: Linux
+x86_64 and arm64 (manylinux_2_17, so glibc 2.17 or newer), macOS 13+ on arm64 and
+x86_64, and Windows x86_64. One wheel serves every Python from 3.9 up. Download them
+all and let pip choose:
+
+```sh
+pip install --no-index --find-links ./wheels zquant    # after `pip install numpy`
+```
+
+The Linux and Windows wheels also carry a portable library, which the package loads
+instead on a CPU without SSSE3 (x86_64) or the dot-product extension (arm64). It is
+correct but several times slower; `zquant.build_info().portable` says which you got.
+
 The package is plain Python over `ctypes`, so it needs the native library, `libzquant`,
 from somewhere. It looks in three places, in this order:
 

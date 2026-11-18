@@ -118,9 +118,141 @@ jobs:
       - name: Run tests
         run: zig build test -Dcpu=${{ matrix.cpu }} -Doptimize=ReleaseSafe
 
+  # A wheel per platform and one npm package for all of them, made from the archives
+  # above so each package holds exactly the library its archive does.
+  packages:
+    name: Build the Python wheels and npm package
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: zquant-*
+          path: archives
+          merge-multiple: true
+
+      - name: Build packages
+        run: bash tools/package_release.sh archives packages
+
+      # auditwheel reads the libraries and reports the oldest manylinux they satisfy:
+      # symbol versions, and only system libraries a manylinux platform must provide.
+      # The tag each wheel claims must be no older than that. (Its human-readable
+      # output repeats the file name, tag and all, so it is the JSON that is checked.)
+      - name: Check the manylinux tags
+        run: |
+          python -m pip install auditwheel
+          for whl in packages/*manylinux*.whl; do
+            auditwheel show "$whl"
+            auditwheel show --json "$whl" > audit.json
+            python - "$whl" audit.json <<'PY'
+          import json, re, sys
+          claimed = re.search(r"manylinux_(\d+)_(\d+)", sys.argv[1])
+          needed = re.search(r"manylinux_(\d+)_(\d+)", json.load(open(sys.argv[2]))["overall_tag"])
+          assert needed, f"{sys.argv[1]}: auditwheel found no manylinux tag its libraries satisfy"
+          c, n = tuple(map(int, claimed.groups())), tuple(map(int, needed.groups()))
+          assert n <= c, f"{sys.argv[1]} claims manylinux_{c[0]}_{c[1]}, but its libraries need {needed.group(0)}"
+          print(f"ok: claims manylinux_{c[0]}_{c[1]}; its libraries need only {needed.group(0)}")
+          PY
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: packages/
+
+  # Install each package the way a user would, on each architecture, and use it.
+  # pip is left to pick the wheel from all five, which also checks the tags select the
+  # right one.
+  packages-test:
+    name: Install packages on ${{ matrix.os }}
+    needs: packages
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-15, windows-latest]
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      # Into the temp directory, and used through relative paths: on Windows the
+      # workspace path has backslashes, which bash would read as glob escapes.
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: ${{ runner.temp }}/packages
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Python
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -m venv venv
+          if [ -d venv/Scripts ]; then py=venv/Scripts/python; else py=venv/bin/python; fi
+          "$py" -m pip install numpy
+          "$py" -m pip install --no-index --find-links packages zquant
+          "$py" - <<'PY'
+          import numpy as np, zquant
+          info = zquant.build_info()
+          print(info)
+          assert "site-packages" in str(info.library), info.library
+          assert not info.portable
+          x = np.random.default_rng(0).standard_normal((2000, 64)).astype("float32")
+          index = zquant.Index(dim=64, bits=5)
+          index.add(x, threads=2)
+          ids, _ = index.search(x[:20], k=1)
+          assert (ids[:, 0] == np.arange(20)).all(), ids[:, 0]
+          again = zquant.Index.from_bytes(index.to_bytes())
+          assert again.bits == 5 and (again.search(x[:20], k=1)[0] == ids).all()
+          print("ok")
+          PY
+
+      - name: Node
+        working-directory: ${{ runner.temp }}
+        run: |
+          mkdir consumer && cd consumer
+          npm init -y > /dev/null
+          npm install ../packages/zquant-*.tgz
+          cat > use.mjs <<'JS'
+          import { Index, buildInfo } from 'zquant';
+          const info = buildInfo();
+          console.log(info);
+          if (!info.libraryPath.includes('node_modules')) throw new Error(`loaded ${info.libraryPath}`);
+          if (info.portable) throw new Error('loaded the portable library on a CPU that has no need of it');
+          const dim = 64, n = 2000;
+          const x = new Float32Array(n * dim).map(() => Math.random() - 0.5);
+          const index = new Index({ dim, bits: 5 });
+          index.add(x, { threads: 2 });
+          const { ids } = index.search(x.subarray(0, 20 * dim), { k: 1 });
+          for (let i = 0; i < 20; i++) if (ids[i] !== i) throw new Error(`query ${i} found ${ids[i]}`);
+          const again = Index.deserialize(index.serialize());
+          if (again.settings.bits !== 5 || again.search(x.subarray(0, dim), { k: 1 }).ids[0] !== 0) throw new Error('round trip');
+          index.close(); again.close();
+          console.log('ok');
+          JS
+          node use.mjs
+
   release:
     name: Publish release
-    needs: [build, test]
+    needs: [build, test, packages-test]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -134,5 +266,8 @@ jobs:
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.tar.gz
+          files: |
+            dist/*.tar.gz
+            dist/*.whl
+            dist/*.tgz
           generate_release_notes: true

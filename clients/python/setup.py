@@ -40,6 +40,11 @@ class platform_wheel(bdist_wheel):
         python, abi, plat = super().get_tag()
         if self.root_is_pure:
             return python, abi, plat
+        # Set by scripts/build_wheel.sh when it packages a library built for another
+        # platform, as the release does for every platform from one Linux runner.
+        override = os.environ.get("ZQUANT_WHEEL_PLATFORM")
+        if override:
+            return "py3", "none", override
         # A Python built as universal2 reports that as its platform, but the library
         # beside it is built for one architecture. Claim only that one, unless the
         # caller chose a platform explicitly with --plat-name.

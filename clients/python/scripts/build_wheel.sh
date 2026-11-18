@@ -23,6 +23,15 @@
 #                    bdist_wheel tags the wheel from the library, so without this a
 #                    wheel built on macOS 26 refuses to install anywhere older.
 #
+# To package libraries that are already built, for this platform or another one (the
+# release builds every wheel on one Linux runner from its release archives):
+#   WHEEL_LIB           the main library: libzquant.so, libzquant.dylib or zquant.dll
+#   WHEEL_PORTABLE_LIB  optionally, its portable counterpart
+#   WHEEL_PLATFORM      the wheel's platform tag, e.g. manylinux_2_17_x86_64. Required
+#                       with WHEEL_LIB: the tag must describe the library, not this
+#                       machine.
+# Nothing is built in that mode.
+#
 # Without network access, pass --no-build-isolation (setuptools and wheel must then be
 # installed in PYTHON's environment already).
 set -euo pipefail
@@ -37,6 +46,18 @@ case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*) lib=zquant.dll;      portable=zquant-portable.dll ;;
   *)                    lib=libzquant.so;    portable=libzquant-portable.so ;;
 esac
+if [ -n "${WHEEL_LIB:-}" ]; then
+  if [ -z "${WHEEL_PLATFORM:-}" ]; then
+    echo "build_wheel.sh: WHEEL_LIB needs WHEEL_PLATFORM, the tag for the platform it was built for" >&2
+    exit 1
+  fi
+  lib="$(basename "$WHEEL_LIB")"
+  case "$lib" in
+    libzquant.so|libzquant.dylib|zquant.dll) ;;
+    *) echo "build_wheel.sh: WHEEL_LIB must be named libzquant.so, libzquant.dylib or zquant.dll, not $lib" >&2; exit 1 ;;
+  esac
+  portable="${lib/zquant/zquant-portable}"
+fi
 
 # The CPUs release.yml builds for. macOS's baselines already have the instructions.
 case "$(uname -s)/$(uname -m)" in
@@ -80,19 +101,33 @@ built_lib() {
   exit 1
 }
 
-echo "==> zig build lib -Dcpu=$cpu ${target_args[*]-}"
-(cd "$repo_root" && zig build lib ${target_args[@]+"${target_args[@]}"} -Dcpu="$cpu" -p "$work/release")
-cp "$(built_lib "$work/release" "$lib")" "$pkg_root/zquant/$lib"
+if [ -n "${WHEEL_LIB:-}" ]; then
+  echo "==> packaging $WHEEL_LIB for $WHEEL_PLATFORM"
+  cp "$WHEEL_LIB" "$pkg_root/zquant/$lib"
+  if [ -n "${WHEEL_PORTABLE_LIB:-}" ]; then
+    if [ "$(basename "$WHEEL_PORTABLE_LIB")" != "$portable" ]; then
+      echo "build_wheel.sh: WHEEL_PORTABLE_LIB must be named $portable" >&2
+      exit 1
+    fi
+    cp "$WHEEL_PORTABLE_LIB" "$pkg_root/zquant/$portable"
+  fi
+  export ZQUANT_WHEEL_PLATFORM="$WHEEL_PLATFORM"
+  unset MACOSX_DEPLOYMENT_TARGET
+else
+  echo "==> zig build lib -Dcpu=$cpu ${target_args[*]-}"
+  (cd "$repo_root" && zig build lib ${target_args[@]+"${target_args[@]}"} -Dcpu="$cpu" -p "$work/release")
+  cp "$(built_lib "$work/release" "$lib")" "$pkg_root/zquant/$lib"
 
-if [ "$want_portable" = 1 ]; then
-  # Built under its own name (-Dlib-name), so its SONAME / install name matches the
-  # file rather than claiming to be libzquant.
-  echo "==> zig build lib -Dcpu=baseline -Dlib-name=zquant-portable (portable)"
-  (cd "$repo_root" && zig build lib ${target_args[@]+"${target_args[@]}"} -Dcpu=baseline -Dlib-name=zquant-portable -p "$work/portable")
-  cp "$(built_lib "$work/portable" "$portable")" "$pkg_root/zquant/$portable"
-elif [ -f "$repo_root/zig-out/lib/$portable" ]; then
-  # Someone built or downloaded one by hand; ship it.
-  cp "$repo_root/zig-out/lib/$portable" "$pkg_root/zquant/$portable"
+  if [ "$want_portable" = 1 ]; then
+    # Built under its own name (-Dlib-name), so its SONAME / install name matches the
+    # file rather than claiming to be libzquant.
+    echo "==> zig build lib -Dcpu=baseline -Dlib-name=zquant-portable (portable)"
+    (cd "$repo_root" && zig build lib ${target_args[@]+"${target_args[@]}"} -Dcpu=baseline -Dlib-name=zquant-portable -p "$work/portable")
+    cp "$(built_lib "$work/portable" "$portable")" "$pkg_root/zquant/$portable"
+  elif [ -f "$repo_root/zig-out/lib/$portable" ]; then
+    # Someone built or downloaded one by hand; ship it.
+    cp "$repo_root/zig-out/lib/$portable" "$pkg_root/zquant/$portable"
+  fi
 fi
 
 echo "==> pip wheel"

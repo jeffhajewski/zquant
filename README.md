@@ -324,6 +324,12 @@ TypeScript bindings fall back to `libzquant-portable` automatically when it sits
 the main library. `zq_build_cpu()` and `zq_build_kernels()` say what a given build
 contains. `zig build lib` with no options builds for the machine you're on.
 
+Releases also carry a Python wheel per platform and one npm tarball for every
+platform, holding the same libraries as the archives; the
+[Python](clients/python/README.md#install) and
+[TypeScript](clients/typescript/README.md#install) READMEs say how to install them.
+Linux builds need glibc 2.17 or newer, macOS builds macOS 13.
+
 ### macOS note
 
 On this machine the Xcode 26 SDK ships a `libSystem.tbd` whose target list omits the

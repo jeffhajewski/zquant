@@ -17,6 +17,9 @@
 #                        `zig build lib -Dcpu=baseline -Dlib-name=zquant-portable`
 #                        produces, and what a release's -portable archive contains) is
 #                        included without this.
+#   ZQUANT_PREBUILDS     a directory already laid out as <platform>-<arch>/ subdirectories,
+#                        one per platform, to pack instead of this machine's library. The
+#                        release uses it to ship one package for every platform.
 #
 # The prebuilds/ directory is removed again afterwards, so a later `npm test` cannot
 # pick up a stale copy instead of a fresh zig-out/lib.
@@ -24,6 +27,19 @@ set -eu
 
 pkg=$(cd "$(dirname "$0")/.." && pwd)
 repo=$(cd "$pkg/../.." && pwd)
+
+if [ -n "${ZQUANT_PREBUILDS:-}" ]; then
+  trap 'rm -rf "$pkg/prebuilds"' EXIT
+  rm -rf "$pkg/prebuilds"
+  cp -R "$ZQUANT_PREBUILDS" "$pkg/prebuilds"
+  for dir in "$pkg"/prebuilds/*/; do
+    echo "pack.sh: prebuilds/$(basename "$dir"): $(ls "$dir" | tr '\n' ' ')"
+  done
+  cd "$pkg"
+  npm pack
+  exit 0
+fi
+
 plat=$(node -p 'process.platform + "-" + process.arch')
 
 case "$plat" in

@@ -31,15 +31,40 @@ const (
 	L2           Metric = C.ZQ_METRIC_L2
 )
 
-// Error is a failure reported by the native library, carrying its status code.
+// Error is a failure, carrying the native status code it corresponds to. Arguments the
+// binding rejects before calling the library carry the status the library would have
+// returned, so one errors.Is check covers both.
 type Error struct {
 	Status  int
 	Context string
 }
 
 func (e *Error) Error() string {
-	return fmt.Sprintf("zquant: %s: %s (%d)", e.Context, C.GoString(C.zq_status_string(C.int(e.Status))), e.Status)
+	msg := C.GoString(C.zq_status_string(C.int(e.Status)))
+	if e.Context == "" {
+		return fmt.Sprintf("zquant: %s (%d)", msg, e.Status)
+	}
+	return fmt.Sprintf("zquant: %s: %s (%d)", e.Context, msg, e.Status)
 }
+
+// Is reports whether target is the sentinel for e's status, so that
+// errors.Is(err, zquant.ErrInvalid) matches every invalid-argument error whatever its
+// context.
+func (e *Error) Is(target error) bool {
+	t, ok := target.(*Error)
+	return ok && t.Context == "" && t.Status == e.Status
+}
+
+// Sentinels for each native status, for use with errors.Is. Every *Error returned by
+// this package matches exactly one of them.
+var (
+	ErrAlloc       = &Error{Status: C.ZQ_ERR_ALLOC}       // out of memory
+	ErrInvalid     = &Error{Status: C.ZQ_ERR_INVALID}     // bad argument, including NaN or infinite input
+	ErrState       = &Error{Status: C.ZQ_ERR_STATE}       // not valid now, e.g. Calibrate after Add
+	ErrUnsupported = &Error{Status: C.ZQ_ERR_UNSUPPORTED} // a configuration the library cannot build
+	ErrCPU         = &Error{Status: C.ZQ_ERR_CPU}         // this CPU cannot run this build; see CPUSupported
+	ErrFormat      = &Error{Status: C.ZQ_ERR_FORMAT}      // not an intact index from a compatible version
+)
 
 func check(status C.int, context string) error {
 	if status == C.ZQ_OK {
@@ -48,7 +73,13 @@ func check(status C.int, context string) error {
 	return &Error{Status: int(status), Context: context}
 }
 
-// ErrClosed is returned, wrapped, by any call on an Index or Searcher after its Close.
+// invalid is an argument error caught before it reaches the library.
+func invalid(format string, args ...any) error {
+	return &Error{Status: C.ZQ_ERR_INVALID, Context: fmt.Sprintf(format, args...)}
+}
+
+// ErrClosed is returned, wrapped, by any call on an Index, Searcher or Codec after its
+// Close.
 var ErrClosed = errors.New("zquant: use after Close")
 
 // closedError names what was closed while still matching ErrClosed under errors.Is.
@@ -56,6 +87,50 @@ type closedError string
 
 func (e closedError) Error() string        { return "zquant: " + string(e) + " is closed" }
 func (e closedError) Is(target error) bool { return target == ErrClosed }
+
+// Limits the library enforces. The binding checks them first, so the error can say
+// which argument is wrong.
+const (
+	MaxDim     = int(C.ZQ_MAX_DIM)     // largest vector dimension
+	MaxThreads = int(C.ZQ_MAX_THREADS) // most threads one call may use
+)
+
+var cpu struct {
+	once sync.Once
+	ok   bool
+}
+
+// CPUSupported reports whether this CPU can run the linked build of libzquant.
+//
+// Release builds use instructions beyond the architecture baseline (SSSE3 on x86_64,
+// the dot-product extension on arm64), because search is 6-10x slower without them. On
+// a CPU that lacks them every constructor in this package returns an error matching
+// ErrCPU rather than letting the library die of an illegal instruction; the fix is to
+// link a portable build. The check itself is safe on any CPU, and runs once.
+func CPUSupported() bool {
+	cpu.once.Do(func() { cpu.ok = C.zq_cpu_supported() != 0 })
+	return cpu.ok
+}
+
+// BuildCPU reports the CPU model the linked library was compiled for, such as
+// "x86_64_v2", for diagnostics.
+func BuildCPU() string { return C.GoString(C.zq_build_cpu()) }
+
+// BuildKernels reports which scan kernels the linked library uses, such as
+// "zquant-kernels shuffle=native dot=native". "scalar" means the portable fallback,
+// which is correct but several times slower.
+func BuildKernels() string { return C.GoString(C.zq_build_kernels()) }
+
+// checkCPU is the guard every constructor runs before anything else native.
+func checkCPU() error {
+	if CPUSupported() {
+		return nil
+	}
+	return &Error{
+		Status:  C.ZQ_ERR_CPU,
+		Context: fmt.Sprintf("libzquant was built for %s (%s) and this CPU lacks instructions it needs; link a portable build", BuildCPU(), BuildKernels()),
+	}
+}
 
 // Version reports the native library version.
 func Version() string { return C.GoString(C.zq_version()) }
@@ -105,12 +180,23 @@ type Index struct {
 
 // New creates an empty index.
 func New(cfg Config) (*Index, error) {
-	if cfg.Dim <= 0 {
-		return nil, errors.New("zquant: Dim must be positive")
+	if cfg.Dim < 1 || cfg.Dim > MaxDim {
+		return nil, invalid("Dim %d is outside 1..%d", cfg.Dim, MaxDim)
 	}
 	bits := cfg.Bits
 	if bits == 0 {
 		bits = 5
+	}
+	if bits < 2 || bits > 6 {
+		return nil, invalid("Bits %d is outside 2..6", cfg.Bits)
+	}
+	switch cfg.Metric {
+	case InnerProduct, Cosine, L2:
+	default:
+		return nil, invalid("unknown Metric %d", cfg.Metric)
+	}
+	if err := checkCPU(); err != nil {
+		return nil, err
 	}
 	seed := cfg.Seed
 	if seed == 0 {
@@ -213,7 +299,7 @@ func (ix *Index) BytesPerVector() int {
 // rows checks that v holds a whole, non-zero number of vectors and returns how many.
 func (ix *Index) rows(v []float32, name string) (int, error) {
 	if len(v) == 0 || len(v)%ix.dim != 0 {
-		return 0, fmt.Errorf("zquant: %s length %d is not a positive multiple of dim %d", name, len(v), ix.dim)
+		return 0, invalid("%s length %d is not a positive multiple of dim %d", name, len(v), ix.dim)
 	}
 	return len(v) / ix.dim, nil
 }

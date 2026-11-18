@@ -6,7 +6,6 @@ package zquant
 import "C"
 
 import (
-	"errors"
 	"runtime"
 	"sync"
 	"unsafe"
@@ -45,7 +44,10 @@ func (ix *Index) newSearcherLocked(k, threads int) (*Searcher, error) {
 		return nil, errIndexClosed
 	}
 	if k < 1 {
-		return nil, errors.New("zquant: k must be at least 1")
+		return nil, invalid("k %d must be at least 1", k)
+	}
+	if threads > MaxThreads {
+		return nil, invalid("threads %d exceeds %d", threads, MaxThreads)
 	}
 	if threads < 1 {
 		threads = 1

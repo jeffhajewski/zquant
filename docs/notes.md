@@ -1836,3 +1836,53 @@ entry points, and only the retrieval one is exposed.
 **Scope.** One model at 135M parameters, 936 tokens, three layers. Whether the picture holds
 at 7B and 128k context is untested, and larger models are known to have more extreme outlier
 channels than this one (key channel spread here is only 3.8×).
+
+## KV cache, against a real baseline: KIVI wins at matched memory
+
+The section above compared zquant against a strawman. Its int4 had one symmetric scale per
+64-wide row, no zero point, and 15 of its 16 levels. Nobody deploys that. Its metric was
+attention-output error on three layers of one model. Both are fixed now, and the claim
+does not survive.
+
+**Baselines** (`bench/kv_bench.zig`, `bench/py/kv_ppl.py`): asymmetric per-token int4/int2
+in channel groups, and KIVI-style 4- and 2-bit. KIVI puts keys per channel over token
+groups and values per token over channel groups. Every f16 scale and zero point is counted
+in the bytes. KIVI's fp16 recent-token window is left out, so every row quantizes every
+token at the bytes shown.
+
+**Metric**: wikitext-2 test perplexity with every K (post-RoPE) and V fake-quantized as it
+enters a `DynamicCache`. Three models, at 72 B/token/head (K+V). The numbers are the
+increase over fp16:
+
+| scheme | SmolLM2-135M | SmolLM2-360M | Qwen2.5-0.5B |
+|---|---|---|---|
+| int4 per-row (old baseline) | +4.31 | +2.30 | +35.0 |
+| int4 per-token g64 asym | +1.46 | +0.94 | +97.3 |
+| KIVI-4 g64 | **+0.31** | **+0.16** | **+0.22** |
+| zquant b=4 | +0.79 | +0.47 | +151 |
+| zquant b=4, keys mean-centred | +0.67 | +0.43 | +5.25 |
+| KIVI-4 keys + zquant b=4 values | +0.30 | +0.16 | +0.23 |
+
+**The loss is in keys.** zquant's values are as good as KIVI's. Swapping zquant values in
+next to KIVI keys changes nothing measurable. kv_bench agrees: on keys alone, KIVI-4's
+output error is lower on all three layers (0.024 / 0.074 / 0.056 against 0.052 / 0.108 /
+0.084).
+
+**Qwen2.5 is the failure that matters.** Its `k_proj` bias puts a large constant offset in
+some key channels. A norm-scaled code after a random rotation spends its range on that
+constant. Centring each channel recovers most of it, from +151 to +5.25, but not all. The
+outlier channels also differ in scale, and only a per-channel scale handles that. That is
+exactly the structure the data-oblivious design gives up. It is the regime that larger
+models reportedly push further into, so the 135M result was the flattering one.
+
+**The proxy was kinder than the real metric.** At 72 B, kv_bench has zquant ahead on one
+layer of three. Perplexity has KIVI ahead on every model. One more reason for distrust:
+`dump_kv.py` captures queries from `q_proj`, which is before RoPE, while the keys are
+post-RoPE. So kv_bench's scores were never the model's attention logits. The perplexity
+eval does not have that problem.
+
+**Measurement notes.** kv_bench now scores every scheme at the same query positions per
+head. A shared PRNG stream had given each row different positions. Several perplexity rows
+in the logs took ~1000 s where neighbours took ~20 s. That was the machine sleeping in
+thermal dark-wake cycles (`pmset -g log`), not anything in the code; results are
+unaffected. SmolLM2-135M ran 64 windows of 1024 tokens; the other two ran 16 windows.

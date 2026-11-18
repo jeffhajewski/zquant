@@ -136,11 +136,12 @@ def test_codec_bits_control_size_and_error():
 
 
 def test_codec_beats_int4_on_reconstruction():
-    """The KV-cache claim, as a test: at matched storage, beat per-row int4.
+    """At matched storage, reconstruct random vectors better than per-row int4.
 
-    int4 with a per-row scale is what KV quantization usually means in practice. At
-    d=64 it costs 36 B/vector (32 packed + a 4-byte scale), which is what Codec(bits=4)
-    costs (32 packed + a 4-byte norm).
+    A regression check on the codec, not a KV-cache claim. Per-row symmetric int4 is a
+    weak baseline: KIVI-style int4 beats zquant on real KV caches at matched memory (see
+    the repository README). At d=64 int4 costs 36 B/vector (32 packed + a 4-byte scale),
+    which is what Codec(bits=4) costs (32 packed + a 4-byte norm).
     """
     x = corpus(1000, 64, seed=22)
 

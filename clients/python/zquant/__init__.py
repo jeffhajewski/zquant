@@ -542,8 +542,17 @@ class Codec:
         keys_back = codec.decode(codes, norms)
 
     Codes are bit-packed, so `code_bytes` is the storage actually consumed; norms cost
-    four bytes per vector on top. Measured on real attention tensors at `bits=5`, this
-    gives 4x lower attention-output error than per-row int4 at the same memory.
+    four bytes per vector on top. `bits` is the codebook width directly, 1 to 6, where
+    `Index` reserves one of its bits for a residual sketch, so `Codec(bits=4)` packs as
+    many bits per coordinate as `Index(bits=5)`.
+
+    Is it a good KV-cache quantizer? Not the best one measured. At matched memory,
+    KIVI-style 4-bit quantization (keys per channel, values per token) gave lower
+    perplexity than `bits=4` on every model tried, and on a model whose keys carry a
+    large per-channel offset (Qwen2.5) zquant's keys failed outright; there is no
+    centring option to correct for that yet. On the other models it does beat plain
+    int4, and it reconstructs values as well as anything measured: the loss is in keys.
+    The repository README's KV-cache section has the measurements and their caveats.
 
     A Codec owns native scratch space that two calls cannot share, so its calls take a
     lock: sharing one between threads is safe, but they take turns. To encode on

@@ -55,6 +55,15 @@ const cases = [_]Case{
     .{ .dim = 1024, .bits = 4, .seed = 0xFEED, .mse_codes = 0xA1F06845B9EA72EB, .prod_codes = 0x8F88C8B1FE0462C5, .prod_sketch = 0x81009704C69D33BA },
 };
 
+/// The encoding these hashes pin, as saved index files record it. Regenerating any hash
+/// above means the codes changed, so an index saved before would load and decode to
+/// the wrong vectors: bump `persist.encoding_version`, then this.
+const golden_encoding_version: u32 = 1;
+
+test "saved indexes name the encoding these hashes pin" {
+    try testing.expectEqual(golden_encoding_version, zq.persist.encoding_version);
+}
+
 test "golden encodings are stable" {
     const allocator = testing.allocator;
 

@@ -24,6 +24,7 @@ typedef int zq_status;
 #define ZQ_ERR_STATE       -3
 #define ZQ_ERR_UNSUPPORTED -4
 #define ZQ_ERR_CPU         -5
+#define ZQ_ERR_FORMAT      -6
 
 /* Largest accepted dimension, and largest worker count for a searcher. */
 #define ZQ_MAX_DIM     65536
@@ -89,6 +90,24 @@ zq_status zq_index_add(zq_index *index, const float *rows, size_t n);
  * since starting a thread costs more than that much encoding. Like every call that
  * modifies an index, it must not overlap any other call on the same index. */
 zq_status zq_index_add_parallel(zq_index *index, const float *rows, size_t n, size_t threads);
+
+/* Saving and loading.
+ *
+ * The serialized form holds the configuration, any calibration and the codes, in a
+ * versioned, checksummed, little-endian format that is the same on every platform.
+ * Loading rebuilds the rest from the configuration, so a loaded index searches and
+ * accepts new vectors exactly as the saved one did.
+ *
+ * zq_index_serialize needs a buffer of at least zq_index_serialized_size bytes
+ * (ZQ_ERR_INVALID otherwise) and stores the bytes written in *written, which may be
+ * NULL. zq_index_deserialize copies what it needs, so the buffer can be freed
+ * afterwards. It returns ZQ_ERR_FORMAT for anything that is not an intact index
+ * from a compatible version: every field and the checksum are verified, so arbitrary
+ * bytes produce an error, never a crash. Indexes saved before an encoding change are
+ * refused rather than loaded, since their codes would decode to the wrong vectors. */
+size_t    zq_index_serialized_size(const zq_index *index);
+zq_status zq_index_serialize(const zq_index *index, void *buf, size_t len, size_t *written);
+zq_status zq_index_deserialize(const void *buf, size_t len, zq_index **out);
 
 size_t   zq_index_count(const zq_index *index);
 size_t   zq_index_bytes_per_vector(const zq_index *index);

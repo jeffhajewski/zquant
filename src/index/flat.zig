@@ -173,6 +173,10 @@ const LaneMask = std.meta.Int(.unsigned, lanes);
 const hot_slots = 8;
 
 pub const FlatIndex = struct {
+    /// What the index was created with. Kept so it can be saved and recreated
+    /// (`persist.zig`): the seed in particular is consumed by the quantizer's setup and
+    /// not otherwise recoverable.
+    params: Params,
     quantizer: prod_mod.Prod,
     layout: packing.Layout,
     metric: Metric,
@@ -256,6 +260,7 @@ pub const FlatIndex = struct {
         @memset(shifts, 0.0);
 
         return .{
+            .params = params,
             .quantizer = quantizer,
             .layout = packing.Layout.init(quantizer.padded(), quantizer.mse.bits),
             .metric = params.metric,

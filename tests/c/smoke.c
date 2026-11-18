@@ -127,6 +127,31 @@ int main(void) {
         zq_searcher_free(pse); zq_index_free(par);
     }
 
+    /* Save and load: the loaded index answers exactly as the original. */
+    {
+        size_t size = zq_index_serialized_size(ix), written = 0;
+        unsigned char *buf = malloc(size);
+        if (zq_index_serialize(ix, buf, size - 1, &written) != ZQ_ERR_INVALID) { printf("FAIL: short buffer accepted\n"); return 1; }
+        if (zq_index_serialize(ix, buf, size, &written) != ZQ_OK || written != size) { printf("FAIL serialize\n"); return 1; }
+        zq_index *loaded = NULL; zq_searcher *lse = NULL;
+        if (zq_index_deserialize(buf, size, &loaded) != ZQ_OK) { printf("FAIL deserialize\n"); return 1; }
+        if (zq_index_count(loaded) != zq_index_count(ix)) { printf("FAIL: loaded count\n"); return 1; }
+        if (zq_searcher_create(loaded, 32, K, 1, &lse) != ZQ_OK) { printf("FAIL searcher loaded\n"); return 1; }
+        uint32_t *lids = malloc(sizeof(uint32_t) * nq * K);
+        float *lscores = malloc(sizeof(float) * nq * K);
+        if (zq_search(loaded, lse, base, nq, lids, lscores) != ZQ_OK) { printf("FAIL search loaded\n"); return 1; }
+        if (memcmp(lids, ids, sizeof(uint32_t) * nq * K) || memcmp(lscores, scores, sizeof(float) * nq * K)) {
+            printf("FAIL: loaded index answers differently\n"); return 1;
+        }
+        /* Damage is reported as a format error. */
+        buf[size / 2] ^= 1;
+        zq_index *broken = NULL;
+        if (zq_index_deserialize(buf, size, &broken) != ZQ_ERR_FORMAT) { printf("FAIL: damaged index accepted\n"); return 1; }
+        if (zq_index_deserialize("hello", 5, &broken) != ZQ_ERR_FORMAT) { printf("FAIL: garbage accepted\n"); return 1; }
+        free(lids); free(lscores); free(buf);
+        zq_searcher_free(lse); zq_index_free(loaded);
+    }
+
     /* Each corpus vector queried against itself should rank itself first. */
     int self_hits = 0;
     for (size_t i = 0; i < nq; i++) if (ids[i*K] == (uint32_t)i) self_hits++;

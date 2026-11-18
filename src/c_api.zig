@@ -25,6 +25,7 @@ pub const ZQ_ERR_INVALID: c_int = -2;
 pub const ZQ_ERR_STATE: c_int = -3;
 pub const ZQ_ERR_UNSUPPORTED: c_int = -4;
 pub const ZQ_ERR_CPU: c_int = -5;
+pub const ZQ_ERR_FORMAT: c_int = -6;
 
 /// From src/cpu_probe.zig, compiled for the architecture baseline so it runs anywhere.
 extern fn zq_cpu_supported() c_int;
@@ -108,6 +109,7 @@ export fn zq_status_string(status: c_int) [*:0]const u8 {
         ZQ_ERR_STATE => "operation not valid in this state",
         ZQ_ERR_UNSUPPORTED => "unsupported configuration",
         ZQ_ERR_CPU => "this CPU lacks instructions this build of the library needs; use a portable build",
+        ZQ_ERR_FORMAT => "not a zquant index, damaged, or saved by an incompatible version",
         else => "unknown status",
     };
 }
@@ -188,6 +190,36 @@ export fn zq_index_add_parallel(index: ?*Index, rows: ?[*]const f32, n: usize, t
         error.OutOfMemory => ZQ_ERR_ALLOC,
         error.NonFiniteInput => ZQ_ERR_INVALID,
     };
+    return ZQ_OK;
+}
+
+/// Bytes `zq_index_serialize` writes for this index as it stands now.
+export fn zq_index_serialized_size(index: ?*const Index) usize {
+    const ix = index orelse return 0;
+    return zq.persist.serializedSize(&ix.inner);
+}
+
+export fn zq_index_serialize(index: ?*const Index, buf: ?[*]u8, len: usize, written: ?*usize) c_int {
+    const ix = index orelse return ZQ_ERR_INVALID;
+    const out = buf orelse return ZQ_ERR_INVALID;
+    const n = zq.persist.write(&ix.inner, out[0..len]) catch return ZQ_ERR_INVALID;
+    if (written) |w| w.* = n;
+    return ZQ_OK;
+}
+
+export fn zq_index_deserialize(buf: ?[*]const u8, len: usize, out: ?**Index) c_int {
+    if (zq_cpu_supported() == 0) return ZQ_ERR_CPU;
+    const data = buf orelse return ZQ_ERR_INVALID;
+    const slot = out orelse return ZQ_ERR_INVALID;
+    const index = allocator.create(Index) catch return ZQ_ERR_ALLOC;
+    index.inner = zq.persist.read(allocator, data[0..len]) catch |e| {
+        allocator.destroy(index);
+        return switch (e) {
+            error.OutOfMemory => ZQ_ERR_ALLOC,
+            else => ZQ_ERR_FORMAT,
+        };
+    };
+    slot.* = index;
     return ZQ_OK;
 }
 

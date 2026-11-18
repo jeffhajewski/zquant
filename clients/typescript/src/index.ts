@@ -215,6 +215,17 @@ export interface SearchResult {
   k: number;
 }
 
+/** An index's settings, as read back from the library. */
+export interface IndexSettings {
+  dim: number;
+  bits: number;
+  metric: 'ip' | 'cosine' | 'l2';
+  seed: bigint;
+  compact: boolean;
+}
+
+const METRIC_NAMES = ['ip', 'cosine', 'l2'] as const;
+
 export interface CalibrateOptions {
   /**
    * Measure the sample first and calibrate only if its centroid norm is at least 0.3,
@@ -249,6 +260,7 @@ const BATCH = 32;
 export class Index {
   #state: IndexState;
   #dim: number;
+  #settings: Readonly<IndexSettings> | null;
 
   constructor(options: IndexOptions) {
     let handle: unknown;
@@ -280,6 +292,20 @@ export class Index {
     }
     this.#state = adoptIndex(this, handle);
     this.#dim = native().indexDim(handle);
+    // Read back rather than remembered from the options, so a loaded index reports what
+    // it was saved with. An index saved through the Zig API can carry options the C
+    // configuration has no field for; it works, but cannot describe itself.
+    const cfg: { dim?: number; bits?: number; metric?: number; seed?: number | bigint; compact?: number } = {};
+    this.#settings =
+      native().indexConfig(handle, cfg) === Status.OK
+        ? Object.freeze({
+            dim: cfg.dim as number,
+            bits: cfg.bits as number,
+            metric: METRIC_NAMES[cfg.metric as number],
+            seed: BigInt(cfg.seed as number | bigint),
+            compact: cfg.compact !== 0,
+          })
+        : null;
   }
 
   /** Rebuild an index from bytes produced by {@link Index.serialize}. */
@@ -322,6 +348,28 @@ export class Index {
 
   get bytesPerVector(): number {
     return Number(native().indexBytesPerVector(this.#handle()));
+  }
+
+  /**
+   * The settings the index was created with, or saved with if it was loaded. Passing
+   * them to `new Index` gives an index that encodes identically, apart from calibration
+   * (see {@link Index.calibrated}). Throws `ZQ_ERR_UNSUPPORTED` for an index saved
+   * through the Zig API with options these settings cannot describe.
+   */
+  get settings(): Readonly<IndexSettings> {
+    if (this.#settings === null) {
+      throw new ZquantError(
+        Status.ERR_UNSUPPORTED,
+        'settings',
+        'This index was saved through the Zig API with options the C configuration cannot describe',
+      );
+    }
+    return this.#settings;
+  }
+
+  /** Whether `calibrate` has been applied, here or before the index was saved. */
+  get calibrated(): boolean {
+    return native().indexCalibrated(this.#handle()) !== 0;
   }
 
   /** True once `close()` has been called. */

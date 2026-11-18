@@ -67,6 +67,41 @@ def test_round_trip_searches_and_grows_identically(metric, compact, calibrate):
             assert back.to_bytes() == ix.to_bytes()
 
 
+@pytest.mark.parametrize("metric, compact, seed", [("ip", True, 0x5EED), ("cosine", False, 0), ("l2", True, (1 << 64) - 1)])
+def test_settings_read_back_from_a_loaded_index(metric, compact, seed):
+    x = unit_rows(600, 40, seed=8, offset=0.5)
+    with zquant.Index(dim=40, bits=3, metric=metric, seed=seed, compact=compact) as ix:
+        assert (ix.bits, ix.metric, ix.seed, ix.compact, ix.calibrated) == (3, metric, seed, compact, False)
+        ix.calibrate(x)
+        assert ix.calibrated
+        ix.add(x)
+        data = ix.to_bytes()
+    with zquant.Index.from_bytes(data) as back:
+        assert (back.dim, back.bits, back.metric, back.seed, back.compact) == (40, 3, metric, seed, compact)
+        assert back.calibrated
+        assert f"bits=3 metric={metric}" in repr(back)
+        # The settings are enough to build an index that encodes identically.
+        with zquant.Index(dim=back.dim, bits=back.bits, metric=back.metric, seed=back.seed,
+                          compact=back.compact) as twin:
+            twin.calibrate(x)
+            twin.add(x)
+            assert twin.to_bytes() == data
+
+
+def test_inexpressible_settings_are_refused_not_guessed():
+    import zlib
+    with zquant.Index(dim=16) as ix:
+        ix.add(unit_rows(20, 16))
+        data = bytearray(ix.to_bytes())
+    data[22] = 1                    # the exact scan, which only the Zig API can set
+    data[-4:] = zlib.crc32(bytes(data[:-4])).to_bytes(4, "little")
+    with zquant.Index.from_bytes(bytes(data)) as back:
+        assert len(back) == 20 and back.dim == 16
+        with pytest.raises(zquant.UnsupportedError):
+            back.bits
+        assert "bits=" not in repr(back)
+
+
 @pytest.mark.parametrize("wrap", [bytes, bytearray, memoryview,
                                   lambda b: np.frombuffer(b, dtype=np.uint8)])
 def test_from_bytes_takes_any_bytes_like(wrap):

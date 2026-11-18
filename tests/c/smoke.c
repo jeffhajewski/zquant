@@ -15,6 +15,18 @@ static unsigned long long s = 88172645463325252ULL;
 static double rnd(void) { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return (double)(s >> 11) / 9007199254740992.0; }
 static float gauss(void) { double u = rnd(), v = rnd(); return (float)(sqrt(-2*log(u+1e-12))*cos(6.283185307*v)); }
 
+/* CRC-32 (IEEE), the checksum the save format ends with, so a test can edit a field. */
+static unsigned crc32_ieee(const unsigned char *p, size_t n) {
+    unsigned c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; i++) { c ^= p[i]; for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u))); }
+    return ~c;
+}
+
+static int same_config(zq_config a, zq_config b) {
+    return a.dim == b.dim && a.bits == b.bits && a.metric == b.metric && a.seed == b.seed &&
+           (a.compact != 0) == (b.compact != 0);
+}
+
 int main(void) {
     printf("zquant %s (built for %s, %s)\n", zq_version(), zq_build_cpu(), zq_build_kernels());
     /* The machine running the tests must be able to run the build under test. */
@@ -40,6 +52,19 @@ int main(void) {
 
     printf("count=%zu  dim=%u  bytes/vector=%zu\n",
            zq_index_count(ix), zq_index_dim(ix), zq_index_bytes_per_vector(ix));
+
+    /* Each configuration reads back as created; calibration is reported separately. */
+    {
+        zq_config other = { .dim = 100, .bits = 3, .metric = ZQ_METRIC_L2, .seed = 0xFFFFFFFFFFFFFFFFull, .compact = 0 };
+        zq_index *o = NULL; zq_config back;
+        if (zq_index_create(&other, &o) != ZQ_OK) { printf("FAIL create other\n"); return 1; }
+        if (zq_index_config(o, &back) != ZQ_OK || !same_config(back, other)) { printf("FAIL: config round trip\n"); return 1; }
+        if (zq_index_calibrated(o)) { printf("FAIL: fresh index reports calibration\n"); return 1; }
+        if (zq_index_config(ix, &back) != ZQ_OK || !same_config(back, cfg) || !zq_index_calibrated(ix)) {
+            printf("FAIL: calibrated index config\n"); return 1;
+        }
+        zq_index_free(o);
+    }
 
     /* calibrate after add must be refused, not crash */
     if (zq_index_calibrate(ix, base, N) != ZQ_ERR_STATE) { printf("FAIL: calibrate after add allowed\n"); return 1; }
@@ -136,6 +161,27 @@ int main(void) {
         zq_index *loaded = NULL; zq_searcher *lse = NULL;
         if (zq_index_deserialize(buf, size, &loaded) != ZQ_OK) { printf("FAIL deserialize\n"); return 1; }
         if (zq_index_count(loaded) != zq_index_count(ix)) { printf("FAIL: loaded count\n"); return 1; }
+        /* A loaded index reports the configuration it was saved with, and its calibration. */
+        zq_config got_cfg;
+        memset(&got_cfg, 0xAB, sizeof got_cfg);
+        if (zq_index_config(loaded, &got_cfg) != ZQ_OK || !same_config(got_cfg, cfg)) { printf("FAIL: loaded config\n"); return 1; }
+        if (!zq_index_calibrated(loaded)) { printf("FAIL: loaded index lost its calibration\n"); return 1; }
+        if (zq_index_config(loaded, NULL) != ZQ_ERR_INVALID || zq_index_config(NULL, &got_cfg) != ZQ_ERR_INVALID) {
+            printf("FAIL: null config arguments accepted\n"); return 1;
+        }
+        /* Options zq_config has no field for (here the exact scan, byte 22, which only the
+         * Zig API sets) are refused rather than silently dropped. */
+        {
+            unsigned char *edited = malloc(size);
+            memcpy(edited, buf, size);
+            edited[22] = 1;
+            unsigned crc = crc32_ieee(edited, size - 4);
+            for (int b = 0; b < 4; b++) edited[size - 4 + b] = (unsigned char)(crc >> (8 * b));
+            zq_index *exact = NULL;
+            if (zq_index_deserialize(edited, size, &exact) != ZQ_OK) { printf("FAIL: exact-scan index did not load\n"); return 1; }
+            if (zq_index_config(exact, &got_cfg) != ZQ_ERR_UNSUPPORTED) { printf("FAIL: inexpressible config reported\n"); return 1; }
+            zq_index_free(exact); free(edited);
+        }
         if (zq_searcher_create(loaded, 32, K, 1, &lse) != ZQ_OK) { printf("FAIL searcher loaded\n"); return 1; }
         uint32_t *lids = malloc(sizeof(uint32_t) * nq * K);
         float *lscores = malloc(sizeof(float) * nq * K);

@@ -43,6 +43,75 @@ test('a loaded index searches exactly as the saved one did', () => {
   }
 });
 
+test('a loaded index reports the settings it was saved with', () => {
+  const d = 40;
+  const x = corpus(600, d, 44, 0.5);
+  const cases = [
+    { metric: 'ip', compact: true, seed: 0x5eedn },
+    { metric: 'cosine', compact: false, seed: 0n },
+    { metric: 'l2', compact: true, seed: 0xffffffffffffffffn },
+  ] as const;
+  for (const c of cases) {
+    const ix = new Index({ dim: d, bits: 3, metric: c.metric, seed: c.seed, compact: c.compact });
+    try {
+      assert.deepEqual(ix.settings, { dim: d, bits: 3, metric: c.metric, seed: c.seed, compact: c.compact });
+      assert.equal(ix.calibrated, false);
+      ix.calibrate(x);
+      assert.equal(ix.calibrated, true);
+      ix.add(x);
+      const bytes = ix.serialize();
+      const back = Index.deserialize(bytes);
+      try {
+        assert.deepEqual(back.settings, ix.settings);
+        assert.equal(back.calibrated, true);
+        assert.ok(Object.isFrozen(back.settings));
+        // The settings are enough to build an index that encodes identically.
+        const twin = new Index(back.settings);
+        try {
+          twin.calibrate(x);
+          twin.add(x);
+          assert.deepEqual(twin.serialize(), bytes);
+        } finally {
+          twin.close();
+        }
+      } finally {
+        back.close();
+      }
+    } finally {
+      ix.close();
+    }
+  }
+});
+
+test('settings the C configuration cannot describe are refused, not guessed', () => {
+  const ix = new Index({ dim: 16 });
+  let bytes: Uint8Array;
+  try {
+    ix.add(corpus(20, 16, 45));
+    bytes = ix.serialize();
+  } finally {
+    ix.close();
+  }
+  bytes[22] = 1; // the exact scan, which only the Zig API can set
+  new DataView(bytes.buffer, bytes.byteOffset).setUint32(bytes.length - 4, crc32(bytes.subarray(0, bytes.length - 4)), true);
+  const back = Index.deserialize(bytes);
+  try {
+    assert.equal(back.size, 20);
+    assert.throws(() => back.settings, (e: unknown) => e instanceof ZquantError && e.status === Status.ERR_UNSUPPORTED);
+  } finally {
+    back.close();
+  }
+});
+
+function crc32(data: Uint8Array): number {
+  let c = 0xffffffff;
+  for (const byte of data) {
+    c ^= byte;
+    for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (0xedb88320 & -(c & 1));
+  }
+  return (c ^ 0xffffffff) >>> 0;
+}
+
 test('deserialize takes a Uint8Array view, a Buffer or an ArrayBuffer', () => {
   const ix = new Index({ dim: 8 });
   try {

@@ -166,6 +166,8 @@ def bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     decl("zq_index_count", [vp], size)
     decl("zq_index_bytes_per_vector", [vp], size)
     decl("zq_index_dim", [vp], ctypes.c_uint32)
+    decl("zq_index_config", [vp, ctypes.POINTER(Config)])
+    decl("zq_index_calibrated", [vp], ctypes.c_int)
 
     decl("zq_searcher_create", [vp, size, size, size, ctypes.POINTER(vp)])
     decl("zq_searcher_free", [vp], None)

@@ -128,6 +128,10 @@ vectors, exactly as the saved one did. A damaged or truncated file, or one writt
 incompatible version, gives an error matching `zquant.ErrFormat` instead of loading
 wrong.
 
+A loaded index knows how it was built. `index.Config()` returns the `Config` it was
+saved with, which `New` accepts, and `index.Calibrated()` says whether it was
+calibrated.
+
 ## Calibration
 
 Calibration fits a per-coordinate shift and scale, and must happen before the first

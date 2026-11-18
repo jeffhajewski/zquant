@@ -25,6 +25,7 @@ from ._sync import RWLock, SearcherPool
 from ._errors import (
     ZQ_ERR_FORMAT,
     ZQ_ERR_STATE,
+    ZQ_ERR_UNSUPPORTED,
     ZQ_OK,
     CpuNotSupportedError,
     FormatError,
@@ -64,6 +65,7 @@ MAX_DIM = 65536
 MAX_THREADS = 1024
 
 _METRICS = {"ip": 0, "inner_product": 0, "cosine": 1, "l2": 2}
+_METRIC_NAMES = {0: "ip", 1: "cosine", 2: "l2"}
 _U64_MAX = (1 << 64) - 1
 
 
@@ -230,6 +232,14 @@ class Index:
     def _adopt(self, handle: int) -> None:
         self._handle = handle
         self._dim = int(_LIB.zq_index_dim(handle))
+        # Read back rather than remembered from the constructor, so a loaded index
+        # reports what it was saved with. An index saved through the Zig API can carry
+        # options the C configuration has no field for; it works, but cannot say.
+        cfg = _lib.Config()
+        if _LIB.zq_index_config(handle, ctypes.byref(cfg)) == ZQ_OK:
+            self._config = (int(cfg.bits), _METRIC_NAMES[cfg.metric], int(cfg.seed), bool(cfg.compact))
+        else:
+            self._config = None
         self._rw = RWLock()
         self._pool = SearcherPool(_create_searcher, _free_searcher)
 
@@ -275,6 +285,37 @@ class Index:
     @property
     def dim(self) -> int:
         return self._dim
+
+    def _setting(self, i: int):
+        if self._config is None:
+            raise UnsupportedError(
+                "this index was saved through the Zig API with options the C "
+                "configuration cannot describe", ZQ_ERR_UNSUPPORTED)
+        return self._config[i]
+
+    @property
+    def bits(self) -> int:
+        """Bits per coordinate, as passed to the constructor or saved in the file."""
+        return self._setting(0)
+
+    @property
+    def metric(self) -> str:
+        """`"ip"`, `"cosine"` or `"l2"`."""
+        return self._setting(1)
+
+    @property
+    def seed(self) -> int:
+        return self._setting(2)
+
+    @property
+    def compact(self) -> bool:
+        return self._setting(3)
+
+    @property
+    def calibrated(self) -> bool:
+        """Whether `calibrate` has been applied, here or before the index was saved."""
+        with self._rw.read():
+            return bool(_LIB.zq_index_calibrated(self._live()))
 
     def __len__(self) -> int:
         with self._rw.read():
@@ -524,7 +565,8 @@ class Index:
                 return f"<zquant.Index dim={self._dim} closed>"
             n = _LIB.zq_index_count(self._handle)
             bpv = _LIB.zq_index_bytes_per_vector(self._handle)
-        return f"<zquant.Index dim={self._dim} vectors={n} {bpv}B/vector>"
+        settings = "" if self._config is None else f" bits={self._config[0]} metric={self._config[1]}"
+        return f"<zquant.Index dim={self._dim}{settings} vectors={n} {bpv}B/vector>"
 
 
 class Codec:

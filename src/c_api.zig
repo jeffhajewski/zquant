@@ -264,6 +264,43 @@ export fn zq_index_dim(index: ?*const Index) u32 {
     return ix.inner.dim();
 }
 
+/// The configuration the index was created with, or was saved with if it was loaded.
+/// Creating an index from it gives one that encodes and scores identically, apart
+/// from calibration, which `zq_index_calibrated` reports.
+export fn zq_index_config(index: ?*const Index, out: ?*ZqConfig) c_int {
+    const ix = index orelse return ZQ_ERR_INVALID;
+    const slot = out orelse return ZQ_ERR_INVALID;
+    const p = ix.inner.params;
+    // A file written through the Zig API can carry options zq_config has no field for
+    // (a dense rotation, the QJL correction, the exact scan). A config that silently
+    // dropped them would build a different index, so say so instead.
+    const expressible: zq.flat.Params = .{
+        .dim = p.dim,
+        .bits = p.bits,
+        .metric = p.metric,
+        .seed = p.seed,
+        .residency = p.residency,
+    };
+    if (!std.meta.eql(p, expressible)) return ZQ_ERR_UNSUPPORTED;
+    slot.* = .{
+        .dim = p.dim,
+        .bits = p.bits,
+        .metric = switch (p.metric) {
+            .inner_product => ZQ_METRIC_INNER_PRODUCT,
+            .cosine => ZQ_METRIC_COSINE,
+            .l2 => ZQ_METRIC_L2,
+        },
+        .seed = p.seed,
+        .compact = @intFromBool(p.residency == .compact),
+    };
+    return ZQ_OK;
+}
+
+export fn zq_index_calibrated(index: ?*const Index) c_int {
+    const ix = index orelse return 0;
+    return @intFromBool(ix.inner.calibrated);
+}
+
 /// `threads` of 0 or 1 searches on the calling thread. Greater than 1 spreads queries
 /// across that many workers, which is only worthwhile for batches of at least that size.
 export fn zq_searcher_create(

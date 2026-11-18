@@ -3,14 +3,95 @@ package zquant
 import (
 	"bytes"
 	"encoding"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io/fs"
 	"path/filepath"
 	"testing"
 )
 
 var _ encoding.BinaryMarshaler = (*Index)(nil)
+
+func TestConfigReadsBackFromALoadedIndex(t *testing.T) {
+	const d = 40
+	x := corpus(600, d, 73, 0.5)
+	for _, cfg := range []Config{
+		{Dim: d, Bits: 3, Metric: InnerProduct, Seed: 0x5EED},
+		{Dim: d, Bits: 3, Metric: Cosine, Seed: 7, Expanded: true},
+		{Dim: d, Bits: 3, Metric: L2, Seed: ^uint64(0)},
+	} {
+		ix, err := New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, err := ix.Config(); err != nil || got != cfg {
+			t.Fatalf("new index: Config() = %+v, %v; want %+v", got, err, cfg)
+		}
+		if ix.Calibrated() {
+			t.Fatal("fresh index reports calibration")
+		}
+		if err := ix.Calibrate(x); err != nil {
+			t.Fatal(err)
+		}
+		ix.Add(x)
+		data, _ := ix.MarshalBinary()
+		ix.Close()
+
+		back, err := FromBytes(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := back.Config()
+		if err != nil || got != cfg || !back.Calibrated() {
+			t.Fatalf("loaded: Config() = %+v, %v, calibrated %v; want %+v", got, err, back.Calibrated(), cfg)
+		}
+		// The configuration is enough to build an index that encodes identically.
+		twin, err := New(got)
+		if err != nil {
+			t.Fatal(err)
+		}
+		twin.Calibrate(x)
+		twin.Add(x)
+		if twinData, _ := twin.MarshalBinary(); !bytes.Equal(twinData, data) {
+			t.Fatalf("%+v: an index built from Config() encodes differently", cfg)
+		}
+		twin.Close()
+		back.Close()
+		if back.Calibrated() {
+			t.Fatal("closed index reports calibration")
+		}
+	}
+
+	// Defaults are reported as the values in effect.
+	ix, _ := New(Config{Dim: 8})
+	defer ix.Close()
+	if got, _ := ix.Config(); got.Bits != 5 || got.Seed != 0x5EED {
+		t.Fatalf("defaults read back as Bits %d Seed %#x", got.Bits, got.Seed)
+	}
+}
+
+func TestConfigRefusesWhatItCannotDescribe(t *testing.T) {
+	ix, _ := New(Config{Dim: 16})
+	ix.Add(corpus(20, 16, 74, 0))
+	data, _ := ix.MarshalBinary()
+	ix.Close()
+	data[22] = 1 // the exact scan, which only the Zig API can set
+	crc := crc32.ChecksumIEEE(data[:len(data)-4])
+	binary.LittleEndian.PutUint32(data[len(data)-4:], crc)
+	back, err := FromBytes(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer back.Close()
+	if back.Len() != 20 {
+		t.Fatalf("Len %d", back.Len())
+	}
+	if _, err := back.Config(); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("Config() error %v, want ErrUnsupported", err)
+	}
+}
 
 func TestRoundTrip(t *testing.T) {
 	const d = 96

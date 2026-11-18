@@ -193,6 +193,14 @@ searches, and accepts new vectors, exactly as the saved one did. Anything that i
 intact index from a compatible version throws a `ZquantError` with code
 `ZQ_ERR_FORMAT`; damaged bytes never crash the process.
 
+A loaded index knows how it was built. `index.settings` gives the `dim`, `bits`,
+`metric`, `seed` and `compact` it was saved with, in a form `new Index()` accepts, and
+`index.calibrated` says whether it was calibrated:
+
+```ts
+const twin = new Index(again.settings);     // encodes exactly as `again` does
+```
+
 ## Codec: storing vectors rather than searching them
 
 An index answers "which stored vectors best match this query". Sometimes you want

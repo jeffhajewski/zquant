@@ -177,6 +177,12 @@ type Index struct {
 	dim    int
 	id     uint64
 
+	// cfg is read back from the library once, so a loaded index reports what it was
+	// saved with. cfgErr is set instead for an index saved through the Zig API with
+	// options Config has no field for.
+	cfg    Config
+	cfgErr error
+
 	// cacheMu guards cache. It is only taken with mu already held, shared or
 	// exclusive, so the lock order is always mu then cacheMu.
 	cacheMu sync.Mutex
@@ -233,6 +239,16 @@ func wrapIndex(handle *C.zq_index) *Index {
 		id:     indexIDs.Add(1),
 		cache:  map[[2]int]*Searcher{},
 	}
+	var c C.zq_config
+	if ix.cfgErr = check(C.zq_index_config(handle, &c), "Config"); ix.cfgErr == nil {
+		ix.cfg = Config{
+			Dim:      int(c.dim),
+			Bits:     int(c.bits),
+			Metric:   Metric(c.metric),
+			Seed:     uint64(c.seed),
+			Expanded: c.compact == 0,
+		}
+	}
 	// A finalizer is a backstop, not the contract: callers should Close. Without it a
 	// dropped Index leaks native memory the garbage collector cannot see. Nothing the
 	// Index reaches points back at it, so it never sits in a cycle, which would stop
@@ -271,6 +287,30 @@ const errIndexClosed = closedError("index")
 
 // Dim reports the vector dimension.
 func (ix *Index) Dim() int { return ix.dim }
+
+// Config reports the configuration the index was created with, or saved with if it was
+// loaded, for when all you have is a file. Passing it to New gives an index that
+// encodes identically, apart from calibration (see Calibrated). An index saved through
+// the Zig API with options Config cannot describe gives an error matching
+// ErrUnsupported.
+//
+// Bits and Seed are the values in effect, never the zero that New reads as "the
+// default". One consequence: another binding can create an index whose seed really is
+// 0, and since New turns a zero Seed into the default, New cannot recreate that one.
+func (ix *Index) Config() (Config, error) { return ix.cfg, ix.cfgErr }
+
+// Calibrated reports whether Calibrate was applied, here or before the index was
+// saved. It reports false once the index is closed.
+func (ix *Index) Calibrated() bool {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	if ix.handle == nil {
+		return false
+	}
+	calibrated := C.zq_index_calibrated(ix.handle) != 0
+	runtime.KeepAlive(ix)
+	return calibrated
+}
 
 // Len reports how many vectors the index holds, or 0 once it is closed.
 func (ix *Index) Len() int {

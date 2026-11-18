@@ -155,6 +155,15 @@ index searches and accepts new vectors exactly as the saved one did. `save` writ
 temporary file and renames it, so a crash halfway never leaves a truncated file behind.
 Anything that isn't an intact index from a compatible version raises `FormatError`.
 
+A loaded index knows how it was built: `index.bits`, `index.metric`, `index.seed`,
+`index.compact` and `index.calibrated` report what was saved, so a file is enough to
+build a matching index:
+
+```python
+twin = zquant.Index(dim=index.dim, bits=index.bits, metric=index.metric,
+                    seed=index.seed, compact=index.compact)
+```
+
 ## Threads
 
 An `Index` can be shared between threads.

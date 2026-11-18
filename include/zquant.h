@@ -121,6 +121,14 @@ size_t   zq_index_count(const zq_index *index);
 size_t   zq_index_bytes_per_vector(const zq_index *index);
 uint32_t zq_index_dim(const zq_index *index);
 
+/* The configuration the index was created with, or saved with if it was loaded, for
+ * when all you have is a file. Passing it to zq_index_create gives an index that
+ * encodes and scores identically, except for calibration, which that does not carry:
+ * zq_index_calibrated is non-zero if the index was calibrated. An index saved through
+ * the Zig API with options zq_config cannot express gives ZQ_ERR_UNSUPPORTED. */
+zq_status zq_index_config(const zq_index *index, zq_config *out);
+int       zq_index_calibrated(const zq_index *index);
+
 /* threads <= 1 searches on the calling thread; greater spreads queries across workers,
  * up to ZQ_MAX_THREADS. Capacity is batch, or threads*batch when threaded. Sizes whose
  * product overflows are rejected with ZQ_ERR_INVALID. */

@@ -220,7 +220,8 @@ and FAISS both use all cores inside `search()`.
 **Against turbovec, recall is a tie and throughput is ours.** 0.907 against 0.904 at 68 B on
 SIFT; 0.916 against 0.914 at 132 B on nytimes; 0.737 against 0.743 at 68 B on nytimes, where
 *they* are ahead by 0.6 points. Storage is identical — their serialized form is the same size
-as our compact one. Throughput is **1.2–1.8× ours** across every matched pair. Their resident
+as our compact one. Our throughput is **1.2–1.9× theirs** across every matched pair (1.86× and
+1.83× on SIFT, 1.22× and 1.24× on nytimes). Their resident
 footprint is larger (270 B against our 132 B) because they dequantize to int8 in memory; our
 `expanded` mode at 260 B is what corresponds to their in-memory form.
 
@@ -251,9 +252,9 @@ orthogonal QJL sketch gives exact rather than asymptotic normalization plus ~2.7
 lower inner-product distortion. See [docs/DESIGN.md](docs/DESIGN.md) §1.2.
 
 See [docs/comparison.md](docs/comparison.md) for the measured comparison against FAISS PQ,
-FAISS RaBitQ, and turbovec. zquant currently **loses at every matched storage budget**;
-the gap is localized to the estimator and the quantizer itself measures at theoretical
-optimum.
+FAISS RaBitQ, and turbovec. The tables above summarize it. FAISS PQ has better recall per byte
+below about 32 B. From there up, zquant matches turbovec, beats PQ and RaBitQ, and is the fastest
+of the four.
 
 ## Building
 

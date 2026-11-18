@@ -141,6 +141,16 @@ between rounds to mix across blocks (`768 = 3·256` works cleanly). Fall back to
 `d` has an awkward factorization; the pad width is recorded in the header so the density parameter
 uses the *padded* dimension.
 
+*As built* (`src/math/rotation.zig`), the cross-block mixing is a Haar-random `m×m` orthogonal
+matrix rather than a permutation, so each round is `(Q_r ⊗ H_B)·D_r`. A single round then makes
+every output depend on every input, and it stays in place and allocation-free, which a
+permutation does not without scratch. The working dimension is the smallest `m·2^a ≥ d` with `m`
+odd and at most 15 and `2^a ≥ 128`. That keeps it a multiple of 128, which every vectorized
+kernel needs, and makes 384, 768, 1536 and 3072 exact. Powers of two and `d ≤ 128` keep the
+plain transform, so their codes did not change. It passes the same moment, mixing and dense-
+reference tests as the power-of-two path. On fashion-mnist (`d=784 → 896`, not 1024) it saves 12%
+of storage at 0.5 points of R@10.
+
 ---
 
 ## 2. Scope and non-goals
@@ -424,6 +434,13 @@ cgo over the same C ABI. `purego`/dlopen is evaluated as a cgo-free alternative 
 ## 6. On-disk format
 
 Versioned, little-endian, mmap-able, 64-byte aligned sections.
+
+*As built* (`src/index/persist.zig`), the format is simpler than this plan. It is not
+aligned or mmap-able; loading copies. The CRC covers the whole file, not just the header,
+since loading is a single pass anyway. `codebook_id` became `encoding_version`, which pins
+the codes as a whole: rotation, codebook and packing. `tests/golden.zig` names it next to
+the hashes it covers. There are no external ids, because the index has none. The layout
+table is at the top of `persist.zig`.
 
 ```
 header:  magic "ZQNT" | format_version | dim | dim_padded | bits | objective

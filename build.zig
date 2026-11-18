@@ -9,6 +9,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    addKernelLevels(b, zquant, target, optimize, false);
 
     // C ABI: a static and a shared library, plus the header. This is what the Python,
     // JavaScript and Go clients link against; see include/zquant.h.
@@ -32,6 +33,7 @@ pub fn build(b: *std.Build) void {
         .strip = lib_strip,
     });
     c_api.link_libc = true;
+    addKernelLevels(b, c_api, target, lib_optimize, lib_strip);
 
     // The runtime CPU check (src/cpu_probe.zig), compiled for the architecture
     // *baseline* so that it can run on any CPU of the architecture — including one that
@@ -153,6 +155,16 @@ pub fn build(b: *std.Build) void {
         "Optimization mode for benchmarks (default ReleaseFast)",
     ) orelse .ReleaseFast;
 
+    // The benches' own copy of the module, so the kernel levels linked into them are
+    // built at `bench_optimize` too: a ReleaseFast bench calling Debug kernels through
+    // the dispatch would measure the wrong thing.
+    const bench_zquant = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+    });
+    addKernelLevels(b, bench_zquant, target, bench_optimize, false);
+
     const bench_step = b.step("bench", "Run all benchmarks");
     for ([_][]const u8{ "encode_bench", "scan_bench", "recall_bench", "index_bench", "sift_bench", "sift_verify", "compare_bench", "diagnose", "kernel_bench", "multiq_bench", "ablate_bench", "lowbit_bench", "quickbench", "kv_bench", "tile_bench" }) |name| {
         const exe = b.addExecutable(.{
@@ -161,7 +173,7 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path(b.fmt("bench/{s}.zig", .{name})),
                 .target = target,
                 .optimize = bench_optimize,
-                .imports = &.{.{ .name = "zquant", .module = zquant }},
+                .imports = &.{.{ .name = "zquant", .module = bench_zquant }},
                 // libc for the monotonic clock; see bench/timer.zig.
                 .link_libc = true,
             }),
@@ -171,6 +183,63 @@ pub fn build(b: *std.Build) void {
         // Each bench is also its own step, so one can be run alone.
         b.step(name, b.fmt("Run {s}", .{name})).dependOn(&run.step);
     }
+}
+
+/// CPU levels above the target's whose scan kernels are worth having: their own copy,
+/// compiled for that level, which src/simd/dispatch.zig runs when the CPU has it.
+///
+/// One today: x86_64 builds with SSSE3 but not AVX2, which is what releases target
+/// (x86_64_v2), also get the AVX2 kernels. Measured on a Zen 3 runner they are
+/// 1.3-1.8x the 128-bit ones, and search through the library is 1.72x at bits=5. A
+/// build without SSSE3 is the portable one, used only on CPUs that could not run
+/// these either, and a build with AVX2 compiles the wide kernels in already.
+fn kernelLevelCpus(target: std.Build.ResolvedTarget) []const *const std.Target.Cpu.Model {
+    const t = target.result;
+    if (t.cpu.arch != .x86_64) return &.{};
+    const has = std.Target.x86.featureSetHas;
+    if (!has(t.cpu.features, .ssse3) or has(t.cpu.features, .avx2)) return &.{};
+    return &.{&std.Target.x86.cpu.x86_64_v3};
+}
+
+/// Compiles src/kernel_entry.zig for each of `kernelLevelCpus` and links it into
+/// `module`, and tells src/simd/dispatch.zig what it has. Every module that compiles
+/// the index needs this, since the dispatch refers to the levels' symbols.
+fn addKernelLevels(
+    b: *std.Build,
+    module: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    strip: bool,
+) void {
+    var spec: std.ArrayList(u8) = .empty;
+    for (kernelLevelCpus(target)) |cpu| {
+        var query = target.query;
+        query.cpu_model = .{ .explicit = cpu };
+        query.cpu_features_add = .empty;
+        query.cpu_features_sub = .empty;
+        const level_target = b.resolveTargetQuery(query);
+
+        const options = b.addOptions();
+        options.addOption([]const u8, "name", cpu.name);
+        const entry = b.createModule(.{
+            .root_source_file = b.path("src/kernel_entry.zig"),
+            .target = level_target,
+            .optimize = optimize,
+            .strip = strip,
+            .pic = true,
+        });
+        entry.addOptions("kernel_options", options);
+        module.addObject(b.addObject(.{
+            .name = b.fmt("zquant_kernels_{s}", .{cpu.name}),
+            .root_module = entry,
+        }));
+
+        if (spec.items.len > 0) spec.append(b.allocator, ';') catch @panic("OOM");
+        spec.print(b.allocator, "{s}:{s}", .{ cpu.name, requiredCpuFeatures(b, level_target) }) catch @panic("OOM");
+    }
+    const options = b.addOptions();
+    options.addOption([]const u8, "levels", spec.items);
+    module.addOptions("dispatch_options", options);
 }
 
 /// Instruction-set features the target enables beyond its architecture's baseline, as

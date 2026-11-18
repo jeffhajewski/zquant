@@ -91,16 +91,13 @@ export fn zq_version() [*:0]const u8 {
     return "0.1.0";
 }
 
-/// Which kernels this build compiled to: native instructions or the portable scalar
-/// fallback. The string sits in the binary as a literal, so CI checks a cross-compiled
-/// release with `grep -a` instead of a disassembler for a foreign architecture.
-const kernels = std.fmt.comptimePrint("zquant-kernels shuffle={s} dot={s}", .{
-    if (zq.simd_shuffle.accelerated) "native" else "scalar",
-    if (zq.simd_dot.accelerated) "native" else "scalar",
-});
-
+/// Which scan kernels searches use: native instructions or the portable scalar
+/// fallback, and on x86_64 whether the 256-bit (AVX2) ones were chosen for this CPU
+/// (`simd/dispatch.zig`). Each candidate's string sits in the binary as a literal, so
+/// CI checks a cross-compiled release with `grep -a` instead of a disassembler for a
+/// foreign architecture.
 export fn zq_build_kernels() [*:0]const u8 {
-    return kernels;
+    return zq.simd_dispatch.description();
 }
 
 export fn zq_status_string(status: c_int) [*:0]const u8 {

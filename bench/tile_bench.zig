@@ -8,9 +8,11 @@
 //!
 //! This times every compact and expanded kernel the index uses at several tile
 //! shapes, scoring the same codes against the same 36 queries, and reports each
-//! shape's throughput against the 128-bit 4x4. On x86_64 with AVX2 it also times the
-//! 256-bit kernels (VNNI where the CPU has it) against the 128-bit ones. It is a means of choosing the shape; quickbench,
-//! which goes through the public API, is what confirms a choice.
+//! shape's throughput against the 128-bit 4x4. In a build with AVX2 it also times the
+//! 256-bit kernels (VNNI where the build has it) against the 128-bit ones. It is a
+//! means of choosing; quickbench, which goes through the public API, confirms a choice.
+//!
+//! The answer, on x86_64 and arm64 alike, was to keep 4x4 (docs/notes.md).
 
 const std = @import("std");
 const builtin = @import("builtin");

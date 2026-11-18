@@ -65,8 +65,12 @@ int zq_cpu_supported(void);
 /* The CPU model this build was compiled for, e.g. "x86_64_v2", for diagnostics. */
 const char *zq_build_cpu(void);
 
-/* Which scan kernels this build uses, e.g. "zquant-kernels shuffle=native dot=native".
- * "scalar" means the portable fallback, which is correct but several times slower. */
+/* Which scan kernels searches use, e.g. "zquant-kernels shuffle=native dot=native".
+ * "scalar" means the portable fallback, which is correct but several times slower. An
+ * x86_64 build below AVX2 also carries kernels compiled for AVX2 and uses them on a CPU
+ * that has it, reporting "... wide=avx2"; the scores are identical either way. Setting
+ * ZQUANT_KERNELS=none in the environment before loading the library keeps it to its
+ * own kernels. */
 const char *zq_build_kernels(void);
 
 zq_status zq_index_create(const zq_config *config, zq_index **out);

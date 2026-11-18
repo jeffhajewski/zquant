@@ -20,6 +20,8 @@ pub const simd_scan = @import("simd/scan.zig");
 pub const simd_bitmask = @import("simd/bitmask.zig");
 pub const simd_shuffle = @import("simd/shuffle.zig");
 pub const simd_dot = @import("simd/dot.zig");
+pub const simd_tiles = @import("simd/tiles.zig");
+pub const simd_dispatch = @import("simd/dispatch.zig");
 pub const simd_sketch = @import("simd/sketch.zig");
 
 pub const topk = @import("index/topk.zig");

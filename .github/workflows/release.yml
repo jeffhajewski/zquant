@@ -58,6 +58,12 @@ jobs:
           grep -a -o 'zquant-kernels [a-z=]* [a-z=]*' "$lib"
           grep -a -q 'zquant-kernels shuffle=native dot=native' "$lib"
 
+      # x86_64 builds below AVX2 also carry the AVX2 kernels, chosen at run time
+      # (src/simd/dispatch.zig). Their description is in the binary as well.
+      - name: Check the AVX2 kernels are linked in
+        if: startsWith(matrix.target, 'x86_64') && matrix.lib == 'zquant'
+        run: grep -a -q 'zquant-kernels shuffle=native dot=native wide=avx2' "$(find zig-out -name '*.so' -o -name '*.dylib' -o -name '*.dll' | head -1)"
+
       # Linux libraries target glibc 2.17 (RHEL 7, and the manylinux_2_17 wheels'
       # promise). The default Zig picks is newer: the arm64 library imported exp and log
       # at GLIBC_2.29 and would not load on RHEL 8, Debian 10 or Amazon Linux 2. The

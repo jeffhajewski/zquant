@@ -92,11 +92,17 @@ pub fn main() !void {
     const random = prng.random();
 
     std.debug.print(
-        \\zquant quickbench — {s}, {d} threads available
+        \\zquant quickbench — {s} ({s}), {d} threads available
+        \\  {s}
         \\  {d} vectors x {d} dims, {d} queries, k={d}, exact ground truth
         \\
         \\
-    , .{ @tagName(@import("builtin").cpu.arch), std.Thread.getCpuCount() catch 0, n, dim, nq, k });
+    , .{
+        @tagName(@import("builtin").cpu.arch),         @import("builtin").cpu.model.name,
+        std.Thread.getCpuCount() catch 0,              zq.simd_dispatch.description(),
+        n,                                             dim,
+        nq,                                            k,
+    });
 
     const corpus = try a.alloc(f32, n * dim);
     defer a.free(corpus);

@@ -24,8 +24,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # The release CPU level first, then everything this runner has.
-          - { os: ubuntu-latest,    cpus: "x86_64_v2 x86_64_v3 native" }
+          # The release CPU level first, then everything this runner has. An x86_64_v2
+          # build runs AVX2 kernels where the CPU has them (src/simd/dispatch.zig), so
+          # its quickbench also runs with ZQUANT_KERNELS=none, which keeps it to its own
+          # 128-bit ones: the release library on a CPU without AVX2, and with it.
+          - { os: ubuntu-latest,    cpus: "x86_64_v2 native" }
           - { os: ubuntu-24.04-arm, cpus: "generic+dotprod native" }
 
     steps:
@@ -46,14 +49,19 @@ jobs:
             echo "Relevant features: $(grep -o -w -E 'ssse3|avx2|avx512f|avx512vnni|avx_vnni|asimddp' /proc/cpuinfo | sort -u | tr '\n' ' ')"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+          run() {
+            "$@" 2>&1 | tee out.txt
+            {
+              echo "#### $*"
+              echo '```'
+              cat out.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
           for cpu in ${{ matrix.cpus }}; do
-            for bench in tile_bench quickbench; do
-              zig build "$bench" -Dcpu="$cpu" 2>&1 | tee out.txt
-              {
-                echo "#### $bench, -Dcpu=$cpu"
-                echo '```'
-                cat out.txt
-                echo '```'
-              } >> "$GITHUB_STEP_SUMMARY"
-            done
+            run zig build tile_bench -Dcpu="$cpu"
+            run zig build quickbench -Dcpu="$cpu"
+            if [ "$cpu" = x86_64_v2 ]; then
+              run env ZQUANT_KERNELS=none zig build quickbench -Dcpu="$cpu"
+            fi
           done

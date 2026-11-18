@@ -27,6 +27,8 @@ const Allocator = std.mem.Allocator;
 const prod_mod = @import("../quant/prod.zig");
 const packing = @import("../quant/packing.zig");
 const scan = @import("../simd/scan.zig");
+const tiles = @import("../simd/tiles.zig");
+const dispatch = @import("../simd/dispatch.zig");
 const sketch_kernel = @import("../simd/sketch.zig");
 const topk = @import("topk.zig");
 const Density = @import("../math/density.zig").Density;
@@ -897,9 +899,10 @@ pub const FlatIndex = struct {
 
         // Vectors are tiled as well as queries: the group's query chunks stay in
         // registers across the tile, so the loop issues group + tile loads against
-        // tile*group SDOTs. See `scan.scoreExpandedTiled` for the accounting.
-        const tile = 4;
-        const group = 4;
+        // tile*group SDOTs. See `scan.scoreExpandedTiled` for the accounting. The
+        // tiles go through `dispatch`, which may run a copy of the kernels compiled for
+        // a wider instruction set than this build's (AVX2 in an x86_64_v2 release).
+        const tile = tiles.batch_tile;
         // Everything the inner loop would otherwise re-test per (vector, query) pair:
         // all three are fixed for the whole index.
         //
@@ -913,64 +916,39 @@ pub const FlatIndex = struct {
         const compact_width = if (use_simd) scan.multiWidth(self.layout) else 1;
         var mse_block: [tile * max_batch]f32 = undefined;
 
+        const can_tile = self.residency == .expanded or (use_simd and scan.canTile(self.layout));
+        const kernels = dispatch.active();
+        const job: tiles.Job = .{
+            .table = &searcher.table,
+            .queries = searcher.scan_queries.ptr,
+            .n = n,
+            .codes = self.codes.items.ptr,
+            .stride = stride,
+            .padded = @intCast(padded),
+            .bits = self.layout.bits,
+            .expanded = self.residency == .expanded,
+            .table_scale = self.table.scale,
+            .out = &mse_block,
+            .out_stride = max_batch,
+        };
+
         const total = self.scalars.items.len;
         var v0: usize = 0;
         while (v0 < total) : (v0 += tile) {
             const take = @min(tile, total - v0);
 
-            if (self.residency == .expanded) {
-                var i: usize = 0;
-                if (take == tile) {
-                    while (i + group <= n) : (i += group) {
-                        scan.scoreExpandedTiled(
-                            tile,
-                            group,
-                            @ptrCast(self.codes.items.ptr + v0 * stride),
-                            stride,
-                            searcher.scan_queries[i..],
-                            self.table.scale,
-                            padded,
-                            mse_block[i..],
-                            max_batch,
-                        );
-                    }
-                }
-                // Query and vector tails both fall back to the one-vector kernel.
-                while (i < n) : (i += 1) {
+            if (can_tile and take == tile) {
+                // Both amortizations at once: shared unpack and register-resident
+                // query chunks. Query tails are handled inside.
+                dispatch.batchTile(kernels, &job, v0);
+            } else if (self.residency == .expanded) {
+                // The last, partial tile.
+                for (0..n) |i| {
                     for (0..take) |u| {
                         mse_block[u * max_batch + i] = scan.scoreExpanded(
                             @ptrCast(self.codes.items[(v0 + u) * stride ..][0..stride]),
                             searcher.scan_queries[i],
                             self.table.scale,
-                            padded,
-                        );
-                    }
-                }
-            } else if (use_simd and take == tile and scan.canTile(self.layout)) {
-                // Both amortizations at once: shared unpack and register-resident
-                // query chunks.
-                var i: usize = 0;
-                while (i + group <= n) : (i += group) {
-                    scan.scoreInt8Tiled(
-                        tile,
-                        group,
-                        self.layout,
-                        searcher.table,
-                        searcher.scan_queries[i..],
-                        self.codes.items.ptr + v0 * stride,
-                        stride,
-                        padded,
-                        mse_block[i..],
-                        max_batch,
-                    );
-                }
-                while (i < n) : (i += 1) {
-                    for (0..take) |u| {
-                        mse_block[u * max_batch + i] = scan.scoreInt8(
-                            self.layout,
-                            searcher.table,
-                            searcher.scan_queries[i],
-                            self.codes.items[(v0 + u) * stride ..][0..stride],
                             padded,
                         );
                     }
@@ -1261,45 +1239,36 @@ pub const FlatIndex = struct {
         // vectors: the one query chunk stays in a register and is reused across the
         // tile, so the loop issues V + 1 loads against V SDOTs — 1.125 at V=8 against
         // the per-vector kernel's 2.0. Q=1 leaves registers nearly free, so the tile
-        // is wider here than in the batch path.
-        const tile = 8;
+        // is wider here than in the batch path. Tiles are scored a block at a time,
+        // so `dispatch` costs one indirect call per `block_tiles` of them.
+        const tile = tiles.single_tile;
+        const block_tiles = 8;
         const queries: [1]scan.Query = .{searcher.scan_query};
         const can_tile = use_simd and
             (self.residency == .expanded or scan.canTile(self.layout));
-        var block: [tile]f32 = undefined;
+        var block: [tile * block_tiles]f32 = undefined;
+        const kernels = dispatch.active();
+        const job: tiles.Job = .{
+            .table = &searcher.table,
+            .queries = &queries,
+            .n = 1,
+            .codes = self.codes.items.ptr,
+            .stride = stride,
+            .padded = @intCast(padded),
+            .bits = self.layout.bits,
+            .expanded = self.residency == .expanded,
+            .table_scale = self.table.scale,
+            .out = &block,
+            .out_stride = 1,
+        };
 
         const total = self.scalars.items.len;
         var v0: usize = 0;
-        while (v0 < total) : (v0 += tile) {
-            const take = @min(tile, total - v0);
-
-            if (can_tile and take == tile) {
-                switch (self.residency) {
-                    .expanded => scan.scoreExpandedTiled(
-                        tile,
-                        1,
-                        @ptrCast(self.codes.items.ptr + v0 * stride),
-                        stride,
-                        queries[0..],
-                        self.table.scale,
-                        padded,
-                        block[0..],
-                        1,
-                    ),
-                    .compact => scan.scoreInt8Tiled(
-                        tile,
-                        1,
-                        self.layout,
-                        searcher.table,
-                        queries[0..],
-                        self.codes.items.ptr + v0 * stride,
-                        stride,
-                        padded,
-                        block[0..],
-                        1,
-                    ),
-                }
-            } else for (0..take) |u| {
+        while (v0 < total) : (v0 += block.len) {
+            const take = @min(block.len, total - v0);
+            const tiled = if (can_tile) take / tile * tile else 0;
+            if (tiled > 0) dispatch.singleTiles(kernels, &job, v0, tiled / tile);
+            for (tiled..take) |u| {
                 block[u] = self.mseTermAt(v0 + u, prepared, searcher);
             }
 

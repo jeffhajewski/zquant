@@ -98,10 +98,10 @@ pub fn main() !void {
         \\
         \\
     , .{
-        @tagName(@import("builtin").cpu.arch),         @import("builtin").cpu.model.name,
-        std.Thread.getCpuCount() catch 0,              zq.simd_dispatch.description(),
-        n,                                             dim,
-        nq,                                            k,
+        @tagName(@import("builtin").cpu.arch), @import("builtin").cpu.model.name,
+        std.Thread.getCpuCount() catch 0,      zq.simd_dispatch.description(),
+        n,                                     dim,
+        nq,                                    k,
     });
 
     const corpus = try a.alloc(f32, n * dim);

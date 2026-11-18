@@ -13,12 +13,14 @@
   },
   "files": [
     "dist",
+    "prebuilds",
     "README.md"
   ],
   "scripts": {
     "build": "node scripts/clean.mjs dist && tsc -p tsconfig.build.json",
     "build:test": "node scripts/clean.mjs build-test && tsc -p tsconfig.json",
     "test": "npm run build && npm run build:test && node --test build-test/tests/*.test.js",
+    "pack:native": "sh scripts/pack.sh",
     "prepare": "npm run build"
   },
   "dependencies": {

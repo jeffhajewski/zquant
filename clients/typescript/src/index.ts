@@ -30,7 +30,7 @@ const METRICS: Record<Metric, number> = {
 export class ZquantError extends Error {
   readonly status: number;
   constructor(status: number, context: string) {
-    super(`${context}: ${native.statusString(status)} (${status})`);
+    super(`${context}: ${native().statusString(status)} (${status})`);
     this.name = 'ZquantError';
     this.status = status;
   }
@@ -41,7 +41,32 @@ function check(status: number, context: string): void {
 }
 
 export function version(): string {
-  return native.version();
+  return native().version();
+}
+
+export interface BuildInfo {
+  /** Library version, e.g. "0.1.0". */
+  version: string;
+  /** The CPU model the library was compiled for, e.g. "x86_64_v2" or "apple_m1". */
+  cpu: string;
+  /** Which scan kernels it uses. "scalar" means the portable fallback: correct, slower. */
+  kernels: string;
+  /** Absolute path of the library that was loaded. */
+  libraryPath: string;
+  /** True if this CPU could not run the release build and the portable one was loaded. */
+  portable: boolean;
+}
+
+/** What was loaded and what it was built for. Loads the library if it is not yet loaded. */
+export function buildInfo(): BuildInfo {
+  const n = native();
+  return {
+    version: n.version(),
+    cpu: n.buildCpu(),
+    kernels: n.buildKernels(),
+    libraryPath: n.path,
+    portable: n.portable,
+  };
 }
 
 export interface IndexOptions {
@@ -86,7 +111,7 @@ export class Index {
     }
     const out = [null];
     check(
-      native.indexCreate(
+      native().indexCreate(
         {
           dim: options.dim,
           bits: options.bits ?? 5,
@@ -107,11 +132,11 @@ export class Index {
   }
 
   get size(): number {
-    return Number(native.indexCount(this.#handle));
+    return Number(native().indexCount(this.#handle));
   }
 
   get bytesPerVector(): number {
-    return Number(native.indexBytesPerVector(this.#handle));
+    return Number(native().indexBytesPerVector(this.#handle));
   }
 
   /**
@@ -123,12 +148,12 @@ export class Index {
    */
   calibrate(sample: Vectors): void {
     const a = asRows(sample, this.#dim, 'sample');
-    check(native.indexCalibrate(this.#handle, a, a.length / this.#dim), 'calibrate');
+    check(native().indexCalibrate(this.#handle, a, a.length / this.#dim), 'calibrate');
   }
 
   add(vectors: Vectors): void {
     const a = asRows(vectors, this.#dim, 'vectors');
-    check(native.indexAdd(this.#handle, a, a.length / this.#dim), 'add');
+    check(native().indexAdd(this.#handle, a, a.length / this.#dim), 'add');
   }
 
   #searcher(k: number, threads: number): unknown {
@@ -136,7 +161,7 @@ export class Index {
     let s = this.#searchers.get(key);
     if (s === undefined) {
       const out = [null];
-      check(native.searcherCreate(this.#handle, 32, k, threads, out), 'searcherCreate');
+      check(native().searcherCreate(this.#handle, 32, k, threads, out), 'searcherCreate');
       s = out[0];
       this.#searchers.set(key, s);
     }
@@ -156,7 +181,7 @@ export class Index {
     const q = asRows(queries, this.#dim, 'queries');
     const nq = q.length / this.#dim;
     const searcher = this.#searcher(k, threads);
-    const capacity = Number(native.searcherCapacity(searcher));
+    const capacity = Number(native().searcherCapacity(searcher));
 
     const ids = new Uint32Array(nq * k);
     const scores = new Float32Array(nq * k);
@@ -167,7 +192,7 @@ export class Index {
       const idsChunk = new Uint32Array(n * k);
       const scoresChunk = new Float32Array(n * k);
       check(
-        native.search(
+        native().search(
           this.#handle,
           searcher,
           q.subarray(start * this.#dim, (start + n) * this.#dim),
@@ -184,10 +209,10 @@ export class Index {
   }
 
   close(): void {
-    for (const s of this.#searchers.values()) native.searcherFree(s);
+    for (const s of this.#searchers.values()) native().searcherFree(s);
     this.#searchers.clear();
     if (this.#handle) {
-      native.indexFree(this.#handle);
+      native().indexFree(this.#handle);
       this.#handle = null;
     }
   }

@@ -789,6 +789,39 @@ test "query round trips through quantization and the parity split" {
     }
 }
 
+test "neither quantizer emits -128" {
+    // The x86 dot product is exact only while the query side avoids -128 (see
+    // `simd/dot.zig`), and the table side feeds the expanded residency's stored
+    // values. Both clamp before rounding; this pins that against inputs built to
+    // land on the boundary: a lone negative extreme, which maps to exactly -127·scale,
+    // values a hair past it, and magnitudes at the edges of f32.
+    const extremes = [_]f32{ -1.0, -0.9999999, 1.0, -1e-30, 3e38, -3e38, 1e-38, -1e-38 };
+
+    var prng = std.Random.DefaultPrng.init(0x128);
+    const random = prng.random();
+    for (0..200) |trial| {
+        var centroids: [16]f32 = undefined;
+        for (&centroids) |*c| c.* = random.floatNorm(f32) * 3;
+        centroids[trial % 16] = extremes[trial % extremes.len];
+        if (trial % 3 == 0) centroids[(trial + 5) % 16] = -@abs(centroids[trial % 16]);
+        const table = Table.init(&centroids);
+        for (@as([16]i8, table.values)) |v| try testing.expect(v >= -127);
+    }
+
+    const dim: u32 = 64;
+    var query = try Query.init(testing.allocator, Layout.init(dim, 4));
+    defer query.deinit();
+    var rotated: [dim]f32 = undefined;
+    for (0..200) |trial| {
+        for (&rotated) |*v| v.* = random.floatNorm(f32);
+        rotated[trial % dim] = extremes[trial % extremes.len];
+        // The most negative value sets the scale, so it lands on exactly -127.
+        if (trial % 2 == 0) rotated[(trial + 7) % dim] = -@abs(rotated[trial % dim]) * 1.5;
+        query.load(&rotated);
+        for (query.data) |v| try testing.expect(v >= -127);
+    }
+}
+
 test "lookup matches a scalar table index" {
     // Guards the one construct whose lowering differs per architecture.
     var prng = std.Random.DefaultPrng.init(21);

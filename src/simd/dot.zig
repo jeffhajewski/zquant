@@ -14,6 +14,33 @@
 //! LLVM will not produce `SDOT` from the natural Zig formulation (tested: the 4-way
 //! grouping lowers to scalar `umov` extraction), so this is inline assembly for the
 //! same reason `simd/shuffle.zig` is.
+//!
+//! ## x86
+//!
+//! x86 has no signed×signed byte dot product short of VNNI, and even that
+//! (`vpdpbusd`) takes one operand unsigned. What SSSE3 has is `pmaddubsw`: unsigned
+//! × signed bytes, adjacent pairs summed into saturating i16. The standard route to
+//! signed×signed moves `a`'s sign onto `b`,
+//!
+//!     a·b = |a| · (sign(a)·b)          pmaddubsw(pabsb(a), psignb(b, a))
+//!
+//! then `pmaddwd` against ones sums adjacent i16 pairs into i32. Four lanes of four
+//! bytes each, the same lane assignment as `sdot` — so the paths agree lane for lane,
+//! not just in total. Four instructions where `sdot` is one. LLVM forms neither
+//! `pmaddubsw` nor `psignb` from the portable formulation (checked: it widens to i32
+//! and emits ~30 instructions), hence assembly again.
+//!
+//! **Range.** This is exact only while `b` avoids −128. `psignb` negates in i8, so
+//! −(−128) wraps back to −128 and the product takes the wrong sign; and the only pair
+//! that could reach i16 saturation, 2·128·128 = 32768, needs exactly that lane. With
+//! `b` in [−127, 127] a pair is bounded by 2·128·127 = 32512 < 32767 whatever `a` is
+//! (`pabsb(−128)` is 0x80, which `pmaddubsw` reads as unsigned 128 — still exact).
+//! Every caller passes the int8 query as `b`, and `scan.Query.load` clamps it to ±127;
+//! `scan.Table.init` clamps the other side too. Tests in `simd/scan.zig` pin both, and
+//! safety-checked builds assert it here.
+//!
+//! VNNI is not used: no machine this was developed on can execute it, and a kernel
+//! that has never run is not one to ship.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -26,14 +53,34 @@ const has_sdot = switch (builtin.cpu.arch) {
     else => false,
 };
 
-/// Whether the single-instruction path is available. False means correct but slower.
-pub const accelerated = has_sdot;
+const has_ssse3 = switch (builtin.cpu.arch) {
+    .x86, .x86_64 => std.Target.x86.featureSetHas(builtin.cpu.features, .ssse3),
+    else => false,
+};
+
+/// VEX encodings. A legacy-SSE instruction in AVX code pays a state transition or a
+/// false dependency (depending on the core) while the upper ymm halves are dirty, and
+/// LLVM uses ymm freely in the code around these.
+const has_avx = switch (builtin.cpu.arch) {
+    .x86, .x86_64 => std.Target.x86.featureSetHas(builtin.cpu.features, .avx),
+    else => false,
+};
+
+/// Whether a native dot-product path is available. False means correct but slower.
+pub const accelerated = has_sdot or has_ssse3;
 
 /// Four independent dot products of four int8 pairs each, accumulated into `acc`.
 ///
 /// Lane assignment is not meaningful to callers: the kernel sums all four lanes at
 /// the end, so only the total matters.
+///
+/// `b` must not contain −128 (see "Range" above); `a` may.
 pub inline fn accumulate(acc: Acc, a: Bytes, b: Bytes) Acc {
+    if (std.debug.runtime_safety) {
+        const raw: [16]i8 = b;
+        for (raw) |v| std.debug.assert(v != -128);
+    }
+
     if (comptime has_sdot) {
         var out = acc;
         asm ("sdot %[acc].4s, %[x].16b, %[y].16b"
@@ -43,7 +90,70 @@ pub inline fn accumulate(acc: Acc, a: Bytes, b: Bytes) Acc {
         );
         return out;
     }
+
+    if (comptime has_ssse3) {
+        // `@abs` is left to LLVM, which emits `pabsb` for it and can then share one
+        // across every query a table value is multiplied against.
+        const magnitude: Bytes = @bitCast(@abs(a));
+        return acc + maddPairs(maddubs(magnitude, signOf(a, b)));
+    }
+
     return scalar(acc, a, b);
+}
+
+/// `psignb`: `x` negated where `s` is negative, zeroed where `s` is zero. The zeroing
+/// is harmless here, since it happens exactly where `|a|` is zero.
+inline fn signOf(s: Bytes, x: Bytes) Bytes {
+    if (comptime has_avx) {
+        return asm ("vpsignb %[s], %[x], %[out]"
+            : [out] "=x" (-> Bytes),
+            : [x] "x" (x),
+              [s] "x" (s),
+        );
+    }
+    // Two-operand form: `x` is read and written.
+    var out = x;
+    asm ("psignb %[s], %[out]"
+        : [out] "+x" (out),
+        : [s] "x" (s),
+    );
+    return out;
+}
+
+/// `pmaddubsw`: `u` read as unsigned, `s` as signed, adjacent products summed into
+/// saturating i16.
+inline fn maddubs(u: Bytes, s: Bytes) @Vector(8, i16) {
+    if (comptime has_avx) {
+        return asm ("vpmaddubsw %[s], %[u], %[out]"
+            : [out] "=x" (-> @Vector(8, i16)),
+            : [u] "x" (u),
+              [s] "x" (s),
+        );
+    }
+    var out: @Vector(8, i16) = @bitCast(u);
+    asm ("pmaddubsw %[s], %[out]"
+        : [out] "+x" (out),
+        : [s] "x" (s),
+    );
+    return out;
+}
+
+/// `pmaddwd` against ones: adjacent i16 pairs summed into i32.
+inline fn maddPairs(x: @Vector(8, i16)) Acc {
+    const ones: @Vector(8, i16) = @splat(1);
+    if (comptime has_avx) {
+        return asm ("vpmaddwd %[ones], %[x], %[out]"
+            : [out] "=x" (-> Acc),
+            : [x] "x" (x),
+              [ones] "x" (ones),
+        );
+    }
+    var out: Acc = @bitCast(x);
+    asm ("pmaddwd %[ones], %[out]"
+        : [out] "+x" (out),
+        : [ones] "x" (ones),
+    );
+    return out;
 }
 
 /// Portable fallback. Widening multiply-accumulate, four products per lane.
@@ -75,7 +185,8 @@ test "accumulate matches a scalar dot product" {
         var bv: [16]i8 = undefined;
         var seed: [4]i32 = undefined;
         for (&av) |*v| v.* = random.intRangeAtMost(i8, -128, 127);
-        for (&bv) |*v| v.* = random.intRangeAtMost(i8, -128, 127);
+        // `b` is the query side, which never holds −128; `a` covers the full range.
+        for (&bv) |*v| v.* = random.intRangeAtMost(i8, -127, 127);
         for (&seed) |*v| v.* = random.intRangeAtMost(i32, -1000, 1000);
 
         const got: [4]i32 = accumulate(seed, av, bv);
@@ -109,4 +220,31 @@ test "negative values and zero" {
 
     const zeros: [16]i8 = @splat(0);
     try testing.expectEqual(@as(i32, 0), total(accumulate(zero, a, zeros)));
+}
+
+test "every pair the contract allows is exact" {
+    // Exhaustive over a in [-128, 127] and b in [-127, 127]. Broadcasting each pair to
+    // all 16 lanes makes every i16 intermediate on the x86 path as large as that pair
+    // can make it, so this covers the saturation edge (2·128·127 = 32512) as well as
+    // the sign handling: a = -128 reaches pmaddubsw as unsigned 128, and a negative a
+    // flips b's sign before the multiply.
+    const zero: Acc = @splat(0);
+    var a: i32 = -128;
+    while (a <= 127) : (a += 1) {
+        var b: i32 = -127;
+        while (b <= 127) : (b += 1) {
+            const av: [16]i8 = @splat(@intCast(a));
+            const bv: [16]i8 = @splat(@intCast(b));
+            const want: [4]i32 = @splat(4 * a * b);
+            try testing.expectEqualSlices(i32, &want, &@as([4]i32, accumulate(zero, av, bv)));
+        }
+    }
+
+    // Mixed signs within one pair, at the extremes, so the two products of a
+    // pmaddubsw pair cancel rather than add.
+    const mixed_a: [16]i8 = .{ -128, 127, -128, -128, 127, 127, -1, 1, -128, 0, 127, -127, 5, -5, 64, -64 };
+    const mixed_b: [16]i8 = .{ 127, -127, -127, -127, 127, 127, -127, 127, 127, -127, -127, 127, -127, -127, 127, -127 };
+    var reference: [4]i32 = @splat(0);
+    for (0..16) |i| reference[i / 4] += @as(i32, mixed_a[i]) * @as(i32, mixed_b[i]);
+    try testing.expectEqualSlices(i32, &reference, &@as([4]i32, accumulate(zero, mixed_a, mixed_b)));
 }

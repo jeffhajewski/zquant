@@ -47,7 +47,7 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
 
       - name: Build
-        run: zig build lib -Dtarget=${{ matrix.target }} -Dcpu=${{ matrix.cpu }} -Dlib-name=${{ matrix.lib }}
+        run: zig build lib -Dtarget=${{ matrix.target }} -Dcpu=${{ matrix.cpu }} -Dlib-name=${{ matrix.lib }} -Dstrip
 
       # The fast builds must contain the fast kernels: that is the reason for the CPU
       # choice, and a silent fall back to scalar code is what the releases used to ship.

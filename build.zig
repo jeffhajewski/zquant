@@ -21,10 +21,15 @@ pub fn build(b: *std.Build) void {
         "lib-opt",
         "Optimization mode for the C ABI library (default ReleaseFast)",
     ) orelse .ReleaseFast;
+    // Releases strip debug info. On Linux it is about 90% of the library (the x86_64
+    // release build is 1.96 MB with it, 183 KB without), and every Python wheel and npm
+    // install would carry it. macOS keeps it out of the dylib anyway.
+    const lib_strip = b.option(bool, "strip", "Strip debug info from the C ABI library") orelse false;
     const c_api = b.createModule(.{
         .root_source_file = b.path("src/c_api.zig"),
         .target = target,
         .optimize = lib_optimize,
+        .strip = lib_strip,
     });
     c_api.link_libc = true;
 

@@ -1,9 +1,16 @@
 /**
  * Native handle ownership.
  *
- * Each wrapper's native handles live in a small state object. Searchers sit in their
- * index's state, so they are always freed before the index they belong to, and a
- * searcher can only ever be used with the index it was created from.
+ * `close()` is the way to free an index or codec, and it frees at once. The
+ * FinalizationRegistry here is the safety net for one that is dropped without being
+ * closed: when the garbage collector reclaims the wrapper, the native memory goes too,
+ * rather than leaking until the process exits. Collection timing is up to the engine,
+ * so code that creates many indexes should still close them.
+ *
+ * Each wrapper's native handles live in a small state object that the registry holds,
+ * and that object must never refer back to the wrapper, or the wrapper could never be
+ * collected. Searchers sit in their index's state, so they are always freed before the
+ * index they belong to, whichever way it goes.
  */
 import { native } from './native.js';
 
@@ -40,10 +47,14 @@ function freeCodec(s: CodecState): void {
   live.codec--;
 }
 
+const indexes = new FinalizationRegistry<IndexState>(freeIndex);
+const codecs = new FinalizationRegistry<CodecState>(freeCodec);
+
 /** Start tracking a freshly created index handle on behalf of `owner`. */
-export function adoptIndex(_owner: object, handle: unknown): IndexState {
+export function adoptIndex(owner: object, handle: unknown): IndexState {
   const state: IndexState = { handle, searchers: new Map() };
   live.index++;
+  indexes.register(owner, state, state);
   return state;
 }
 
@@ -55,15 +66,18 @@ export function addSearcher(state: IndexState, key: string, handle: unknown): vo
 
 /** Free an index and its searchers now. Safe to call more than once. */
 export function releaseIndex(state: IndexState): void {
+  indexes.unregister(state);
   freeIndex(state);
 }
 
-export function adoptCodec(_owner: object, handle: unknown): CodecState {
+export function adoptCodec(owner: object, handle: unknown): CodecState {
   const state: CodecState = { handle };
   live.codec++;
+  codecs.register(owner, state, state);
   return state;
 }
 
 export function releaseCodec(state: CodecState): void {
+  codecs.unregister(state);
   freeCodec(state);
 }

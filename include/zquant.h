@@ -60,7 +60,9 @@ void      zq_index_free(zq_index *index);
  * It is not free - on low-rank zero-mean data it can cost recall. */
 zq_status zq_index_calibrate(zq_index *index, const float *rows, size_t n);
 
-/* Append n row-major vectors of dim floats each. */
+/* Append n row-major vectors of dim floats each. A batch containing any NaN or
+ * infinity is refused whole with ZQ_ERR_INVALID; nothing from it is added. Queries,
+ * calibration samples and codec input are checked the same way. */
 zq_status zq_index_add(zq_index *index, const float *rows, size_t n);
 
 size_t   zq_index_count(const zq_index *index);

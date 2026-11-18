@@ -362,6 +362,8 @@ pub const FlatIndex = struct {
         if (self.count() > 0) return error.IndexNotEmpty;
         const d = self.dim();
         std.debug.assert(sample.len % d == 0);
+        // One NaN poisons the column sort and with it a coordinate's fitted scale.
+        if (!allFinite(sample)) return error.NonFiniteInput;
         const rows = sample.len / d;
         if (rows < 2) return error.EmptySample;
 
@@ -425,6 +427,9 @@ pub const FlatIndex = struct {
     /// data-oblivious, so a vector's codes never depend on what was added before it.
     pub fn add(self: *FlatIndex, vector: []const f32) !u32 {
         std.debug.assert(vector.len == self.dim());
+        // A NaN or infinite coordinate encodes to a NaN norm and score, and a NaN in the
+        // collector breaks its ordering for every query, not just for this vector.
+        if (!allFinite(vector)) return error.NonFiniteInput;
 
         const stride = self.codeStride();
         const sketch_len = self.quantizer.sketchLen();
@@ -517,6 +522,9 @@ pub const FlatIndex = struct {
         const d = self.dim();
         std.debug.assert(vectors.len % d == 0);
         const n = vectors.len / d;
+        // Checked up front so a bad row late in the batch does not leave the rows
+        // before it added: a batch either goes in whole or not at all.
+        if (!allFinite(vectors)) return error.NonFiniteInput;
         try self.reserve(n);
         for (0..n) |i| _ = try self.add(vectors[i * d ..][0..d]);
     }
@@ -1212,6 +1220,24 @@ inline fn flushHot(
     for (staged[0..len.*]) |e| collector.offer(e.score, e.id);
     len.* = 0;
     threshold.* = collector.threshold();
+}
+
+/// Whether every value is finite. `v * 0` is zero for a finite `v` and NaN for an
+/// infinity or a NaN, so the sum is zero exactly when all are finite — a branch-free
+/// pass that costs far less than encoding the same values.
+pub fn allFinite(x: []const f32) bool {
+    const width = 16;
+    const V = @Vector(width, f32);
+    const zero: V = @splat(0);
+    var acc: V = zero;
+    var i: usize = 0;
+    while (i + width <= x.len) : (i += width) {
+        const v: V = x[i..][0..width].*;
+        acc += v * zero;
+    }
+    var tail: f32 = 0;
+    for (x[i..]) |v| tail += v * 0;
+    return @reduce(.Add, acc) + tail == 0;
 }
 
 fn euclideanNorm(x: []const f32) f32 {
@@ -2252,4 +2278,43 @@ test "batch search fills k results when some vectors score -inf" {
     for (0..nq) |q| {
         for (res[q * k ..][0..k]) |e| try testing.expect(e.id < n);
     }
+}
+
+test "allFinite flags NaN and both infinities anywhere in the slice" {
+    var buf: [37]f32 = undefined;
+    for (&buf, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i)) - 18.5;
+    try testing.expect(allFinite(&buf));
+    try testing.expect(allFinite(buf[0..0]));
+    // Positions inside the vector body and in the scalar tail.
+    for ([_]usize{ 0, 15, 16, 31, 32, 36 }) |pos| {
+        for ([_]f32{ std.math.nan(f32), std.math.inf(f32), -std.math.inf(f32) }) |bad| {
+            const saved = buf[pos];
+            buf[pos] = bad;
+            try testing.expect(!allFinite(&buf));
+            buf[pos] = saved;
+        }
+    }
+}
+
+test "non-finite vectors are refused and leave the index unchanged" {
+    var index = try FlatIndex.init(testing.allocator, .{ .dim = 32, .bits = 4 });
+    defer index.deinit();
+
+    var good: [32]f32 = @splat(0.25);
+    _ = try index.add(&good);
+
+    var bad = good;
+    bad[7] = std.math.nan(f32);
+    try testing.expectError(error.NonFiniteInput, index.add(&bad));
+    try testing.expectEqual(@as(usize, 1), index.count());
+
+    // A bad row at the end of a batch rejects the whole batch, not just the tail.
+    var batch: [3 * 32]f32 = @splat(0.25);
+    batch[2 * 32 + 5] = std.math.inf(f32);
+    try testing.expectError(error.NonFiniteInput, index.addBatch(&batch));
+    try testing.expectEqual(@as(usize, 1), index.count());
+
+    var fresh = try FlatIndex.init(testing.allocator, .{ .dim = 32, .bits = 4 });
+    defer fresh.deinit();
+    try testing.expectError(error.NonFiniteInput, fresh.calibrate(&batch));
 }

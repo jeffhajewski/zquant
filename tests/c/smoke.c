@@ -63,6 +63,19 @@ int main(void) {
     zq_codec_config cbad = { .dim = 0xFFFFFFFFu, .bits = 4, .seed = 1 }; zq_codec *ctmp = NULL;
     if (zq_codec_create(&cbad, &ctmp) != ZQ_ERR_INVALID) { printf("FAIL: codec dim=2^32-1 accepted\n"); return 1; }
 
+    /* Non-finite input is refused, and a refused batch adds nothing. */
+    {
+        size_t before = zq_index_count(ix);
+        float *row = malloc(sizeof(float) * 2 * DIM);
+        memcpy(row, base, sizeof(float) * 2 * DIM);
+        row[DIM + 3] = NAN;
+        if (zq_index_add(ix, row, 2) != ZQ_ERR_INVALID) { printf("FAIL: NaN row accepted\n"); return 1; }
+        row[DIM + 3] = INFINITY;
+        if (zq_index_add(ix, row, 2) != ZQ_ERR_INVALID) { printf("FAIL: inf row accepted\n"); return 1; }
+        if (zq_index_count(ix) != before) { printf("FAIL: rejected batch partly added\n"); return 1; }
+        free(row);
+    }
+
     zq_searcher *se = NULL;
     st = zq_searcher_create(ix, 32, K, 1, &se);
     if (st != ZQ_OK) { printf("FAIL searcher: %s\n", zq_status_string(st)); return 1; }
@@ -83,6 +96,14 @@ int main(void) {
         if (zq_search(other, se, q, 1, ids, scores) != ZQ_ERR_INVALID) { printf("FAIL: foreign searcher accepted\n"); return 1; }
         free(q);
         zq_index_free(other);
+    }
+
+    {
+        float *q = malloc(sizeof(float) * DIM);
+        memcpy(q, base, sizeof(float) * DIM);
+        q[5] = NAN;
+        if (zq_search(ix, se, q, 1, ids, scores) != ZQ_ERR_INVALID) { printf("FAIL: NaN query accepted\n"); return 1; }
+        free(q);
     }
 
     /* Each corpus vector queried against itself should rank itself first. */
@@ -116,6 +137,12 @@ int main(void) {
     printf("codec round-trip relative error: %.4f\n", rel);
     if (!(rel < 0.25)) { printf("FAIL: reconstruction error too large\n"); return 1; }
     if (zq_codec_encode(cd, NULL, rows, cbuf, nbuf) != ZQ_ERR_INVALID) { printf("FAIL: null rows accepted\n"); return 1; }
+    {
+        float saved = base[3];
+        base[3] = NAN;
+        if (zq_codec_encode(cd, base, 1, cbuf, nbuf) != ZQ_ERR_INVALID) { printf("FAIL: codec NaN accepted\n"); return 1; }
+        base[3] = saved;
+    }
     zq_codec_free(cd);
     free(cbuf); free(nbuf); free(back);
 

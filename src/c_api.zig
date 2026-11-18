@@ -138,7 +138,7 @@ export fn zq_index_calibrate(index: ?*Index, rows: ?[*]const f32, n: usize) c_in
     ix.inner.calibrate(sample) catch |e| return switch (e) {
         error.OutOfMemory => ZQ_ERR_ALLOC,
         error.IndexNotEmpty => ZQ_ERR_STATE,
-        error.EmptySample => ZQ_ERR_INVALID,
+        error.EmptySample, error.NonFiniteInput => ZQ_ERR_INVALID,
     };
     return ZQ_OK;
 }
@@ -148,7 +148,10 @@ export fn zq_index_add(index: ?*Index, rows: ?[*]const f32, n: usize) c_int {
     const data = rows orelse return ZQ_ERR_INVALID;
     if (n == 0) return ZQ_OK;
     const vectors = rowsOf(data, n, ix.inner.dim()) orelse return ZQ_ERR_INVALID;
-    ix.inner.addBatch(vectors) catch return ZQ_ERR_ALLOC;
+    ix.inner.addBatch(vectors) catch |e| return switch (e) {
+        error.OutOfMemory => ZQ_ERR_ALLOC,
+        error.NonFiniteInput => ZQ_ERR_INVALID,
+    };
     return ZQ_OK;
 }
 
@@ -246,6 +249,9 @@ export fn zq_search(
     const k = s.k;
     const found = @min(k, ix.inner.count());
     const batch = rowsOf(q, nq, ix.inner.dim()) orelse return ZQ_ERR_INVALID;
+    // A NaN query scores NaN against everything and the collector's order is then
+    // meaningless; refuse it rather than return confident garbage.
+    if (!zq.flat.allFinite(batch)) return ZQ_ERR_INVALID;
 
     const results = if (s.parallel) |*p|
         ix.inner.searchBatchParallel(batch, p) catch return ZQ_ERR_ALLOC
@@ -360,8 +366,9 @@ export fn zq_codec_encode(
 
     const d = c.mse.dim;
     const stride = c.layout.codeBytes();
-    _ = rowsOf(src, n, d) orelse return ZQ_ERR_INVALID;
+    const input = rowsOf(src, n, d) orelse return ZQ_ERR_INVALID;
     _ = std.math.mul(usize, n, stride) catch return ZQ_ERR_INVALID;
+    if (!zq.flat.allFinite(input)) return ZQ_ERR_INVALID;
     for (0..n) |i| {
         nrm[i] = c.mse.encode(src[i * d ..][0..d], c.scratch, &c.workspace);
         c.layout.pack(c.scratch, dst[i * stride ..][0..stride]);

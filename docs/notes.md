@@ -1981,3 +1981,97 @@ both synthetic corpora. There is still no real corpus at d ≥ 768 beyond fashio
   by TSan.
 - *dump_kv.py.* It still captures pre-RoPE queries. This is documented in the KV
   section and does not affect the perplexity results.
+
+## x86, measured at last: the tile stays, and AVX2 ships through a run-time choice
+
+Until now nothing had measured x86 speed on real hardware. Two items were left open in
+the review pass above: the 4×4 batch tile might spill on x86, and there was no 256-bit
+kernel. [bench.yml](../.github/workflows/bench.yml) now runs `tile_bench` and quickbench on
+GitHub's x86_64 and arm64 runners. The x86 runner's CPU varies between runs. It drew an
+AMD Zen 5 once and a Zen 3 once, each with 4 vCPUs.
+
+**The 4×4 tile stays.** `tile_bench` times every kernel at seven tile shapes on the same
+codes and queries. On both x86 CPUs 4×4 was the fastest shape in most rows and never more
+than 6% behind the fastest, which was 3×3 or 2×4 when it was not 4×4. The one exception
+was the Zen 3's 1-bit row at x86_64_v2, where 2×4 measured 11% ahead. The same kernel compiled at x86_64_v3, in the same job,
+had the two shapes level, so I read that row as noise. The 256-bit kernels below favour
+4×4 as well. The stack traffic in the x86_64_v3 disassembly was real, but it did not cost
+what it suggested. Apple M5 and Neoverse N2 agreed.
+
+**256-bit kernels: 1.3–1.8× per kernel.** The 128-bit dot product is `pmaddubsw` +
+`pmaddwd` per 16 bytes. The AVX2 kernels do the same on 32 bytes per instruction, with
+the 16-entry shuffle table copied into both 128-bit lanes of `vpshufb`. The sums are
+integers taken in a different order, so the scores are bit-identical; a test checks
+that exactly. On the Zen 3, at the 4×4 tile, against the 128-bit kernel in the same build:
+
+| kernel | 128-bit | 256-bit | ratio |
+|---|---|---|---|
+| compact, 1-bit codes | 109 | 197 | 1.81× |
+| compact, 2-bit codes | 109 | 188 | 1.72× |
+| compact, 3-bit codes (bit planes) | 64 | 84 | 1.31× |
+| compact, 4-bit codes | 112 | 193 | 1.72× |
+| expanded | 119 | 208 | 1.75× |
+
+(M scores/s. The index's `bits` is one more than the code bits.) The 3-bit layout gains
+least, because unpacking its bit planes is a large part of its cost and does not widen.
+quickbench, on one thread:
+
+| bits | x86_64_v2 (SSSE3) | x86_64_v3 (AVX2) | |
+|---|---|---|---|
+| 2 | 1,989 | 3,348 | 1.68× |
+| 3 | 1,964 | 3,311 | 1.69× |
+| 4 | 1,189 | 1,595 | 1.34× |
+| 5 | 1,992 | 3,484 | 1.75× |
+
+A native `znver3` build measured the same as x86_64_v3, within 1%.
+
+**Shipping it: a run-time choice, not another release tier.** Releases target x86_64_v2,
+which has no AVX2, so a faster kernel would reach nobody who downloads a release. Two
+ways to fix that were on the table:
+- *More release tiers.* A v3 library with a v2 fallback, chosen by the binding's loader,
+  the way the portable library already is. That would mean another file per platform, and
+  another fallback in every binding.
+- *A choice inside the one library.* Compile the kernels a second time, for x86_64_v3,
+  and pick a copy when the library first searches.
+
+I chose the second. `src/simd/tiles.zig` is the seam. It holds two functions, one for a
+4-vector batch tile across every query and one for a block of 8-vector single-query
+tiles. Their arguments are passed as an `extern struct`, so each call covers dozens of
+vector-query pairs. build.zig compiles `src/kernel_entry.zig`, which exports
+`tiles.zig`'s pair, a second time at x86_64_v3 as a separate object, and links it into
+the library under a hidden symbol. `src/simd/dispatch.zig` uses that copy when CPUID
+says the CPU has every feature it was compiled with, checking the OS's YMM state as
+well. Otherwise it calls the library's own copy directly.
+
+The table and query structs cross between the two compilations behind opaque pointers.
+Zig promises nothing about the layout of a plain struct, so each copy carries a
+fingerprint of the layouts it was built with. A copy whose fingerprint differs is never
+used.
+
+The costs:
+- **Size:** the stripped x86_64 Linux library went from 183 KB to 234 KB.
+- **arm64:** nothing changes. Builds that already have AVX2 compile the wide kernels in
+  directly, and the portable build is only ever loaded on CPUs that could not run either
+  copy, so none of these carry a second copy.
+- **Speed where nothing is chosen:** none measurable. An A/B on the M5 against the
+  previous commit measured the same quickbench and `index_bench` throughput, both batch
+  and single query, within run-to-run noise.
+
+`zq_build_kernels()` now reports the kernels in use, with `wide=avx2` when the AVX2 copy
+was chosen. `ZQUANT_KERNELS=none` keeps the library to its own, which is how bench.yml
+measures both on one machine.
+
+How it was verified:
+- **Under Rosetta, with AVX advertised:** every Zig, C and Python test passes at x86_64_v2
+  with the AVX2 copy in use, including the golden tests, whose scores are exact.
+- **Under Rosetta, without AVX:** they pass on the 128-bit copy.
+- **On CI's x86 runners:** they run at x86_64_v2 and so take the AVX2 path. A test there
+  calls both copies through the seam and requires identical output.
+- **Release checks:** they now require the AVX2 copy's marker string in every
+  non-portable x86_64 library.
+
+**Not done.** The VNNI form of the kernels (`vpdpbusd`, one instruction in place of two)
+compiles for x86_64_v4 and for CPUs with AVX-VNNI, and the disassembly shows it in use.
+No runner has yet drawn a CPU that has VNNI while running this branch, so it is
+unmeasured. It is not one of the release's choices. If a run on a Zen 4/5 or an Ice Lake
+or later shows it pays, it can be added as a second level in `kernelLevelCpus`.

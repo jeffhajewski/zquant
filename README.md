@@ -278,8 +278,12 @@ Search is a linear scan, so throughput falls with n·d as expected. At d=768 the
 longer pads to 1024, so these sizes are 25% smaller than they were. bits=4 is left out
 because it is the slow width (its 3-bit codes need bit-plane unpacking; see `Residency` in
 [src/index/flat.zig](src/index/flat.zig)). It runs at about 40% of the speed of bits=3 and
-5. No x86_64 throughput has been measured on real hardware; CI writes the x86_64
-quickbench to its job summary.
+5.
+
+On x86_64 the only measurements are from a GitHub runner, an AMD Zen 3 with 4 vCPUs,
+running quickbench (50k × 256, k=10). One thread at bits=5 measures 3,484 QPS with the
+AVX2 kernels the release library chooses on such a CPU, and 1,992 with the SSSE3 ones it
+falls back to without AVX2. [bench.yml](.github/workflows/bench.yml) reruns it.
 
 ## Status
 
@@ -317,6 +321,11 @@ instructions unconditionally. Releases are built for SSSE3 on x86_64 (`x86_64_v2
 the dot-product extension on arm64. Search is 6–10× slower without them. Each release
 also has a `-portable` build for the bare baseline, named `libzquant-portable`, for older
 CPUs.
+
+The x86_64 libraries also carry a copy of the kernels compiled for AVX2, and use it on a
+CPU that has AVX2: one-thread search measured 1.34× (bits=4) to 1.75× (bits=5) faster
+with it. `zq_build_kernels()` reports `wide=avx2` when that copy is in use. Setting
+`ZQUANT_KERNELS=none` keeps the library to its own kernels.
 
 The library checks at load time rather than crashing: `zq_cpu_supported()` is safe on any
 CPU, and creating an index on an unsupported one returns `ZQ_ERR_CPU`. The Python and

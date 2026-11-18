@@ -10,11 +10,13 @@
 #
 # Environment:
 #   ZQUANT_LIB_DIR       where the built library is (default: the repo's zig-out/lib)
-#   ZQUANT_PORTABLE_LIB  a portable build to include as well, e.g. the libzquant.so from
-#                        a release's -portable archive. It is renamed to
-#                        libzquant-portable.*, the name the binding falls back to on a
-#                        CPU that cannot run the release build. A libzquant-portable.*
-#                        already in ZQUANT_LIB_DIR is included without this.
+#   ZQUANT_PORTABLE_LIB  a portable build somewhere else to include as well. It is
+#                        copied as libzquant-portable.*, the name the binding falls
+#                        back to on a CPU that cannot run the release build. A
+#                        libzquant-portable.* already in ZQUANT_LIB_DIR (what
+#                        `zig build lib -Dcpu=baseline -Dlib-name=zquant-portable`
+#                        produces, and what a release's -portable archive contains) is
+#                        included without this.
 #
 # The prebuilds/ directory is removed again afterwards, so a later `npm test` cannot
 # pick up a stale copy instead of a fresh zig-out/lib.

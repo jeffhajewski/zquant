@@ -41,8 +41,10 @@ The binding looks in three places, in this order, and uses the first it finds:
 To build a tarball that carries the library, run `npm run pack:native` (that's
 `scripts/pack.sh`). It copies `zig-out/lib`'s library into `prebuilds/` for the
 machine you're on, runs `npm pack`, and removes `prebuilds/` again so a later test run
-can't pick up a stale copy. Set `ZQUANT_PORTABLE_LIB` to the `libzquant` from a release's
-`-portable` archive to include that too.
+can't pick up a stale copy. A `libzquant-portable` beside the main library in
+`zig-out/lib` is packed too. Build one with
+`zig build lib -Dcpu=baseline -Dlib-name=zquant-portable`, or take it from a release's
+`-portable` archive. `ZQUANT_PORTABLE_LIB` points at one somewhere else.
 
 ### Older CPUs
 

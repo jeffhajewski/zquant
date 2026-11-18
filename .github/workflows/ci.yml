@@ -138,6 +138,55 @@ jobs:
         working-directory: clients/python
         run: pytest -q
 
+  # The installed package, not the checkout: build a wheel with the library inside, install
+  # it into a fresh venv in a directory with no repository nearby, and check that the
+  # library it loads is the one inside the wheel. Nothing tested this before, and the
+  # binding could only find a library built in the repository.
+  python-package:
+    name: Python wheel (installed outside the repo)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build the wheel
+        run: WHEEL_DIR="$RUNNER_TEMP/wheels" bash clients/python/scripts/build_wheel.sh
+
+      - name: Install and use it outside the repository
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -m venv venv
+          venv/bin/pip install wheels/zquant-*.whl
+          venv/bin/python - <<'PY'
+          import numpy as np, zquant
+          info = zquant.build_info()
+          print(info)
+          assert "site-packages" in str(info.library), info.library
+          assert not info.portable
+          x = np.random.default_rng(0).standard_normal((2000, 64)).astype("float32")
+          index = zquant.Index(dim=64, bits=5)
+          index.add(x, threads=2)
+          ids, _ = index.search(x[:20], k=1)
+          assert (ids[:, 0] == np.arange(20)).all(), ids[:, 0]
+          again = zquant.Index.from_bytes(index.to_bytes())
+          assert (again.search(x[:20], k=1)[0] == ids).all()
+          print("ok")
+          PY
+
   # ============================================
   # TypeScript client
   # ============================================
@@ -177,6 +226,66 @@ jobs:
       - name: Run tests
         working-directory: clients/typescript
         run: npm test
+
+  # The packed tarball, installed outside the repository. package.json's entry point once
+  # pointed at a file the build never produced, and only installing the package shows it.
+  typescript-package:
+    name: TypeScript package (installed outside the repo)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build the library and a portable one to bundle with it
+        run: |
+          zig build lib
+          zig build lib -Dcpu=baseline -Dlib-name=zquant-portable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Pack
+        working-directory: clients/typescript
+        run: |
+          npm install
+          npm run pack:native
+          mv zquant-*.tgz "$RUNNER_TEMP/"
+
+      - name: Install and use it outside the repository
+        working-directory: ${{ runner.temp }}
+        run: |
+          mkdir consumer && cd consumer
+          npm init -y > /dev/null
+          npm install ../zquant-*.tgz
+          ls node_modules/zquant/prebuilds/*/
+          cat > use.mjs <<'JS'
+          import { Index, buildInfo } from 'zquant';
+          const info = buildInfo();
+          console.log(info);
+          if (!info.libraryPath.includes('node_modules')) throw new Error(`loaded ${info.libraryPath}`);
+          const dim = 64, n = 2000;
+          const x = new Float32Array(n * dim).map(() => Math.random() - 0.5);
+          const index = new Index({ dim, bits: 5 });
+          index.add(x, { threads: 2 });
+          const { ids } = index.search(x.subarray(0, 20 * dim), { k: 1 });
+          for (let i = 0; i < 20; i++) if (ids[i] !== i) throw new Error(`query ${i} found ${ids[i]}`);
+          const again = Index.deserialize(index.serialize());
+          if (again.search(x.subarray(0, dim), { k: 1 }).ids[0] !== 0) throw new Error('round trip');
+          index.close(); again.close();
+          console.log('ok');
+          JS
+          env -u ZQUANT_LIB node use.mjs
 
   # ============================================
   # Go client

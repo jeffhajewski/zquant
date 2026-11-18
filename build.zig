@@ -49,32 +49,54 @@ pub fn build(b: *std.Build) void {
     probe_mod.addOptions("cpu_options", cpu_options);
     c_api.addObject(b.addObject(.{ .name = "zquant_cpu", .root_module = probe_mod }));
 
-    const lib_static = b.addLibrary(.{ .name = "zquant", .root_module = c_api, .linkage = .static });
-    const lib_shared = b.addLibrary(.{ .name = "zquant", .root_module = c_api, .linkage = .dynamic });
+    // Releases build the portable variant as `zquant-portable`, so it can be installed
+    // next to the fast one and the bindings can fall back to it by name when
+    // zq_cpu_supported() says no. A distinct name rather than a renamed file, so the
+    // ELF SONAME and Mach-O install name agree with the file.
+    const lib_name = b.option(
+        []const u8,
+        "lib-name",
+        "Base name of the C ABI library (default zquant)",
+    ) orelse "zquant";
+    const is_windows = target.result.os.tag == .windows;
+    // On Windows the DLL's import library is `<name>.lib`, the same file name a static
+    // library gets, and whichever was installed second silently replaced the other.
+    const static_name = if (is_windows) b.fmt("{s}_static", .{lib_name}) else lib_name;
+    const lib_static = b.addLibrary(.{ .name = static_name, .root_module = c_api, .linkage = .static });
+    const lib_shared = b.addLibrary(.{ .name = lib_name, .root_module = c_api, .linkage = .dynamic });
     lib_static.installHeader(b.path("include/zquant.h"), "zquant.h");
     b.installArtifact(lib_static);
     b.installArtifact(lib_shared);
 
     // A pkg-config file, so an installed library can be consumed without every
     // downstream build hardcoding paths. The Go client's default build uses it.
+    //
+    // Relocatable: `${pcfiledir}` is wherever the file is found, so an unpacked release
+    // tarball works from any directory. It used to bake in the absolute install prefix,
+    // which was only right on the machine that built it. The rpath lets a binary find
+    // the shared library at run time without LD_LIBRARY_PATH; on macOS the library's
+    // install name is @rpath-relative, so without it nothing linked against it runs.
+    const rpath = if (is_windows) "" else " -Wl,-rpath,${libdir}";
     const pc = b.addWriteFiles();
     const pc_file = pc.add("zquant.pc", b.fmt(
-        \\prefix={s}
+        \\prefix=${{pcfiledir}}/../..
         \\libdir=${{prefix}}/lib
         \\includedir=${{prefix}}/include
         \\
         \\Name: zquant
         \\Description: TurboQuant vector quantization
         \\Version: 0.1.0
-        \\Libs: -L${{libdir}} -lzquant
+        \\Libs: -L${{libdir}}{s} -l{s}
         \\Cflags: -I${{includedir}}
         \\
-    , .{b.install_prefix}));
-    b.getInstallStep().dependOn(&b.addInstallFileWithDir(pc_file, .{ .custom = "lib/pkgconfig" }, "zquant.pc").step);
+    , .{ rpath, lib_name }));
+    const install_pc = b.addInstallFileWithDir(pc_file, .{ .custom = "lib/pkgconfig" }, b.fmt("{s}.pc", .{lib_name}));
+    b.getInstallStep().dependOn(&install_pc.step);
 
     const lib_step = b.step("lib", "Build the C ABI static and shared libraries");
     lib_step.dependOn(&b.addInstallArtifact(lib_static, .{}).step);
     lib_step.dependOn(&b.addInstallArtifact(lib_shared, .{}).step);
+    lib_step.dependOn(&install_pc.step);
 
     const unit_tests = b.addTest(.{
         .name = "zquant-test",

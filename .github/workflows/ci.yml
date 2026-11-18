@@ -50,6 +50,42 @@ jobs:
             zig-out/include/
 
   # ============================================
+  # The release CPU configurations, run natively
+  # ============================================
+  #
+  # Releases are built for specific CPU levels (release.yml explains why), and the
+  # baseline rows are the only place the scalar fallback kernels run at all: every
+  # other job builds for the runner's own CPU, which has the fast instructions. arm64
+  # Linux and Windows are covered here and nowhere else. Same matrix as the gate in
+  # release.yml, so a platform break shows up on the commit that caused it rather than
+  # at tag time.
+  platform-test:
+    name: Platform ${{ matrix.os }} (${{ matrix.cpu }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,    cpu: x86_64_v2 }
+          - { os: ubuntu-latest,    cpu: baseline }
+          - { os: ubuntu-24.04-arm, cpu: generic+dotprod }
+          - { os: ubuntu-24.04-arm, cpu: baseline }
+          - { os: macos-14,         cpu: baseline }
+          - { os: windows-latest,   cpu: x86_64_v2 }
+          - { os: windows-latest,   cpu: baseline }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Run tests
+        run: zig build test -Dcpu=${{ matrix.cpu }} -Doptimize=ReleaseSafe
+
+  # ============================================
   # Python client
   # ============================================
   python-test:
@@ -72,8 +108,13 @@ jobs:
       # Built in-job rather than downloaded from zig-build. actions/upload-artifact does
       # not preserve file permissions, and the library arrived without its executable
       # bit; the job is self-contained now and the library takes seconds to build.
+      #
+      # ReleaseSafe, not the shipped ReleaseFast: the bindings are what hand the library
+      # pointers and lengths, and with safety checks on, a binding that passes a short
+      # buffer or a wrong count panics with a message instead of corrupting memory and
+      # passing anyway.
       - name: Build library
-        run: zig build lib
+        run: zig build lib -Dlib-opt=ReleaseSafe
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -117,8 +158,8 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
-      - name: Build library
-        run: zig build lib
+      - name: Build library (with safety checks; see the Python job)
+        run: zig build lib -Dlib-opt=ReleaseSafe
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -156,8 +197,8 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
-      - name: Build library
-        run: zig build lib
+      - name: Build library (with safety checks; see the Python job)
+        run: zig build lib -Dlib-opt=ReleaseSafe
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -168,9 +209,12 @@ jobs:
         working-directory: clients/go
         run: go vet -tags repolocal ./...
 
-      - name: Run tests (repository-local)
+      # -race matters here more than in most Go code: handles are freed by Close and by
+      # finalizers, and the binding's locking is what keeps a search from using one
+      # after it is gone.
+      - name: Run tests (repository-local, race detector)
         working-directory: clients/go
-        run: go test -tags repolocal ./...
+        run: go test -race -tags repolocal ./...
 
   # Both linking paths are supported, so both are exercised: the repo-local build above
   # and the pkg-config one a downstream consumer would actually use.
@@ -191,15 +235,20 @@ jobs:
         with:
           go-version-file: clients/go/go.mod
 
-      - name: Install to a prefix
-        run: zig build install --prefix /tmp/zquant-install
+      # Installed by `zig build lib` (what the release tarballs contain), then moved: the
+      # pkg-config file is relative to where it sits and carries an rpath, so it must
+      # work from a directory other than the one it was built for, with no
+      # LD_LIBRARY_PATH. It used to bake in the absolute build prefix.
+      - name: Install to a prefix, then move it
+        run: |
+          zig build lib --prefix /tmp/zquant-build
+          mv /tmp/zquant-build /tmp/zquant-moved
 
       - name: Run tests via pkg-config
         working-directory: clients/go
         env:
-          PKG_CONFIG_PATH: /tmp/zquant-install/lib/pkgconfig
-          LD_LIBRARY_PATH: /tmp/zquant-install/lib
-        run: go test ./...
+          PKG_CONFIG_PATH: /tmp/zquant-moved/lib/pkgconfig
+        run: go test -race ./...
 
   # ============================================
   # End-to-end benchmark
@@ -221,8 +270,19 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
+      # Also written to the job summary, which anyone can read; job logs need admin
+      # rights on this repository. This is the only x86_64 throughput the project
+      # measures, so it should be visible.
       - name: Run quickbench
-        run: zig build quickbench
+        run: |
+          set -o pipefail
+          zig build quickbench 2>&1 | tee quickbench.txt
+          {
+            echo '### quickbench on ubuntu-latest (x86_64)'
+            echo '```'
+            cat quickbench.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ============================================
   # Cross-compilation

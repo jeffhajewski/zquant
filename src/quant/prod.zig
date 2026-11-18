@@ -181,9 +181,25 @@ pub const Prod = struct {
         sketch: []u8,
         ws: *Workspace,
     ) Scalars {
+        std.debug.assert(sketch.len == self.sketchLen());
+
+        const scalars = self.encodeCodes(x, codes, ws);
+
+        // qjl = sign(S'·u). Scale-invariant, so u need not be normalized first.
+        self.sketch.apply(ws.residual, ws.staging);
+        packSigns(ws.staging, sketch);
+
+        return scalars;
+    }
+
+    /// The MSE codes, ‖x‖ and the residual norm γ, without the sketch.
+    ///
+    /// For callers that never read the sketch: computing it is a second full
+    /// rotation per vector, which is most of what `encode` costs beyond this.
+    /// Leaves the rotated-basis residual `u = y − ỹ` in `ws.residual`.
+    pub fn encodeCodes(self: Prod, x: []const f32, codes: []u8, ws: *Workspace) Scalars {
         std.debug.assert(x.len == self.dim());
         std.debug.assert(codes.len == self.codeLen());
-        std.debug.assert(sketch.len == self.sketchLen());
 
         // y = Π·(x/‖x‖)
         const norm = self.mse.encodeRotated(x, ws.rotated, ws.staging);
@@ -198,13 +214,7 @@ pub const Prod = struct {
             u.* = y - y_hat;
             sum += @as(f64, u.*) * u.*;
         }
-        const gamma: f32 = @floatCast(@sqrt(sum));
-
-        // qjl = sign(S'·u). Scale-invariant, so u need not be normalized first.
-        self.sketch.apply(ws.residual, ws.staging);
-        packSigns(ws.staging, sketch);
-
-        return .{ .norm = norm, .gamma = gamma };
+        return .{ .norm = norm, .gamma = @floatCast(@sqrt(sum)) };
     }
 
     /// Full reconstruction x̃. Not on the search path — `dot` avoids it entirely —
@@ -236,12 +246,18 @@ pub const Prod = struct {
 
     /// Rotate and sketch a query once, for reuse across the corpus.
     pub fn prepareQuery(self: Prod, q: []const f32, state: *QueryState, ws: *Workspace) void {
+        self.prepareQueryRotated(q, state, ws);
+        self.sketch.apply(state.rotated, state.sketched);
+    }
+
+    /// `prepareQuery` without the sketch: fills `state.rotated` only, leaving
+    /// `state.sketched` stale. For callers that never read the sketch term.
+    pub fn prepareQueryRotated(self: Prod, q: []const f32, state: *QueryState, ws: *Workspace) void {
         std.debug.assert(q.len == self.dim());
         // No normalization: the estimator is linear in q, so an unnormalized query
         // yields the true unnormalized inner product.
         @memcpy(ws.staging[0..self.dim()], q);
         self.mse.rotation.apply(ws.staging[0..self.dim()], state.rotated);
-        self.sketch.apply(state.rotated, state.sketched);
     }
 
     /// Estimate ⟨q, x⟩ without reconstructing anything.

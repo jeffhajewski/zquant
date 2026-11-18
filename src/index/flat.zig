@@ -185,7 +185,8 @@ pub const FlatIndex = struct {
 
     /// Packed codes, `layout.stride()` bytes per vector.
     codes: std.ArrayList(u8),
-    /// QJL sign bitmaps, `sketchLen()` bytes per vector.
+    /// QJL sign bitmaps, `sketchStride()` bytes per vector — none at all unless the
+    /// score reads them (see `storesSketch`).
     sketches: std.ArrayList(u8),
     /// ‖x‖ and ‖y − ỹ‖ per vector, at half precision.
     ///
@@ -320,14 +321,24 @@ pub const FlatIndex = struct {
     }
 
     /// Bytes of codes and sketch only — the part that scales with the bit budget.
-    /// With the sketch disabled its storage is not counted, because it is not read.
+    /// The scalar factor rides in `StoredScalars`, already counted by `bytesPerVector`.
     pub fn codeBytesPerVector(self: FlatIndex) usize {
-        const sketch_bytes = switch (self.correction) {
-            .qjl_sketch => if (self.use_sketch) self.quantizer.sketchLen() else 0,
-            // The scalar factor rides in `StoredScalars`, already counted.
-            .scalar => 0,
-        };
-        return self.codeStride() + sketch_bytes;
+        return self.codeStride() + self.sketchStride();
+    }
+
+    /// Whether the score reads the QJL sketch, and so whether it is computed and kept.
+    ///
+    /// Only `.qjl_sketch` with `use_sketch` does. Every vector used to get a sketch
+    /// regardless, which under the default `.scalar` correction was a second rotation
+    /// per insert and per query, and d/8 bytes per vector that nothing read — 164
+    /// resident bytes against the 132 reported, at d=256 and bits=5.
+    pub fn storesSketch(self: FlatIndex) bool {
+        return self.correction == .qjl_sketch and self.use_sketch;
+    }
+
+    /// Bytes of stored sketch per vector: `sketchLen()` when kept, otherwise zero.
+    pub fn sketchStride(self: FlatIndex) usize {
+        return if (self.storesSketch()) self.quantizer.sketchLen() else 0;
     }
 
     /// Bytes of codes per vector, which is what `Residency` changes.
@@ -422,7 +433,7 @@ pub const FlatIndex = struct {
 
     pub fn reserve(self: *FlatIndex, additional: usize) !void {
         try self.codes.ensureUnusedCapacity(self.allocator, additional * self.codeStride());
-        try self.sketches.ensureUnusedCapacity(self.allocator, additional * self.quantizer.sketchLen());
+        try self.sketches.ensureUnusedCapacity(self.allocator, additional * self.sketchStride());
         try self.scalars.ensureUnusedCapacity(self.allocator, additional);
     }
 
@@ -437,7 +448,7 @@ pub const FlatIndex = struct {
         if (!allFinite(vector)) return error.NonFiniteInput;
 
         const stride = self.codeStride();
-        const sketch_len = self.quantizer.sketchLen();
+        const sketch_len = self.sketchStride();
 
         // Encode into scratch, then pack. The quantizer emits one byte per
         // coordinate; storage wants them bit-packed.
@@ -453,8 +464,10 @@ pub const FlatIndex = struct {
 
         var scalars = if (self.calibrated)
             self.encodeCalibrated(vector, scratch)
+        else if (self.storesSketch())
+            self.quantizer.encode(vector, scratch, sketch_slot, &self.workspace)
         else
-            self.quantizer.encode(vector, scratch, sketch_slot, &self.workspace);
+            self.quantizer.encodeCodes(vector, scratch, &self.workspace);
 
         switch (self.residency) {
             .compact => self.layout.pack(scratch, codes_slot),
@@ -681,17 +694,18 @@ pub const FlatIndex = struct {
 
         const use_simd = self.vectorized();
 
-        // One rotation and one sketch per query, before the corpus is touched.
+        // One rotation per query before the corpus is touched, plus a sketch rotation
+        // only where the score reads it. The int8 scan query is loaded below, once any
+        // calibration scaling has been applied.
+        const sketched = self.storesSketch();
         for (0..n) |i| {
-            self.quantizer.prepareQuery(
-                queries[i * d ..][0..d],
-                &searcher.query_states[i],
-                &searcher.workspace,
-            );
-
-            if (use_simd) {
-                searcher.scan_queries[i].load(searcher.query_states[i].rotated);
-                searcher.sketch_queries[i].load(searcher.query_states[i].sketched);
+            const query = queries[i * d ..][0..d];
+            const state = &searcher.query_states[i];
+            if (sketched) {
+                self.quantizer.prepareQuery(query, state, &searcher.workspace);
+                if (use_simd) searcher.sketch_queries[i].load(state.sketched);
+            } else {
+                self.quantizer.prepareQueryRotated(query, state, &searcher.workspace);
             }
         }
 
@@ -741,7 +755,7 @@ pub const FlatIndex = struct {
         };
 
         const stride = self.codeStride();
-        const sketch_len = self.quantizer.sketchLen();
+        const sketch_len = self.sketchStride();
         const padded = self.quantizer.padded();
         const centroids = self.quantizer.mse.codebook.centroids;
 
@@ -1081,7 +1095,11 @@ pub const FlatIndex = struct {
 
         // One rotation and one sketch for the whole corpus — the point of staying in
         // the rotated basis (docs/DESIGN.md §1.3).
-        self.quantizer.prepareQuery(query, &searcher.query_state, &searcher.workspace);
+        if (self.storesSketch()) {
+            self.quantizer.prepareQuery(query, &searcher.query_state, &searcher.workspace);
+        } else {
+            self.quantizer.prepareQueryRotated(query, &searcher.query_state, &searcher.workspace);
+        }
         // ⟨p, ỹ⟩ = Σ (p_j/scale_j)·c[code_j] − ⟨p, shift⟩; the second term is the
         // same for every vector and cannot reorder them, but is included so scores
         // are real inner-product estimates.
@@ -1095,7 +1113,7 @@ pub const FlatIndex = struct {
         const use_simd = self.vectorized();
         if (use_simd) {
             searcher.scan_query.load(searcher.query_state.rotated);
-            searcher.sketch_query.load(searcher.query_state.sketched);
+            if (self.storesSketch()) searcher.sketch_query.load(searcher.query_state.sketched);
         }
 
         const query_norm = if (self.metric == .cosine or self.metric == .l2)
@@ -1105,7 +1123,7 @@ pub const FlatIndex = struct {
 
         var collector = topk.TopK.init(searcher.heap);
         const stride = self.codeStride();
-        const sketch_len = self.quantizer.sketchLen();
+        const sketch_len = self.sketchStride();
         const padded = self.quantizer.padded();
         const centroids = self.quantizer.mse.codebook.centroids;
 
@@ -2330,4 +2348,32 @@ test "calibration is refused with the QJL sketch correction" {
     const sample: [8 * 32]f32 = @splat(0.5);
     try testing.expectError(error.CalibrationNeedsScalarCorrection, index.calibrate(&sample));
     try testing.expect(!index.calibrated);
+}
+
+test "resident storage is what bytesPerVector reports" {
+    // The sketch used to be computed and stored for every vector even under the
+    // scalar correction, which never reads it: 32 resident bytes per vector at d=256
+    // that the reported figure did not include.
+    var prng = std.Random.DefaultPrng.init(0x51DE);
+    const random = prng.random();
+    for ([_]Correction{ .scalar, .qjl_sketch }) |correction| {
+        for ([_]u6{ 3, 5 }) |bits| {
+            var index = try FlatIndex.init(testing.allocator, .{
+                .dim = 256,
+                .bits = bits,
+                .correction = correction,
+            });
+            defer index.deinit();
+            var v: [256]f32 = undefined;
+            for (0..20) |_| {
+                randomUnit(&v, random);
+                _ = try index.add(&v);
+            }
+            const n = index.count();
+            const resident = index.codes.items.len + index.sketches.items.len +
+                index.scalars.items.len * @sizeOf(StoredScalars);
+            try testing.expectEqual(index.bytesPerVector() * n, resident);
+            try testing.expectEqual(correction == .qjl_sketch, index.sketches.items.len > 0);
+        }
+    }
 }

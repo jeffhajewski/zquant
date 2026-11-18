@@ -362,16 +362,31 @@ pub fn scoreExpandedTiled(
     }
 }
 
+/// Accumulator registers the multi-query kernel may use.
+///
+/// aarch64 has 32 vector registers and the loop also needs the code chunk, the
+/// unpacked values and a query chunk, so the budget is 16. x86 below AVX-512 has 16,
+/// and its dot product needs three more temporaries than `sdot` (the magnitude, the
+/// sign-adjusted query and a register of ones — see `simd/dot.zig`), so it gets 8.
+/// Exceeding the budget spills to the stack, which cost 42% when it happened to the
+/// single-query kernel.
+const accumulator_budget: usize = switch (builtin.cpu.arch) {
+    .x86, .x86_64 => 8,
+    else => 16,
+};
+
+/// `multiWidth` for a sequential layout, at comptime so the kernel can be sized by it.
+fn sequentialWidth(comptime bits: u6) usize {
+    return @max(1, accumulator_budget / (8 / @as(usize, bits)));
+}
+
 /// Widest query group the compact kernels can hold without spilling.
 ///
 /// A sequential layout keeps one accumulator per bit-field group, so the multi-query
-/// form needs `Q * groups` of them. aarch64 has 32 vector registers and the loop also
-/// needs the code chunk, the unpacked values and a query chunk, so the accumulator
-/// budget is 16. Exceeding it spills to the stack, which cost 42% when it happened
-/// to the single-query kernel.
+/// form needs `Q * groups` of them, within `accumulator_budget`.
 pub fn multiWidth(layout: Layout) usize {
     return switch (layout.kind()) {
-        .sequential => @max(1, 16 / (8 / @as(usize, layout.bits))),
+        .sequential => @max(1, accumulator_budget / (8 / @as(usize, layout.bits))),
         .bit_plane => 4,
     };
 }
@@ -572,9 +587,7 @@ pub fn scoreInt8Multi(
     std.debug.assert(codes.len * 8 >= @as(usize, dim) * layout.bits);
     switch (layout.kind()) {
         .sequential => switch (layout.bits) {
-            1 => scoreBitsMulti(1, 2, table, queries, codes, dim, out),
-            2 => scoreBitsMulti(2, 4, table, queries, codes, dim, out),
-            4 => scoreBitsMulti(4, 8, table, queries, codes, dim, out),
+            inline 1, 2, 4 => |bits| scoreBitsMulti(bits, sequentialWidth(bits), table, queries, codes, dim, out),
             else => unreachable,
         },
         // Bit-plane assembles its indices from planes rather than by shift-and-mask;

@@ -16,8 +16,20 @@
 //! structure that is hard to guess: RoPE rotates keys position-dependently, a few key
 //! channels carry outsized magnitude, and values look nothing like keys.
 //!
-//! Baselines are per-token int8 and int4 with a per-row scale, which is what KV
-//! quantization in practice usually means.
+//! Two families of baseline. The original rows, per-token int8 and int4 with one symmetric
+//! scale per 64-wide row, are kept so earlier numbers stay comparable — but they are a weak
+//! baseline: no zero point, one scale for the whole row, and `2^(bits-1) - 1` levels, so
+//! int4 uses 15 of its 16. The stronger rows are what KV quantization in practice means:
+//!
+//!   int<b> tok g<n>  asymmetric (scale + zero point) per token, in groups of n channels.
+//!   KIVI-<b> g<n>    KIVI (Liu et al., 2024): keys per *channel* over groups of n tokens,
+//!                    values per token over groups of min(n, d) channels, both asymmetric.
+//!
+//! Every scale and zero point is stored as f16 (rounded to f16 before use, so the error is
+//! the error of what would actually be stored) and counted in B/tok/hd. KIVI's per-channel
+//! key metadata is shared by n tokens, so it is counted amortised: d * 4 / n bytes per
+//! token. KIVI also keeps the most recent tokens in fp16 until a group fills; that window is
+//! left out here, so every KIVI row quantizes every token at the bytes shown.
 
 const std = @import("std");
 const zq = @import("zquant");
@@ -64,6 +76,78 @@ fn quantizeRows(rows: []const f32, d: usize, bits: u8, out: []f32) void {
     }
 }
 
+fn f16Round(x: f32) f32 {
+    return @floatCast(@as(f16, @floatCast(x)));
+}
+
+/// Asymmetric min/max quantization of the block rows[t0..t1] x channels[c0..c1] to `bits`,
+/// using all 2^bits levels. Scale and zero point go through f16, as they would be stored.
+fn quantizeBlock(src: []const f32, out: []f32, d: usize, t0: usize, t1: usize, c0: usize, c1: usize, bits: u8) void {
+    var lo: f32 = std.math.inf(f32);
+    var hi: f32 = -std.math.inf(f32);
+    for (t0..t1) |t| for (src[t * d + c0 .. t * d + c1]) |x| {
+        lo = @min(lo, x);
+        hi = @max(hi, x);
+    };
+    const levels: f32 = @floatFromInt((@as(u32, 1) << @intCast(bits)) - 1);
+    const zero = f16Round(lo);
+    const scale = f16Round((hi - lo) / levels);
+    for (t0..t1) |t| for (src[t * d + c0 .. t * d + c1], out[t * d + c0 .. t * d + c1]) |x, *o| {
+        if (scale == 0) {
+            o.* = zero;
+        } else {
+            o.* = std.math.clamp(@round((x - zero) / scale), 0, levels) * scale + zero;
+        }
+    };
+}
+
+/// How a tensor is grouped for asymmetric quantization.
+const Grouping = union(enum) {
+    /// One scale and zero point per token per `n` channels.
+    per_token: usize,
+    /// One scale and zero point per channel per `n` tokens (KIVI's key layout).
+    per_channel: usize,
+
+    fn apply(self: Grouping, src: []const f32, seq: usize, d: usize, bits: u8, out: []f32) void {
+        switch (self) {
+            .per_token => |n| for (0..seq) |t| {
+                var c: usize = 0;
+                while (c < d) : (c += n) quantizeBlock(src, out, d, t, t + 1, c, @min(c + n, d), bits);
+            },
+            .per_channel => |n| {
+                // A trailing partial group gets its own statistics; KIVI would hold those
+                // tokens in fp16 instead, which this deliberately does not model.
+                var t: usize = 0;
+                while (t < seq) : (t += n) for (0..d) |c| quantizeBlock(src, out, d, t, @min(t + n, seq), c, c + 1, bits);
+            },
+        }
+    }
+
+    /// Bytes per token: packed codes plus f16 scale and f16 zero point per group, with
+    /// per-channel metadata amortised over the `n` tokens that share it.
+    fn bytes(self: Grouping, d: usize, bits: u8) usize {
+        const codes = d * bits / 8;
+        return codes + switch (self) {
+            .per_token => |n| 4 * ((d + n - 1) / n),
+            .per_channel => |n| 4 * d / n,
+        };
+    }
+};
+
+const Baseline = struct { label: []const u8, bits: u8, k: Grouping, v: Grouping };
+
+const baselines = [_]Baseline{
+    .{ .label = "int4 tok g64", .bits = 4, .k = .{ .per_token = 64 }, .v = .{ .per_token = 64 } },
+    .{ .label = "int4 tok g32", .bits = 4, .k = .{ .per_token = 32 }, .v = .{ .per_token = 32 } },
+    .{ .label = "KIVI-4 g128", .bits = 4, .k = .{ .per_channel = 128 }, .v = .{ .per_token = 64 } },
+    .{ .label = "KIVI-4 g64", .bits = 4, .k = .{ .per_channel = 64 }, .v = .{ .per_token = 64 } },
+    .{ .label = "KIVI-4 g32", .bits = 4, .k = .{ .per_channel = 32 }, .v = .{ .per_token = 32 } },
+    .{ .label = "int2 tok g32", .bits = 2, .k = .{ .per_token = 32 }, .v = .{ .per_token = 32 } },
+    .{ .label = "KIVI-2 g128", .bits = 2, .k = .{ .per_channel = 128 }, .v = .{ .per_token = 64 } },
+    .{ .label = "KIVI-2 g64", .bits = 2, .k = .{ .per_channel = 64 }, .v = .{ .per_token = 64 } },
+    .{ .label = "KIVI-2 g32", .bits = 2, .k = .{ .per_channel = 32 }, .v = .{ .per_token = 32 } },
+};
+
 const Stats = struct {
     score_rmse: f64 = 0,
     weight_tv: f64 = 0,
@@ -93,8 +177,13 @@ fn evaluate(
     d: usize,
     approx_scores: ?[]const f32, // [seq*seq] or null
     approx_values: ?[]const f32,
-    random: std.Random,
+    seed: u64,
 ) !Stats {
+    // Positions come from `seed` alone, so every scheme on a head is scored at the same
+    // query positions. A shared stream would hand each scheme different positions and add
+    // sampling noise to every comparison between rows.
+    var prng = std.Random.DefaultPrng.init(seed);
+    const random = prng.random();
     const inv_sqrt_d: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(d)));
     const exact_p = try a.alloc(f32, seq);
     defer a.free(exact_p);
@@ -162,9 +251,6 @@ pub fn main() !void {
     };
     defer a.free(meta_raw);
 
-    var prng = std.Random.DefaultPrng.init(0x11FE);
-    const random = prng.random();
-
     std.debug.print("\nKV-cache fidelity on real attention tensors ({d} query positions per head)\n", .{K_POSITIONS});
     std.debug.print("  score RMSE is on pre-softmax logits; weight TV is total variation between\n", .{});
     std.debug.print("  attention distributions; output error is relative L2 of the attention output.\n\n", .{});
@@ -219,12 +305,52 @@ pub fn main() !void {
                     for (q[i * d ..][0..d], kq[j * d ..][0..d]) |x, y| s += x * y;
                     scores[i * seq + j] = s;
                 };
-                agg.add(try evaluate(a, q, k, v, seq, d, scores, approx_v, random));
+                agg.add(try evaluate(a, q, k, v, seq, d, scores, approx_v, 0x11FE + 16 * layer + h));
             }
             const m = agg.mean();
             const per = 2 * (d * bits / 8 + 4);
             const label = if (bits == 8) "int8 per-row" else "int4 per-row";
             std.debug.print("  {s:>18} {d:>9} {d:>11.4} {d:>10.4} {d:>11.4}\n", .{ label, per, m.score_rmse, m.weight_tv, m.out_rel });
+        }
+
+        // --- asymmetric grouped baselines: per-token groups, and KIVI's per-channel keys.
+        for (baselines) |bl| {
+            var agg_k = Stats{};
+            var agg_both = Stats{};
+            const kq = try a.alloc(f32, seq * d);
+            defer a.free(kq);
+            for (0..kv_heads) |h| {
+                const k = kf.data[h * seq * d ..][0 .. seq * d];
+                const v = vf.data[h * seq * d ..][0 .. seq * d];
+                const q = qf.data[(h * (q_heads / kv_heads)) * seq * d ..][0 .. seq * d];
+                bl.k.apply(k, seq, d, bl.bits, kq);
+                bl.v.apply(v, seq, d, bl.bits, approx_v);
+                for (0..seq) |i| for (0..seq) |j| {
+                    var s: f32 = 0;
+                    for (q[i * d ..][0..d], kq[j * d ..][0..d]) |x, y| s += x * y;
+                    scores[i * seq + j] = s;
+                };
+                agg_k.add(try evaluate(a, q, k, v, seq, d, scores, null, 0x11FE + 16 * layer + h));
+                agg_both.add(try evaluate(a, q, k, v, seq, d, scores, approx_v, 0x11FE + 16 * layer + h));
+            }
+            const mk = agg_k.mean();
+            const mb = agg_both.mean();
+            var buf: [40]u8 = undefined;
+            std.debug.print("  {s:>18} {d:>9} {d:>11.4} {d:>10.4} {d:>11.4}\n", .{
+                try std.fmt.bufPrint(&buf, "{s} K", .{bl.label}),
+                bl.k.bytes(d, bl.bits),
+                mk.score_rmse,
+                mk.weight_tv,
+                mk.out_rel,
+            });
+            var buf2: [40]u8 = undefined;
+            std.debug.print("  {s:>18} {d:>9} {d:>11.4} {d:>10.4} {d:>11.4}\n", .{
+                try std.fmt.bufPrint(&buf2, "{s} K+V", .{bl.label}),
+                bl.k.bytes(d, bl.bits) + bl.v.bytes(d, bl.bits),
+                mb.score_rmse,
+                mb.weight_tv,
+                mb.out_rel,
+            });
         }
 
         // --- zquant, across the knobs that could plausibly matter here.
@@ -300,8 +426,8 @@ pub fn main() !void {
                         mse.decode(codes, norm, approx_v[i * d ..][0..d], &ws);
                     }
 
-                    agg_k.add(try evaluate(a, q, k, v, seq, d, scores, null, random));
-                    agg_both.add(try evaluate(a, q, k, v, seq, d, scores, approx_v, random));
+                    agg_k.add(try evaluate(a, q, k, v, seq, d, scores, null, 0x11FE + 16 * layer + h));
+                    agg_both.add(try evaluate(a, q, k, v, seq, d, scores, approx_v, 0x11FE + 16 * layer + h));
                 }
 
                 // Bytes actually consumed by the path being measured: packed codes at

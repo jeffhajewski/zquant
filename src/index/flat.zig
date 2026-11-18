@@ -753,6 +753,14 @@ pub const FlatIndex = struct {
             }
             break :blk norms;
         };
+        // The per-query half of `scalarScore`, laid out as lanes for the epilogue.
+        var query_factor: [max_batch]f32 = undefined;
+        var query_offset: [max_batch]f32 = undefined;
+        for (0..n) |i| {
+            const terms = queryTerms(self.metric, query_norms[i]);
+            query_factor[i] = terms.factor;
+            query_offset[i] = terms.offset;
+        }
 
         const stride = self.codeStride();
         const sketch_len = self.sketchStride();
@@ -766,8 +774,13 @@ pub const FlatIndex = struct {
         const group = 4;
         // Everything the inner loop would otherwise re-test per (vector, query) pair:
         // all three are fixed for the whole index.
+        //
+        // Every metric qualifies: under the scalar correction each one is an affine map
+        // of the shifted MSE term with per-vector and per-query coefficients
+        // (`scalarScore`), so cosine and L2 reject a lane group as cheaply as inner
+        // product does. They used to take the per-pair path, and measured about half
+        // inner product's throughput for it.
         const fast_path = self.correction == .scalar and
-            self.metric == .inner_product and
             (self.residency == .expanded or use_simd);
         const compact_width = if (use_simd) scan.multiWidth(self.layout) else 1;
         var mse_block: [tile * max_batch]f32 = undefined;
@@ -890,36 +903,49 @@ pub const FlatIndex = struct {
                     // `searchBatch`'s 133, and the gap is the per-pair scalar work
                     // rather than the top-k structure.
                     const block = mse_block[u * max_batch ..][0..n];
-                    const ng: f32 = norm * gamma;
-                    const ngv: Lane = @splat(ng);
+                    const vt = vectorTerms(self.metric, norm, gamma);
+                    const av: Lane = @splat(vt.factor);
+                    const bv: Lane = @splat(vt.offset);
 
                     var i: usize = 0;
-                    while (i + lanes <= n) : (i += lanes) {
-                        const m: Lane = block[i..][0..lanes].*;
-                        const sh: Lane = shift_terms[i..][0..lanes].*;
-                        const th: Lane = thresholds[i..][0..lanes].*;
-                        const sc = ngv * (sh + m);
-                        // Visit only the lanes that actually passed. Descending into
-                        // all `lanes` on any hit costs eight unpredictable branches to
-                        // service what is almost always a single accept, and hits get
-                        // steadily more frequent as k rises and thresholds fall — which
-                        // is where the cost of retrieval depth lives.
-                        var mask: LaneMask = @bitCast(sc > th);
-                        if (mask == 0) continue;
-                        const each: [lanes]f32 = sc;
-                        while (mask != 0) {
-                            const j = @ctz(mask);
-                            mask &= mask - 1;
-                            const q = i + j;
-                            hot[q][hot_len[q]] = .{ .id = @intCast(v), .score = each[j] };
-                            hot_len[q] += 1;
-                            if (hot_len[q] == hot_slots) {
-                                flushHot(&collectors[q], &hot[q], &hot_len[q], &thresholds[q]);
+                    // Inner product's query coefficients are 1 and 0, so its lanes skip
+                    // loading them; specialized at compile time, it is the loop it was
+                    // before cosine and L2 joined (which cost it 3.5% unspecialized).
+                    switch (self.metric == .inner_product) {
+                        inline else => |plain| while (i + lanes <= n) : (i += lanes) {
+                            const m: Lane = block[i..][0..lanes].*;
+                            const sh: Lane = shift_terms[i..][0..lanes].*;
+                            const th: Lane = thresholds[i..][0..lanes].*;
+                            // `scalarScore`, lane by lane and in the same order, so the
+                            // result is bit-identical to the scalar paths. For inner
+                            // product (f·1)·t + (0+0) is f·t exactly.
+                            const sc = if (plain) av * (sh + m) else blk: {
+                                const qf: Lane = query_factor[i..][0..lanes].*;
+                                const qc: Lane = query_offset[i..][0..lanes].*;
+                                break :blk (av * qf) * (sh + m) + (bv + qc);
+                            };
+                            // Visit only the lanes that actually passed. Descending into
+                            // all `lanes` on any hit costs eight unpredictable branches to
+                            // service what is almost always a single accept, and hits get
+                            // steadily more frequent as k rises and thresholds fall — which
+                            // is where the cost of retrieval depth lives.
+                            var mask: LaneMask = @bitCast(sc > th);
+                            if (mask == 0) continue;
+                            const each: [lanes]f32 = sc;
+                            while (mask != 0) {
+                                const j = @ctz(mask);
+                                mask &= mask - 1;
+                                const q = i + j;
+                                hot[q][hot_len[q]] = .{ .id = @intCast(v), .score = each[j] };
+                                hot_len[q] += 1;
+                                if (hot_len[q] == hot_slots) {
+                                    flushHot(&collectors[q], &hot[q], &hot_len[q], &thresholds[q]);
+                                }
                             }
-                        }
+                        },
                     }
                     while (i < n) : (i += 1) {
-                        const sc = ng * (shift_terms[i] + block[i]);
+                        const sc = scalarScore(vt, .{ .factor = query_factor[i], .offset = query_offset[i] }, shift_terms[i] + block[i]);
                         if (sc > thresholds[i]) {
                             collectors[i].offer(sc, @intCast(v));
                             thresholds[i] = collectors[i].threshold();
@@ -929,8 +955,9 @@ pub const FlatIndex = struct {
                     // Heaps not yet full: everything is admitted, so there is nothing
                     // to reject early and the scalar path is the whole job.
                     const block = mse_block[u * max_batch ..][0..n];
+                    const vt = vectorTerms(self.metric, norm, gamma);
                     for (0..n) |i| {
-                        const sc = norm * gamma * (shift_terms[i] + block[i]);
+                        const sc = scalarScore(vt, .{ .factor = query_factor[i], .offset = query_offset[i] }, shift_terms[i] + block[i]);
                         collectors[i].offer(sc, @intCast(v));
                         thresholds[i] = collectors[i].threshold();
                     }
@@ -940,8 +967,12 @@ pub const FlatIndex = struct {
                     else
                         scan.scoreExact(self.layout, centroids, searcher.query_states[i].rotated, code_slot);
 
-                    const estimate = switch (self.correction) {
-                        .scalar => norm * gamma * (shift_terms[i] + mse_term),
+                    const sc = switch (self.correction) {
+                        .scalar => scalarScore(
+                            vectorTerms(self.metric, norm, gamma),
+                            .{ .factor = query_factor[i], .offset = query_offset[i] },
+                            shift_terms[i] + mse_term,
+                        ),
                         .qjl_sketch => blk: {
                             const sketch_term = if (!self.use_sketch)
                                 0
@@ -949,10 +980,10 @@ pub const FlatIndex = struct {
                                 sketch_kernel.signDot(searcher.sketch_queries[i], sketch_slot, padded)
                             else
                                 sketch_kernel.signDotExact(searcher.query_states[i].sketched, sketch_slot);
-                            break :blk norm * (mse_term + gamma * self.quantizer.sketch_scale * sketch_term);
+                            const estimate = norm * (mse_term + gamma * self.quantizer.sketch_scale * sketch_term);
+                            break :blk self.score(estimate, norm, query_norms[i]);
                         },
                     };
-                    const sc = self.score(estimate, norm, query_norms[i]);
                     if (!filled or sc > thresholds[i]) {
                         collectors[i].offer(sc, @intCast(v));
                         thresholds[i] = collectors[i].threshold();
@@ -1120,6 +1151,7 @@ pub const FlatIndex = struct {
             euclideanNorm(query)
         else
             0;
+        const query_terms = queryTerms(self.metric, query_norm);
 
         var collector = topk.TopK.init(searcher.heap);
         const stride = self.codeStride();
@@ -1195,8 +1227,12 @@ pub const FlatIndex = struct {
                 const norm: f32 = scalars.norm;
                 const gamma: f32 = scalars.gamma;
 
-                const estimate = switch (self.correction) {
-                    .scalar => norm * gamma * (shift_term + mse_term),
+                const sc = switch (self.correction) {
+                    .scalar => scalarScore(
+                        vectorTerms(self.metric, norm, gamma),
+                        query_terms,
+                        shift_term + mse_term,
+                    ),
                     .qjl_sketch => blk: {
                         const sketch_term = if (!self.use_sketch)
                             0
@@ -1204,18 +1240,21 @@ pub const FlatIndex = struct {
                             sketch_kernel.signDot(searcher.sketch_query, sketch_slot, padded)
                         else
                             sketch_kernel.signDotExact(searcher.query_state.sketched, sketch_slot);
-                        break :blk norm * (mse_term + gamma * self.quantizer.sketch_scale * sketch_term);
+                        const estimate = norm * (mse_term + gamma * self.quantizer.sketch_scale * sketch_term);
+                        break :blk self.score(estimate, norm, query_norm);
                     },
                 };
 
-                collector.offer(self.score(estimate, norm, query_norm), @intCast(i));
+                collector.offer(sc, @intCast(i));
             }
         }
 
         return collector.drain();
     }
 
-    /// Map an inner-product estimate onto the metric, always larger-is-better.
+    /// Map an inner-product estimate onto the metric, always larger-is-better. The
+    /// `.qjl_sketch` paths use this; `.scalar` uses `scalarScore`, which is the same
+    /// map rearranged so the batch epilogue can evaluate it a lane group at a time.
     fn score(self: FlatIndex, estimate: f32, norm: f32, query_norm: f32) f32 {
         return switch (self.metric) {
             .inner_product => estimate,
@@ -1232,6 +1271,56 @@ pub const FlatIndex = struct {
         };
     }
 };
+
+/// Per-vector coefficients of `scalarScore`.
+const VectorTerms = struct { factor: f32, offset: f32 };
+/// Per-query coefficients of `scalarScore`.
+const QueryTerms = struct { factor: f32, offset: f32 };
+
+/// The `.scalar`-correction score for any metric, as one affine map of the shifted
+/// MSE term `t = shift + ⟨p, ỹ⟩`:
+///
+///     score = (v.factor · q.factor) · t + (v.offset + q.offset)
+///
+/// With the estimate `e = norm·γ·t` of ⟨q, x⟩:
+///
+///     inner product   e                       = (norm·γ)·t
+///     cosine          e / (norm·‖q‖)          = (γ · 1/‖q‖)·t
+///     l2              −(‖q‖² + norm² − 2e)    = (2·norm·γ)·t − norm² − ‖q‖²
+///
+/// Splitting the coefficients by who owns them is what lets the batch epilogue score
+/// a whole lane group of queries against one vector with a multiply and an add, for
+/// every metric rather than inner product alone. Every path that scores `.scalar`
+/// calls this, or evaluates it lane-wise in this exact order, so batched and
+/// single-query scores stay bit-identical.
+///
+/// A zero vector or zero query has no direction under cosine and scores −inf, as
+/// `score` does: its factor is zero and its offset −inf.
+inline fn scalarScore(v: VectorTerms, q: QueryTerms, t: f32) f32 {
+    return (v.factor * q.factor) * t + (v.offset + q.offset);
+}
+
+fn vectorTerms(metric: Metric, norm: f32, gamma: f32) VectorTerms {
+    return switch (metric) {
+        .inner_product => .{ .factor = norm * gamma, .offset = 0 },
+        .cosine => if (norm > 0)
+            .{ .factor = gamma, .offset = 0 }
+        else
+            .{ .factor = 0, .offset = -std.math.inf(f32) },
+        .l2 => .{ .factor = 2 * norm * gamma, .offset = -(norm * norm) },
+    };
+}
+
+fn queryTerms(metric: Metric, query_norm: f32) QueryTerms {
+    return switch (metric) {
+        .inner_product => .{ .factor = 1, .offset = 0 },
+        .cosine => if (query_norm > 0)
+            .{ .factor = 1 / query_norm, .offset = 0 }
+        else
+            .{ .factor = 0, .offset = -std.math.inf(f32) },
+        .l2 => .{ .factor = 1, .offset = -(query_norm * query_norm) },
+    };
+}
 
 /// Drain staged candidates into a collector and refresh its cached threshold.
 inline fn flushHot(

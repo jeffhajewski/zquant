@@ -181,3 +181,88 @@ func (ix *Index) Search(queries []float32, k, threads int) (Results, error) {
 	ix.cacheMu.Unlock()
 	return ix.searchLocked(s, queries)
 }
+
+// SearchRerank searches, then rescores each query's candidates exactly against the
+// original vectors and returns the best k of them, with exact scores under the index's
+// metric.
+//
+// The searcher's K is how many candidates are fetched, and k must be at most that.
+// Fetching 4-10x more candidates than you keep, and reranking, recovers close to the
+// exact top k. originals holds the vectors as added, row-major, row i being id i, and
+// must cover every vector in the index.
+func (ix *Index) SearchRerank(s *Searcher, queries, originals []float32, k int) (Results, error) {
+	nq, err := ix.rows(queries, "queries")
+	if err != nil {
+		return Results{}, err
+	}
+	nOrig, err := ix.rows(originals, "originals")
+	if err != nil {
+		return Results{}, err
+	}
+	if k < 1 || k > s.k {
+		return Results{}, invalid("rerank k %d is outside 1..%d, the searcher's candidate count", k, s.k)
+	}
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	if err := ix.acquire(s); err != nil {
+		return Results{}, err
+	}
+	defer s.mu.Unlock()
+	count := ix.lenLocked()
+	if count == 0 {
+		return Results{}, &Error{Status: C.ZQ_ERR_STATE, Context: "search on an empty index"}
+	}
+	if nOrig < count {
+		return Results{}, invalid("originals hold %d vectors but the index holds %d", nOrig, count)
+	}
+
+	ids := make([]uint32, nq*k)
+	scores := make([]float32, nq*k)
+	for start := 0; start < nq; start += s.capacity {
+		n := min(s.capacity, nq-start)
+		st := C.zq_search_rerank(
+			ix.handle, s.handle,
+			(*C.float)(&queries[start*ix.dim]), C.size_t(n),
+			(*C.float)(&originals[0]), C.size_t(nOrig), C.size_t(k),
+			(*C.uint32_t)(unsafe.Pointer(&ids[start*k])),
+			(*C.float)(&scores[start*k]),
+		)
+		runtime.KeepAlive(ix)
+		runtime.KeepAlive(s)
+		if err := check(st, "search rerank"); err != nil {
+			return Results{}, err
+		}
+	}
+	return Results{IDs: ids, Scores: scores, K: k}, nil
+}
+
+// ScoreIDs scores chosen stored vectors against one query: the result's j-th score is
+// the estimate a search would report for ids[j]. It is for ranking a candidate set
+// picked some other way, by a metadata filter or another index, without scanning the
+// whole corpus. An id at or past Len is an error matching ErrInvalid.
+func (ix *Index) ScoreIDs(s *Searcher, query []float32, ids []uint32) ([]float32, error) {
+	if len(query) != ix.dim {
+		return nil, invalid("query length %d is not dim %d", len(query), ix.dim)
+	}
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	if err := ix.acquire(s); err != nil {
+		return nil, err
+	}
+	defer s.mu.Unlock()
+	scores := make([]float32, len(ids))
+	if len(ids) == 0 {
+		return scores, nil
+	}
+	st := C.zq_score_ids(
+		ix.handle, s.handle, (*C.float)(&query[0]),
+		(*C.uint32_t)(unsafe.Pointer(&ids[0])), C.size_t(len(ids)),
+		(*C.float)(&scores[0]),
+	)
+	runtime.KeepAlive(ix)
+	runtime.KeepAlive(s)
+	if err := check(st, "score ids"); err != nil {
+		return nil, err
+	}
+	return scores, nil
+}

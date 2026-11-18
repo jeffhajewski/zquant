@@ -339,3 +339,51 @@ func (ix *Index) Add(vectors []float32) error {
 	runtime.KeepAlive(ix)
 	return check(st, "add")
 }
+
+// AddParallel is Add with encoding spread over up to threads threads; 0 or 1 encodes
+// on the calling goroutine. The index ends up byte-for-byte the same as after Add.
+// Below a few hundred vectors per thread the library encodes on one thread anyway,
+// since starting a thread costs more than that much work.
+func (ix *Index) AddParallel(vectors []float32, threads int) error {
+	n, err := ix.rows(vectors, "vectors")
+	if err != nil {
+		return err
+	}
+	if threads < 0 || threads > MaxThreads {
+		return invalid("threads %d is outside 0..%d", threads, MaxThreads)
+	}
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	if ix.handle == nil {
+		return errIndexClosed
+	}
+	st := C.zq_index_add_parallel(ix.handle, (*C.float)(&vectors[0]), C.size_t(n), C.size_t(threads))
+	runtime.KeepAlive(ix)
+	return check(st, "add")
+}
+
+// CalibrateAuto measures the sample's centroid norm and calibrates only if it is at
+// least 0.3, where calibration measured a gain; below that it measured neutral or
+// worse. It returns the norm and whether calibration was applied, and fails exactly as
+// Calibrate would, whatever the measurement. Like Calibrate it must precede Add.
+//
+// This is the sensible default when you do not know your data.
+func (ix *Index) CalibrateAuto(sample []float32) (centroidNorm float32, applied bool, err error) {
+	n, err := ix.rows(sample, "sample")
+	if err != nil {
+		return 0, false, err
+	}
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	if ix.handle == nil {
+		return 0, false, errIndexClosed
+	}
+	var norm C.float
+	var did C.int
+	st := C.zq_index_calibrate_auto(ix.handle, (*C.float)(&sample[0]), C.size_t(n), &norm, &did)
+	runtime.KeepAlive(ix)
+	if err := check(st, "calibrate"); err != nil {
+		return 0, false, err
+	}
+	return float32(norm), did != 0, nil
+}

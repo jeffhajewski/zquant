@@ -45,6 +45,10 @@ func TestCloseIsIdempotentAndLaterCallsFail(t *testing.T) {
 	_, checks["Search"] = ix.Search(x[:d], 5, 1)
 	_, checks["SearchWith"] = ix.SearchWith(s, x[:d])
 	_, checks["NewSearcher"] = ix.NewSearcher(5, 1)
+	checks["AddParallel"] = ix.AddParallel(x, 2)
+	_, _, checks["CalibrateAuto"] = ix.CalibrateAuto(x)
+	_, checks["SearchRerank"] = ix.SearchRerank(s, x[:d], x, 5)
+	_, checks["ScoreIDs"] = ix.ScoreIDs(s, x[:d], []uint32{0})
 	for name, err := range checks {
 		if !errors.Is(err, ErrClosed) {
 			t.Errorf("%s after Close: got %v, want ErrClosed", name, err)

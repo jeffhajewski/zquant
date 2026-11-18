@@ -231,17 +231,21 @@ jobs:
   # Zig cross-compiles without a toolchain per target, so the release artifacts can be
   # checked on every push rather than discovered to be broken at tag time.
   cross-compile:
-    name: Cross-compile ${{ matrix.target }}
+    name: Cross-compile ${{ matrix.target }} (${{ matrix.cpu }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-linux-gnu
-          - aarch64-linux-gnu
-          - x86_64-macos
-          - aarch64-macos
-          - x86_64-windows-gnu
+        # The release matrix, target and CPU alike (release.yml explains the CPUs).
+        include:
+          - { target: x86_64-linux-gnu,   cpu: x86_64_v2 }
+          - { target: x86_64-linux-gnu,   cpu: baseline }
+          - { target: aarch64-linux-gnu,  cpu: generic+dotprod }
+          - { target: aarch64-linux-gnu,  cpu: baseline }
+          - { target: x86_64-macos,       cpu: baseline }
+          - { target: aarch64-macos,      cpu: baseline }
+          - { target: x86_64-windows-gnu, cpu: x86_64_v2 }
+          - { target: x86_64-windows-gnu, cpu: baseline }
 
     steps:
       - uses: actions/checkout@v4
@@ -252,4 +256,16 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
 
       - name: Build library
-        run: zig build lib -Dtarget=${{ matrix.target }}
+        run: zig build lib -Dtarget=${{ matrix.target }} -Dcpu=${{ matrix.cpu }}
+
+      # The point of the CPU choice: the shipped kernels must actually be the native
+      # ones. The aarch64 and x86_64 Linux builds used to fall back to scalar code. The
+      # library embeds which it compiled to (zq_build_kernels), so a grep of the binary
+      # checks it without a disassembler for the target architecture.
+      - name: Check the kernels are native, not the scalar fallback
+        if: matrix.cpu != 'baseline'
+        run: |
+          set -e
+          lib=$(find zig-out -name 'libzquant.so' -o -name 'libzquant.dylib' -o -name 'zquant.dll' | head -1)
+          grep -a -o 'zquant-kernels [a-z=]* [a-z=]*' "$lib"
+          grep -a -q 'zquant-kernels shuffle=native dot=native' "$lib"

@@ -27,6 +27,28 @@ pub fn build(b: *std.Build) void {
         .optimize = lib_optimize,
     });
     c_api.link_libc = true;
+
+    // The runtime CPU check (src/cpu_probe.zig), compiled for the architecture
+    // *baseline* so that it can run on any CPU of the architecture — including one that
+    // lacks the instructions the rest of the library was compiled with, which is the
+    // CPU it exists to detect. It is told which features those are.
+    var probe_query = target.query;
+    probe_query.cpu_model = .baseline;
+    probe_query.cpu_features_add = .empty;
+    probe_query.cpu_features_sub = .empty;
+    const cpu_options = b.addOptions();
+    cpu_options.addOption([]const u8, "required", requiredCpuFeatures(b, target));
+    cpu_options.addOption([]const u8, "model", target.result.cpu.model.name);
+    const probe_mod = b.createModule(.{
+        .root_source_file = b.path("src/cpu_probe.zig"),
+        .target = b.resolveTargetQuery(probe_query),
+        .optimize = lib_optimize,
+        .link_libc = true,
+        .pic = true,
+    });
+    probe_mod.addOptions("cpu_options", cpu_options);
+    c_api.addObject(b.addObject(.{ .name = "zquant_cpu", .root_module = probe_mod }));
+
     const lib_static = b.addLibrary(.{ .name = "zquant", .root_module = c_api, .linkage = .static });
     const lib_shared = b.addLibrary(.{ .name = "zquant", .root_module = c_api, .linkage = .dynamic });
     lib_static.installHeader(b.path("include/zquant.h"), "zquant.h");
@@ -122,4 +144,45 @@ pub fn build(b: *std.Build) void {
         // Each bench is also its own step, so one can be run alone.
         b.step(name, b.fmt("Run {s}", .{name})).dependOn(&run.step);
     }
+}
+
+/// Instruction-set features the target enables beyond its architecture's baseline, as
+/// a space-separated list for src/cpu_probe.zig to verify at load time.
+///
+/// Only features the probe knows how to detect are listed. The rest of what a CPU model
+/// enables is tuning (instruction scheduling, fusion), which changes no instruction the
+/// CPU must execute. A native build lists nothing: it runs where it was built.
+fn requiredCpuFeatures(b: *std.Build, target: std.Build.ResolvedTarget) []const u8 {
+    if (target.query.isNativeCpu()) return "";
+    const t = target.result;
+    const baseline = std.Target.Cpu.baseline(t.cpu.arch, t.os);
+    var out: std.ArrayList(u8) = .empty;
+    switch (t.cpu.arch) {
+        .x86_64 => {
+            const F = std.Target.x86.Feature;
+            const known = [_]F{
+                .sse3,     .ssse3,    .fma,      .cx16,     .sse4_1,     .sse4_2,
+                .crc32,    .movbe,    .popcnt,   .xsave,    .avx,        .f16c,
+                .sahf,     .lzcnt,    .bmi,      .avx2,     .bmi2,       .avx512f,
+                .avx512dq, .avx512cd, .avx512bw, .avx512vl, .avx512vnni, .avxvnni,
+            };
+            for (known) |f| {
+                if (std.Target.x86.featureSetHas(t.cpu.features, f) and
+                    !std.Target.x86.featureSetHas(baseline.features, f))
+                {
+                    if (out.items.len > 0) out.append(b.allocator, ' ') catch @panic("OOM");
+                    out.appendSlice(b.allocator, @tagName(f)) catch @panic("OOM");
+                }
+            }
+        },
+        .aarch64 => {
+            if (std.Target.aarch64.featureSetHas(t.cpu.features, .dotprod) and
+                !std.Target.aarch64.featureSetHas(baseline.features, .dotprod))
+            {
+                out.appendSlice(b.allocator, "dotprod") catch @panic("OOM");
+            }
+        },
+        else => {},
+    }
+    return out.items;
 }

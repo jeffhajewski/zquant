@@ -23,6 +23,7 @@ typedef int zq_status;
 #define ZQ_ERR_INVALID     -2
 #define ZQ_ERR_STATE       -3
 #define ZQ_ERR_UNSUPPORTED -4
+#define ZQ_ERR_CPU         -5
 
 /* Largest accepted dimension, and largest worker count for a searcher. */
 #define ZQ_MAX_DIM     65536
@@ -49,6 +50,23 @@ typedef struct {
 
 const char *zq_version(void);
 const char *zq_status_string(zq_status status);
+
+/* Non-zero if this CPU can run this build of the library.
+ *
+ * Release builds use instructions beyond the architecture baseline (SSSE3 on x86_64,
+ * the dot-product extension on arm64), because without them search is 6-10x slower.
+ * On a CPU that lacks them the library would die of an illegal instruction, so call
+ * this first, straight after loading it: it is compiled for the bare baseline and is
+ * safe on any CPU. If it returns 0, use a portable build instead. Creating an index or
+ * codec also checks, returning ZQ_ERR_CPU. */
+int zq_cpu_supported(void);
+
+/* The CPU model this build was compiled for, e.g. "x86_64_v2", for diagnostics. */
+const char *zq_build_cpu(void);
+
+/* Which scan kernels this build uses, e.g. "zquant-kernels shuffle=native dot=native".
+ * "scalar" means the portable fallback, which is correct but several times slower. */
+const char *zq_build_kernels(void);
 
 zq_status zq_index_create(const zq_config *config, zq_index **out);
 void      zq_index_free(zq_index *index);

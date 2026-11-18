@@ -24,6 +24,10 @@ pub const ZQ_ERR_ALLOC: c_int = -1;
 pub const ZQ_ERR_INVALID: c_int = -2;
 pub const ZQ_ERR_STATE: c_int = -3;
 pub const ZQ_ERR_UNSUPPORTED: c_int = -4;
+pub const ZQ_ERR_CPU: c_int = -5;
+
+/// From src/cpu_probe.zig, compiled for the architecture baseline so it runs anywhere.
+extern fn zq_cpu_supported() c_int;
 
 /// Largest dimension the library accepts. Far above any embedding or head dimension in
 /// use, and low enough that `dim` rounded up for the rotation, and every per-vector
@@ -84,6 +88,18 @@ export fn zq_version() [*:0]const u8 {
     return "0.1.0";
 }
 
+/// Which kernels this build compiled to: native instructions or the portable scalar
+/// fallback. The string sits in the binary as a literal, so CI checks a cross-compiled
+/// release with `grep -a` instead of a disassembler for a foreign architecture.
+const kernels = std.fmt.comptimePrint("zquant-kernels shuffle={s} dot={s}", .{
+    if (zq.simd_shuffle.accelerated) "native" else "scalar",
+    if (zq.simd_dot.accelerated) "native" else "scalar",
+});
+
+export fn zq_build_kernels() [*:0]const u8 {
+    return kernels;
+}
+
 export fn zq_status_string(status: c_int) [*:0]const u8 {
     return switch (status) {
         ZQ_OK => "ok",
@@ -91,11 +107,15 @@ export fn zq_status_string(status: c_int) [*:0]const u8 {
         ZQ_ERR_INVALID => "invalid argument",
         ZQ_ERR_STATE => "operation not valid in this state",
         ZQ_ERR_UNSUPPORTED => "unsupported configuration",
+        ZQ_ERR_CPU => "this CPU lacks instructions this build of the library needs; use a portable build",
         else => "unknown status",
     };
 }
 
 export fn zq_index_create(config: ?*const ZqConfig, out: ?**Index) c_int {
+    // First, before any code that might use the instructions in question. Bindings
+    // check zq_cpu_supported themselves on load; this catches a C caller who did not.
+    if (zq_cpu_supported() == 0) return ZQ_ERR_CPU;
     const cfg = config orelse return ZQ_ERR_INVALID;
     const slot = out orelse return ZQ_ERR_INVALID;
     // bits = 1 used to be accepted here and then reached `8 % 0` in the packing layout:
@@ -301,6 +321,7 @@ pub const ZqCodecConfig = extern struct {
 };
 
 export fn zq_codec_create(config: ?*const ZqCodecConfig, out: ?**Codec) c_int {
+    if (zq_cpu_supported() == 0) return ZQ_ERR_CPU;
     const cfg = config orelse return ZQ_ERR_INVALID;
     const slot = out orelse return ZQ_ERR_INVALID;
     if (cfg.dim == 0 or cfg.dim > ZQ_MAX_DIM) return ZQ_ERR_INVALID;

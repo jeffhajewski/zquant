@@ -16,7 +16,9 @@ static double rnd(void) { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return (doubl
 static float gauss(void) { double u = rnd(), v = rnd(); return (float)(sqrt(-2*log(u+1e-12))*cos(6.283185307*v)); }
 
 int main(void) {
-    printf("zquant %s\n", zq_version());
+    printf("zquant %s (built for %s, %s)\n", zq_version(), zq_build_cpu(), zq_build_kernels());
+    /* The machine running the tests must be able to run the build under test. */
+    if (!zq_cpu_supported()) { printf("FAIL: zq_cpu_supported() is 0 on the build machine\n"); return 1; }
 
     float *base = malloc(sizeof(float) * N * DIM);
     for (int i = 0; i < N; i++) {

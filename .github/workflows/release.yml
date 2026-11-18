@@ -17,12 +17,25 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Each target is built for a CPU with the instructions the scan kernels need:
+        # SSSE3 on x86_64 (x86_64_v2, the RHEL 9 baseline) and the dot-product extension
+        # on arm64. Built for the bare architecture baseline instead, search is 6-10x
+        # slower, which is what these artifacts used to ship. The macOS baselines already
+        # include both (core2 has SSSE3; every Apple arm64 CPU has dotprod).
+        #
+        # Each also has a `-portable` build for the baseline, for CPUs without them. The
+        # library checks at load time (zq_cpu_supported) rather than dying of an illegal
+        # instruction, and the Python and TypeScript clients fall back to the portable
+        # build automatically when it is installed alongside.
         include:
-          - { target: x86_64-linux-gnu,   name: linux-x86_64 }
-          - { target: aarch64-linux-gnu,  name: linux-aarch64 }
-          - { target: x86_64-macos,       name: macos-x86_64 }
-          - { target: aarch64-macos,      name: macos-aarch64 }
-          - { target: x86_64-windows-gnu, name: windows-x86_64 }
+          - { target: x86_64-linux-gnu,    cpu: x86_64_v2,       name: linux-x86_64 }
+          - { target: x86_64-linux-gnu,    cpu: baseline,        name: linux-x86_64-portable }
+          - { target: aarch64-linux-gnu,   cpu: generic+dotprod, name: linux-aarch64 }
+          - { target: aarch64-linux-gnu,   cpu: baseline,        name: linux-aarch64-portable }
+          - { target: x86_64-macos,        cpu: baseline,        name: macos-x86_64 }
+          - { target: aarch64-macos,       cpu: baseline,        name: macos-aarch64 }
+          - { target: x86_64-windows-gnu,  cpu: x86_64_v2,       name: windows-x86_64 }
+          - { target: x86_64-windows-gnu,  cpu: baseline,        name: windows-x86_64-portable }
 
     steps:
       - uses: actions/checkout@v4
@@ -33,7 +46,7 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
 
       - name: Build
-        run: zig build lib -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
+        run: zig build lib -Dtarget=${{ matrix.target }} -Dcpu=${{ matrix.cpu }}
 
       - name: Package
         run: |

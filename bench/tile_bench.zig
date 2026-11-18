@@ -7,8 +7,9 @@
 //! disassembly of the 4x4 tile showed hundreds of stack accesses in its loop.
 //!
 //! This times every compact and expanded kernel the index uses at several tile
-//! shapes, scoring the same codes against the same 32 queries, and reports each
-//! shape's throughput against 4x4. It is a means of choosing the shape; quickbench,
+//! shapes, scoring the same codes against the same 36 queries, and reports each
+//! shape's throughput against the 128-bit 4x4. On x86_64 with AVX2 it also times the
+//! 256-bit kernels (VNNI where the CPU has it) against the 128-bit ones. It is a means of choosing the shape; quickbench,
 //! which goes through the public API, is what confirms a choice.
 
 const std = @import("std");
@@ -42,7 +43,7 @@ pub fn main() !void {
     });
     std.debug.print("{s:<22}", .{"kernel"});
     inline for (shapes) |s| std.debug.print("{s:>9}", .{std.fmt.comptimePrint("{d}x{d}", .{ s.v, s.q })});
-    std.debug.print("   (M scores/s; then relative to 4x4)\n", .{});
+    std.debug.print("   (M scores/s; then relative to 128-bit 4x4)\n", .{});
 
     const sigma = 1.0 / @sqrt(@as(f32, @floatFromInt(dim)));
     const rotated = try a.alloc(f32, dim);
@@ -87,8 +88,9 @@ pub fn main() !void {
             seq[i].deinit();
         };
 
-        // The compact kernels, where the layout has a tiled form.
-        if (zq.simd_scan.canTile(layout)) {
+        // The compact kernels, where the layout has a tiled form, at each width this
+        // build has.
+        if (zq.simd_scan.canTile(layout)) inline for (widths) |use_wide| {
             var rates: [shapes.len]f64 = undefined;
             inline for (shapes, 0..) |s, si| {
                 var best: u64 = std.math.maxInt(u64);
@@ -99,7 +101,7 @@ pub fn main() !void {
                     while (v0 + s.v <= n) : (v0 += s.v) {
                         var i: usize = 0;
                         while (i + s.q <= nq) : (i += s.q) {
-                            zq.simd_scan.scoreInt8Tiled(s.v, s.q, layout, table, queries[i..], store.ptr + v0 * stride, stride, dim, out[i..], nq);
+                            zq.simd_scan.scoreInt8TiledWith(use_wide, s.v, s.q, layout, table, queries[i..], store.ptr + v0 * stride, stride, dim, out[i..], nq);
                         }
                         sink += out[0];
                     }
@@ -108,11 +110,11 @@ pub fn main() !void {
                 std.mem.doNotOptimizeAway(sink);
                 rates[si] = @as(f64, @floatFromInt(n * nq)) / @as(f64, @floatFromInt(best)) * 1e3;
             }
-            report(std.fmt.comptimePrint("compact, {d}-bit codes", .{bits}), &rates);
-        }
+            report(std.fmt.comptimePrint("compact, {d}-bit{s}", .{ bits, if (use_wide) ", 256" else "" }), &rates, &baseline);
+        };
 
         // The expanded kernel is the same for every width; time it once.
-        if (bits == 4) {
+        if (bits == 4) inline for (widths) |use_wide| {
             var rates: [shapes.len]f64 = undefined;
             inline for (shapes, 0..) |s, si| {
                 var best: u64 = std.math.maxInt(u64);
@@ -123,7 +125,7 @@ pub fn main() !void {
                     while (v0 + s.v <= n) : (v0 += s.v) {
                         var i: usize = 0;
                         while (i + s.q <= nq) : (i += s.q) {
-                            zq.simd_scan.scoreExpandedTiled(s.v, s.q, expanded.ptr + v0 * dim, dim, seq[i..], table.scale, dim, out[i..], nq);
+                            zq.simd_scan.scoreExpandedTiledWith(use_wide, s.v, s.q, expanded.ptr + v0 * dim, dim, seq[i..], table.scale, dim, out[i..], nq);
                         }
                         sink += out[0];
                     }
@@ -132,15 +134,24 @@ pub fn main() !void {
                 std.mem.doNotOptimizeAway(sink);
                 rates[si] = @as(f64, @floatFromInt(n * nq)) / @as(f64, @floatFromInt(best)) * 1e3;
             }
-            report("expanded", &rates);
-        }
+            report(if (use_wide) "expanded, 256" else "expanded", &rates, &baseline);
+        };
     }
 }
 
-fn report(name: []const u8, rates: []const f64) void {
+/// 128-bit kernels everywhere; the 256-bit ones as well where the build has them
+/// (x86_64 with AVX2), so the two are compared on one machine in one run.
+const widths: []const bool = if (zq.simd_scan.wide) &.{ false, true } else &.{false};
+
+/// The 128-bit 4x4 rate of the kernel last reported, which the 256-bit rows are
+/// also measured against.
+var baseline: f64 = 0;
+
+fn report(name: []const u8, rates: []const f64, base: *f64) void {
+    if (std.mem.indexOf(u8, name, "256") == null) base.* = rates[0];
     std.debug.print("{s:<22}", .{name});
     for (rates) |r| std.debug.print("{d:>9.0}", .{r});
     std.debug.print("\n{s:<22}", .{""});
-    for (rates) |r| std.debug.print("{d:>9.2}", .{r / rates[0]});
+    for (rates) |r| std.debug.print("{d:>9.2}", .{r / base.*});
     std.debug.print("\n", .{});
 }

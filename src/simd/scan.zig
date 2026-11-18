@@ -335,6 +335,25 @@ pub fn scoreExpandedTiled(
     out: []f32,
     out_stride: usize,
 ) void {
+    scoreExpandedTiledWith(wide, V, Q, base, vec_stride, queries, table_scale, dim, out, out_stride);
+}
+
+/// `scoreExpandedTiled` with the kernel width chosen by the caller, as in
+/// `scoreInt8TiledWith`. The 256-bit form takes two 16-byte chunks per step and an odd
+/// last chunk at 128 bits.
+pub fn scoreExpandedTiledWith(
+    comptime use_wide: bool,
+    comptime V: usize,
+    comptime Q: usize,
+    base: [*]const i8,
+    vec_stride: usize,
+    queries: []const Query,
+    table_scale: f32,
+    dim: u32,
+    out: []f32,
+    out_stride: usize,
+) void {
+    comptime std.debug.assert(wide or !use_wide);
     std.debug.assert(queries.len >= Q);
     std.debug.assert(dim % 16 == 0);
 
@@ -345,6 +364,20 @@ pub fn scoreExpandedTiled(
     const chunks = dim / 16;
 
     var ch: usize = 0;
+    if (use_wide) {
+        var wide_acc: [V][Q]dot.Acc8 = @splat(@splat(@splat(0)));
+        while (ch + 2 <= chunks) : (ch += 2) {
+            var w: [Q]@Vector(32, i8) = undefined;
+            inline for (0..Q) |q| w[q] = qp[q][ch * 16 ..][0..32].*;
+            inline for (0..V) |v| {
+                const c: @Vector(32, i8) = base[v * vec_stride + ch * 16 ..][0..32].*;
+                inline for (0..Q) |q| wide_acc[v][q] = dot.accumulate32(wide_acc[v][q], c, w[q]);
+            }
+        }
+        inline for (0..V) |v| {
+            inline for (0..Q) |q| acc[v][q] = dot.fold(wide_acc[v][q]);
+        }
+    }
     while (ch < chunks) : (ch += 1) {
         var w: [Q]@Vector(16, i8) = undefined;
         inline for (0..Q) |q| w[q] = qp[q][ch * 16 ..][0..16].*;
@@ -541,6 +574,133 @@ fn scorePlanesTiled(
     }
 }
 
+/// Whether this build has the 256-bit tiled kernels: x86_64 with AVX2.
+pub const wide = dot.has_avx2;
+
+/// `scoreBitsTiled` on 32 bytes at a time.
+///
+/// Chunks `ch` and `ch + 1` are adjacent in memory, and so are their slices of each
+/// bit-field group's query stream (`k * stride + ch * 16`, then `+ 16`). One 32-byte
+/// load of each therefore covers two chunks, and every instruction in the loop does
+/// twice the work. An odd last chunk takes the 128-bit path.
+fn scoreBitsTiledWide(
+    comptime bits: u6,
+    comptime V: usize,
+    comptime Q: usize,
+    table: Table,
+    queries: []const Query,
+    base: [*]const u8,
+    code_stride: usize,
+    dim: u32,
+    out: []f32,
+    out_stride: usize,
+) void {
+    // Unrolled loops count against the comptime branch quota: at bits=1 the main
+    // loop, the fold and the tail together unroll past the default 1000.
+    @setEvalBranchQuota(10_000);
+    const groups = comptime 8 / @as(usize, bits);
+    const mask_value = comptime (@as(u8, 1) << @as(u3, @intCast(bits))) - 1;
+    const mask32: @Vector(32, u8) = @splat(mask_value);
+    const mask16: @Vector(16, u8) = @splat(mask_value);
+    const chunks = @as(usize, dim) * bits / 128;
+    const table32 = std.simd.join(table.values, table.values);
+
+    var qp: [Q][*]const i8 = undefined;
+    inline for (0..Q) |q| qp[q] = queries[q].data.ptr;
+    const qstride = queries[0].stride;
+
+    var wide_acc: [V][Q]dot.Acc8 = @splat(@splat(@splat(0)));
+    var ch: usize = 0;
+    while (ch + 2 <= chunks) : (ch += 2) {
+        var pc: [V]@Vector(32, u8) = undefined;
+        inline for (0..V) |v| pc[v] = base[v * code_stride + ch * 16 ..][0..32].*;
+
+        inline for (0..groups) |k| {
+            const shift: @Vector(32, u3) = @splat(@intCast(k * bits));
+            var w: [Q]@Vector(32, i8) = undefined;
+            inline for (0..Q) |q| w[q] = qp[q][k * qstride + ch * 16 ..][0..32].*;
+            inline for (0..V) |v| {
+                const vals = shuffle.table32(table32, (pc[v] >> shift) & mask32);
+                inline for (0..Q) |q| wide_acc[v][q] = dot.accumulate32(wide_acc[v][q], vals, w[q]);
+            }
+        }
+    }
+
+    var acc: [V][Q]dot.Acc = undefined;
+    inline for (0..V) |v| {
+        inline for (0..Q) |q| acc[v][q] = dot.fold(wide_acc[v][q]);
+    }
+    if (ch < chunks) {
+        inline for (0..groups) |k| {
+            const shift: @Vector(16, u3) = @splat(@intCast(k * bits));
+            inline for (0..V) |v| {
+                const pc: @Vector(16, u8) = base[v * code_stride + ch * 16 ..][0..16].*;
+                const vals = lookup(table.values, (pc >> shift) & mask16);
+                inline for (0..Q) |q| {
+                    const w: @Vector(16, i8) = qp[q][k * qstride + ch * 16 ..][0..16].*;
+                    acc[v][q] = dot.accumulate(acc[v][q], vals, w);
+                }
+            }
+        }
+    }
+
+    inline for (0..V) |v| {
+        inline for (0..Q) |q| {
+            const sum: f32 = @floatFromInt(dot.total(acc[v][q]));
+            out[v * out_stride + q] = sum * table.scale * queries[q].scale;
+        }
+    }
+}
+
+/// `scorePlanesTiled` on two 16-code groups at a time. Assembling indices from planes
+/// stays 16 lanes wide; the lookup and the dot products, the part repeated per query,
+/// do both groups at once. `canVectorize` requires an even number of groups, so there
+/// is no tail.
+fn scorePlanesTiledWide(
+    comptime bits: u6,
+    comptime V: usize,
+    comptime Q: usize,
+    table: Table,
+    queries: []const Query,
+    base: [*]const u8,
+    code_stride: usize,
+    dim: u32,
+    out: []f32,
+    out_stride: usize,
+) void {
+    const group_bytes = comptime @as(usize, bits) * (packing.plane_group / 8);
+    const groups = dim / packing.plane_group;
+    std.debug.assert(groups % 2 == 0);
+    const table32 = std.simd.join(table.values, table.values);
+
+    var qp: [Q][*]const i8 = undefined;
+    inline for (0..Q) |q| qp[q] = queries[q].data.ptr;
+
+    var acc: [V][Q]dot.Acc8 = @splat(@splat(@splat(0)));
+
+    var g: usize = 0;
+    while (g < groups) : (g += 2) {
+        var w: [Q]@Vector(32, i8) = undefined;
+        inline for (0..Q) |q| w[q] = qp[q][g * 16 ..][0..32].*;
+        inline for (0..V) |v| {
+            const codes = base + v * code_stride + g * group_bytes;
+            const idx = std.simd.join(
+                planeIndex(bits, codes[0..group_bytes]),
+                planeIndex(bits, codes[group_bytes..][0..group_bytes]),
+            );
+            const vals = shuffle.table32(table32, idx);
+            inline for (0..Q) |q| acc[v][q] = dot.accumulate32(acc[v][q], vals, w[q]);
+        }
+    }
+
+    inline for (0..V) |v| {
+        inline for (0..Q) |q| {
+            const sum: f32 = @floatFromInt(dot.total(dot.fold(acc[v][q])));
+            out[v * out_stride + q] = sum * table.scale * queries[q].scale;
+        }
+    }
+}
+
 /// Whether a vector-tiled compact kernel exists for this layout.
 pub fn canTile(layout: Layout) bool {
     return switch (layout.kind()) {
@@ -562,15 +722,37 @@ pub fn scoreInt8Tiled(
     out: []f32,
     out_stride: usize,
 ) void {
+    scoreInt8TiledWith(wide, V, Q, layout, table, queries, base, code_stride, dim, out, out_stride);
+}
+
+/// `scoreInt8Tiled` with the kernel width chosen by the caller: the 256-bit kernels
+/// (`use_wide`, which needs `wide`) or the 128-bit ones. For tests and benchmarks that
+/// compare the two; everything else takes the default.
+pub fn scoreInt8TiledWith(
+    comptime use_wide: bool,
+    comptime V: usize,
+    comptime Q: usize,
+    layout: Layout,
+    table: Table,
+    queries: []const Query,
+    base: [*]const u8,
+    code_stride: usize,
+    dim: u32,
+    out: []f32,
+    out_stride: usize,
+) void {
+    comptime std.debug.assert(wide or !use_wide);
     std.debug.assert(canTile(layout));
+    const bitsTiled = if (use_wide) scoreBitsTiledWide else scoreBitsTiled;
+    const planesTiled = if (use_wide) scorePlanesTiledWide else scorePlanesTiled;
     switch (layout.kind()) {
         .sequential => switch (layout.bits) {
-            1 => scoreBitsTiled(1, V, Q, table, queries, base, code_stride, dim, out, out_stride),
-            2 => scoreBitsTiled(2, V, Q, table, queries, base, code_stride, dim, out, out_stride),
-            4 => scoreBitsTiled(4, V, Q, table, queries, base, code_stride, dim, out, out_stride),
+            1 => bitsTiled(1, V, Q, table, queries, base, code_stride, dim, out, out_stride),
+            2 => bitsTiled(2, V, Q, table, queries, base, code_stride, dim, out, out_stride),
+            4 => bitsTiled(4, V, Q, table, queries, base, code_stride, dim, out, out_stride),
             else => unreachable,
         },
-        .bit_plane => scorePlanesTiled(3, V, Q, table, queries, base, code_stride, dim, out, out_stride),
+        .bit_plane => planesTiled(3, V, Q, table, queries, base, code_stride, dim, out, out_stride),
     }
 }
 
@@ -1119,6 +1301,76 @@ test "compact tiled kernel agrees exactly with the per-query kernel" {
             for (0..V) |v| for (0..Q) |q| {
                 const one = scoreInt8(layout, table, queries[q], codes[v * stride ..][0..stride], dim);
                 try testing.expectEqual(one, out[v * Q + q]);
+            };
+        }
+    }
+}
+
+test "256-bit kernels agree exactly with the 128-bit ones" {
+    // Same products, summed in another order, in integers: any difference at all is a
+    // bug, so the comparison is exact. Odd chunk counts exercise the 128-bit tails.
+    if (!wide) return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(0x256);
+    const rand = prng.random();
+    const shapes = [_][2]usize{ .{ 4, 4 }, .{ 2, 4 }, .{ 3, 3 }, .{ 1, 1 } };
+
+    for ([_]u6{ 1, 2, 3, 4 }) |bits| {
+        for ([_]u32{ 32, 64, 96, 128, 160, 384, 640, 1024 }) |dim| {
+            const layout = Layout.init(dim, bits);
+            if (!canVectorize(layout) or !canTile(layout)) continue;
+            const stride = layout.stride();
+            const codes = try testing.allocator.alloc(u8, 4 * stride);
+            defer testing.allocator.free(codes);
+            rand.bytes(codes); // every byte is a valid code block in both layouts
+
+            var centroids: [16]f32 = undefined;
+            for (&centroids) |*c| c.* = rand.floatNorm(f32);
+            const table = Table.init(centroids[0 .. @as(usize, 1) << bits]);
+
+            const rotated = try testing.allocator.alloc(f32, dim);
+            defer testing.allocator.free(rotated);
+            var queries: [4]Query = undefined;
+            for (&queries) |*q| {
+                q.* = try Query.init(testing.allocator, layout);
+                for (rotated) |*x| x.* = rand.floatNorm(f32);
+                q.load(rotated);
+            }
+            defer for (&queries) |*q| q.deinit();
+
+            inline for (shapes) |s| {
+                var narrow: [16]f32 = undefined;
+                var wide_out: [16]f32 = undefined;
+                scoreInt8TiledWith(false, s[0], s[1], layout, table, &queries, codes.ptr, stride, dim, &narrow, 4);
+                scoreInt8TiledWith(true, s[0], s[1], layout, table, &queries, codes.ptr, stride, dim, &wide_out, 4);
+                for (0..s[0]) |v| for (0..s[1]) |q| {
+                    try testing.expectEqual(narrow[v * 4 + q], wide_out[v * 4 + q]);
+                };
+            }
+        }
+    }
+
+    // Expanded: plain int8, the full range on the stored side, as `accumulate` allows.
+    for ([_]u32{ 16, 48, 256, 784 }) |dim| {
+        const values = try testing.allocator.alloc(i8, 4 * dim);
+        defer testing.allocator.free(values);
+        rand.bytes(std.mem.sliceAsBytes(values));
+        const rotated = try testing.allocator.alloc(f32, dim);
+        defer testing.allocator.free(rotated);
+        var queries: [4]Query = undefined;
+        for (&queries) |*q| {
+            q.* = try Query.initSequential(testing.allocator, dim);
+            for (rotated) |*x| x.* = rand.floatNorm(f32);
+            q.load(rotated);
+        }
+        defer for (&queries) |*q| q.deinit();
+
+        inline for (shapes) |s| {
+            var narrow: [16]f32 = undefined;
+            var wide_out: [16]f32 = undefined;
+            scoreExpandedTiledWith(false, s[0], s[1], values.ptr, dim, &queries, 0.01, dim, &narrow, 4);
+            scoreExpandedTiledWith(true, s[0], s[1], values.ptr, dim, &queries, 0.01, dim, &wide_out, 4);
+            for (0..s[0]) |v| for (0..s[1]) |q| {
+                try testing.expectEqual(narrow[v * 4 + q], wide_out[v * 4 + q]);
             };
         }
     }

@@ -25,7 +25,7 @@ jobs:
       matrix:
         include:
           # The release CPU level first, then everything this runner has.
-          - { os: ubuntu-latest,    cpus: "x86_64_v2 native" }
+          - { os: ubuntu-latest,    cpus: "x86_64_v2 x86_64_v3 native" }
           - { os: ubuntu-24.04-arm, cpus: "generic+dotprod native" }
 
     steps:

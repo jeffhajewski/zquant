@@ -97,6 +97,22 @@ pub inline fn table16(table: Vec, idx: Idx) Vec {
     return scalar(table, idx);
 }
 
+/// `table16` on 32 lanes, for AVX2 targets. `vpshufb` on ymm looks each half up in its
+/// own 128-bit half of the table, so the table must be repeated in both halves.
+pub inline fn table32(table: @Vector(32, i8), idx: @Vector(32, u8)) @Vector(32, i8) {
+    if (std.debug.runtime_safety) {
+        const raw: [32]u8 = idx;
+        for (raw) |v| std.debug.assert(v < 16);
+        const t: [32]i8 = table;
+        std.debug.assert(std.mem.eql(i8, t[0..16], t[16..32]));
+    }
+    return asm ("vpshufb %[i], %[t], %[out]"
+        : [out] "=x" (-> @Vector(32, i8)),
+        : [t] "x" (table),
+          [i] "x" (idx),
+    );
+}
+
 /// Portable fallback. Correct everywhere, one load per lane.
 fn scalar(table: Vec, idx: Idx) Vec {
     const values: [16]i8 = table;

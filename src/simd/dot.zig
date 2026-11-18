@@ -172,6 +172,87 @@ pub inline fn total(acc: Acc) i32 {
     return @reduce(.Add, acc);
 }
 
+// -- 256-bit forms -----------------------------------------------------------
+//
+// The same arithmetic on 32 bytes at a time, for x86 targets with AVX2. The 128-bit
+// chain above is several instructions per 16 bytes where `sdot` is one, so x86 runs
+// out of issue slots long before it runs out of memory bandwidth; doing 32 bytes per
+// instruction halves the instruction count. Where VNNI is available the
+// `pmaddubsw`/`pmaddwd`/add chain becomes one `vpdpbusd`.
+//
+// Results are identical to the 128-bit path: the same products, summed in a
+// different order, in integers.
+
+pub const Acc8 = @Vector(8, i32);
+pub const Bytes32 = @Vector(32, i8);
+
+pub const has_avx2 = switch (builtin.cpu.arch) {
+    .x86_64 => std.Target.x86.featureSetHas(builtin.cpu.features, .avx2),
+    else => false,
+};
+
+/// `vpdpbusd` on ymm registers: the AVX-512 encoding needs VL as well as VNNI; the
+/// VEX encoding (Alder Lake, Zen 5) is a feature of its own.
+const has_vnni_evex = has_avx2 and
+    std.Target.x86.featureSetHas(builtin.cpu.features, .avx512vnni) and
+    std.Target.x86.featureSetHas(builtin.cpu.features, .avx512vl);
+const has_vnni_vex = has_avx2 and std.Target.x86.featureSetHas(builtin.cpu.features, .avxvnni);
+pub const has_vnni = has_vnni_evex or has_vnni_vex;
+
+/// `accumulate` on 32 bytes. `b` must not contain −128, as there.
+pub inline fn accumulate32(acc: Acc8, a: Bytes32, b: Bytes32) Acc8 {
+    comptime std.debug.assert(has_avx2);
+    if (std.debug.runtime_safety) {
+        const raw: [32]i8 = b;
+        for (raw) |v| std.debug.assert(v != -128);
+    }
+    const magnitude: Bytes32 = @bitCast(@abs(a));
+    const signed = asm ("vpsignb %[s], %[x], %[out]"
+        : [out] "=x" (-> Bytes32),
+        : [x] "x" (b),
+          [s] "x" (a),
+    );
+    if (comptime has_vnni) {
+        // acc += Σ4 u8(magnitude) · s8(signed), straight into i32: no i16 stage, so
+        // no saturation to reason about either.
+        var out = acc;
+        if (comptime has_vnni_evex) {
+            asm ("vpdpbusd %[s], %[u], %[acc]"
+                : [acc] "+x" (out),
+                : [u] "x" (magnitude),
+                  [s] "x" (signed),
+            );
+        } else {
+            asm ("{vex} vpdpbusd %[s], %[u], %[acc]"
+                : [acc] "+x" (out),
+                : [u] "x" (magnitude),
+                  [s] "x" (signed),
+            );
+        }
+        return out;
+    }
+    const pairs = asm ("vpmaddubsw %[s], %[u], %[out]"
+        : [out] "=x" (-> @Vector(16, i16)),
+        : [u] "x" (magnitude),
+          [s] "x" (signed),
+    );
+    const ones: @Vector(16, i16) = @splat(1);
+    const quads = asm ("vpmaddwd %[ones], %[x], %[out]"
+        : [out] "=x" (-> Acc8),
+        : [x] "x" (pairs),
+          [ones] "x" (ones),
+    );
+    return acc + quads;
+}
+
+/// Fold eight lanes into the four of `Acc`, so a kernel can finish a 256-bit loop
+/// with a 128-bit tail and sum both the same way.
+pub inline fn fold(acc: Acc8) Acc {
+    const lo: Acc = @shuffle(i32, acc, undefined, [4]i32{ 0, 1, 2, 3 });
+    const hi: Acc = @shuffle(i32, acc, undefined, [4]i32{ 4, 5, 6, 7 });
+    return lo + hi;
+}
+
 // -- tests -------------------------------------------------------------------
 
 const testing = std.testing;

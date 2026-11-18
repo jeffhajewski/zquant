@@ -91,7 +91,7 @@ jobs:
           - { os: ubuntu-latest,    cpu: baseline }
           - { os: ubuntu-24.04-arm, cpu: generic+dotprod }
           - { os: ubuntu-24.04-arm, cpu: baseline }
-          - { os: macos-14,         cpu: baseline }
+          - { os: macos-15,         cpu: baseline }
           - { os: windows-latest,   cpu: x86_64_v2 }
           - { os: windows-latest,   cpu: baseline }
 

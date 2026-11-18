@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-latest, macos-15]
 
     steps:
       - uses: actions/checkout@v4
@@ -70,7 +70,7 @@ jobs:
           - { os: ubuntu-latest,    cpu: baseline }
           - { os: ubuntu-24.04-arm, cpu: generic+dotprod }
           - { os: ubuntu-24.04-arm, cpu: baseline }
-          - { os: macos-14,         cpu: baseline }
+          - { os: macos-15,         cpu: baseline }
           - { os: windows-latest,   cpu: x86_64_v2 }
           - { os: windows-latest,   cpu: baseline }
 
@@ -94,8 +94,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
-        python-version: ['3.9', '3.11', '3.13']
+        os: [ubuntu-latest, macos-15]
+        python-version: ['3.11', '3.13']
+        # 3.9 is the oldest version pyproject.toml accepts. setup-python has no build of it
+        # for Ubuntu 26.04, which ubuntu-latest became in October 2026, so it runs on 24.04.
+        include:
+          - { os: ubuntu-24.04, python-version: '3.9' }
 
     steps:
       - uses: actions/checkout@v4
@@ -148,7 +152,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-latest, macos-15]
 
     steps:
       - uses: actions/checkout@v4
@@ -196,7 +200,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-latest, macos-15]
         node-version: ['18', '20', '22']
 
     steps:
@@ -235,7 +239,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-latest, macos-15]
 
     steps:
       - uses: actions/checkout@v4
@@ -296,7 +300,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-latest, macos-15]
 
     steps:
       - uses: actions/checkout@v4

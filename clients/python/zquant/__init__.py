@@ -13,15 +13,17 @@ without copying is accepted; anything else is converted, which costs a copy.
 from __future__ import annotations
 
 import ctypes
+import os
 import threading
 from pathlib import Path
-from typing import Literal, NamedTuple
+from typing import Literal, NamedTuple, Optional, Union
 
 import numpy as np
 
 from . import _lib
 from ._sync import RWLock, SearcherPool
 from ._errors import (
+    ZQ_ERR_FORMAT,
     ZQ_ERR_STATE,
     ZQ_OK,
     CpuNotSupportedError,
@@ -47,6 +49,7 @@ __all__ = [
     "FormatError",
     "LibraryNotFoundError",
     "BuildInfo",
+    "Calibration",
     "build_info",
     "version",
     "MAX_DIM",
@@ -101,6 +104,16 @@ def build_info() -> BuildInfo:
         library=_LIB_PATH,
         portable=_LIB_PORTABLE,
     )
+
+
+class Calibration(NamedTuple):
+    """What `Index.calibrate(sample, auto=True)` measured and did."""
+
+    #: ||mean(x / ||x||)|| over the sample: how far the data's directions sit from the
+    #: origin. Calibration measured a gain from about 0.3 up, and none below.
+    centroid_norm: float
+    #: Whether the index was calibrated.
+    applied: bool
 
 
 # ── Argument checks ─────────────────────────────────────────────────────────────────
@@ -272,7 +285,7 @@ class Index:
         with self._rw.read():
             return _LIB.zq_index_bytes_per_vector(self._live())
 
-    def calibrate(self, sample) -> None:
+    def calibrate(self, sample, auto: bool = False) -> Optional[Calibration]:
         """Fit per-coordinate shift and scale from a sample. Must precede `add`.
 
         Worth enabling when the corpus centroid sits away from the origin — compute
@@ -280,19 +293,47 @@ class Index:
         and expect a real gain above about 0.3 and none below. It is not free: on
         low-rank zero-mean data it has cost several points of recall. A few thousand rows
         are enough; more did not measurably help.
+
+        `auto=True` lets the library make that call: it measures the sample's centroid
+        norm and calibrates only if it is at least 0.3. It returns a `Calibration`
+        saying what it measured and whether it calibrated; it fails exactly as a plain
+        calibration would (after `add`, say), whatever it measured. It is the sensible
+        choice when you do not know your data. Without `auto` this returns None.
         """
         a = _as_rows(sample, self._dim, "sample")
         with self._rw.write():
             h = self._live()
-            _check_rows(_LIB.zq_index_calibrate(h, _ptr(a, ctypes.c_float), a.shape[0]),
-                        a, "calibrate", "sample")
+            if not auto:
+                _check_rows(_LIB.zq_index_calibrate(h, _ptr(a, ctypes.c_float), a.shape[0]),
+                            a, "calibrate", "sample")
+                return None
+            norm = ctypes.c_float()
+            applied = ctypes.c_int()
+            _check_rows(
+                _LIB.zq_index_calibrate_auto(h, _ptr(a, ctypes.c_float), a.shape[0],
+                                             ctypes.byref(norm), ctypes.byref(applied)),
+                a, "calibrate", "sample")
+        return Calibration(centroid_norm=float(norm.value), applied=bool(applied.value))
 
-    def add(self, vectors) -> None:
+    def add(self, vectors, threads: int = 1) -> None:
+        """Append vectors; the first gets id `len(index)` as it was before the call.
+
+        `threads > 1` encodes on that many threads. The index comes out byte for byte
+        the same either way. Below a few hundred vectors per thread the library stays on
+        the calling thread, since starting threads costs more than the encoding.
+
+        A batch with any NaN or infinity in it is refused whole; nothing is added.
+        """
+        threads = _threads_arg(threads)
         a = _as_rows(vectors, self._dim, "vectors")
         with self._rw.write():
             h = self._live()
-            _check_rows(_LIB.zq_index_add(h, _ptr(a, ctypes.c_float), a.shape[0]),
-                        a, "add", "vectors")
+            if threads <= 1:
+                status = _LIB.zq_index_add(h, _ptr(a, ctypes.c_float), a.shape[0])
+            else:
+                status = _LIB.zq_index_add_parallel(h, _ptr(a, ctypes.c_float), a.shape[0],
+                                                    threads)
+            _check_rows(status, a, "add", "vectors")
 
     def search(self, queries, k: int = 10, threads: int = 1):
         """Return `(ids, scores)`, each shape `(n_queries, k)`, best first.
@@ -334,6 +375,148 @@ class Index:
                         "queries",
                     )
         return ids, scores
+
+    def search_rerank(self, queries, originals, k: int = 10, candidates: Optional[int] = None,
+                      threads: int = 1):
+        """Search, then rescore the candidates exactly against the original vectors.
+
+        Fetches `candidates` results per query from the quantized index (default
+        `4 * k`), scores each against its original vector with the index's metric, and
+        returns the best `k` as `(ids, scores)`, padded like `search`. The scores are
+        exact, not estimates. Over-fetching 4-10x and reranking recovers near-exact
+        top-k.
+
+        `originals` holds the vectors you added, row i being the one that got id i, and
+        must cover every id in the index. Keeping them is the price: full precision
+        costs `4 * dim` bytes per vector, against the index's `bytes_per_vector`.
+        Pass float32 C-contiguous rows to avoid a copy on every call.
+        """
+        k = _int_arg(k, "k", 1, 1 << 32)
+        candidates = 4 * k if candidates is None else _int_arg(candidates, "candidates",
+                                                               1, 1 << 32)
+        if candidates < k:
+            raise ValueError(f"candidates ({candidates}) must be at least k ({k})")
+        threads = _threads_arg(threads)
+        q = _as_rows(queries, self._dim, "queries")
+        orig = _as_rows(originals, self._dim, "originals")
+        nq = q.shape[0]
+        ids = np.empty((nq, k), dtype=np.uint32)
+        scores = np.empty((nq, k), dtype=np.float32)
+
+        with self._rw.read():
+            h = self._live()
+            count = _LIB.zq_index_count(h)
+            if count == 0:
+                raise StateError("search on an empty index", ZQ_ERR_STATE)
+            if orig.shape[0] < count:
+                raise ValueError(f"originals has {orig.shape[0]} rows, but the index holds "
+                                 f"{count} vectors and every one needs its original")
+            with self._pool.borrow(h, candidates, threads) as searcher:
+                capacity = _LIB.zq_searcher_capacity(searcher)
+                for start in range(0, nq, capacity):
+                    n = min(capacity, nq - start)
+                    chunk = q[start:start + n]
+                    status = _LIB.zq_search_rerank(
+                        h, searcher, _ptr(chunk, ctypes.c_float), n,
+                        _ptr(orig, ctypes.c_float), orig.shape[0], k,
+                        _ptr(ids[start:start + n], ctypes.c_uint32),
+                        _ptr(scores[start:start + n], ctypes.c_float),
+                    )
+                    _check_rows(status, chunk, "search_rerank", "queries")
+        return ids, scores
+
+    def score_ids(self, query, ids) -> np.ndarray:
+        """Score chosen stored vectors against one query.
+
+        Returns float32 scores, `scores[j]` being the estimate `search` would report for
+        `ids[j]`. For ranking a candidate set picked some other way - a metadata filter,
+        another index - without scanning the whole corpus. An id outside
+        `0..len(index)-1` raises IndexError.
+        """
+        q = _as_rows(query, self._dim, "query")
+        if q.shape[0] != 1:
+            raise ValueError(f"score_ids takes one query, got {q.shape[0]}")
+        raw = np.asarray(ids)
+        if raw.size and raw.dtype.kind not in "iu":
+            raise TypeError(f"ids must be integers, got dtype {raw.dtype}")
+        if raw.ndim > 1:
+            raise ValueError(f"ids must be 1-D, got shape {raw.shape}")
+        raw = raw.reshape(-1)
+        out = np.empty(raw.shape[0], dtype=np.float32)
+
+        with self._rw.read():
+            h = self._live()
+            count = _LIB.zq_index_count(h)
+            if raw.size and (raw.min() < 0 or raw.max() >= count):
+                bad = raw[(raw < 0) | (raw >= count)][0]
+                raise IndexError(f"id {bad} is out of range for an index of {count} vectors")
+            id_arr = np.ascontiguousarray(raw, dtype=np.uint32)
+            with self._pool.borrow(h, 1, 1) as searcher:
+                status = _LIB.zq_score_ids(h, searcher, _ptr(q, ctypes.c_float),
+                                           _ptr(id_arr, ctypes.c_uint32), id_arr.shape[0],
+                                           _ptr(out, ctypes.c_float))
+                _check_rows(status, q, "score_ids", "query")
+        return out
+
+    # ── Saving and loading ─────────────────────────────────────────────────────────
+    #
+    # The format holds the configuration, any calibration and the codes. It is
+    # versioned, checksummed and the same on every platform, so a file saved on one
+    # machine loads on another. Loading checks every field and the checksum, so
+    # anything that is not an intact index raises FormatError rather than crashing.
+
+    def _serialize(self) -> np.ndarray:
+        with self._rw.read():
+            h = self._live()
+            size = _LIB.zq_index_serialized_size(h)
+            buf = np.empty(size, dtype=np.uint8)
+            written = ctypes.c_size_t()
+            _check(_LIB.zq_index_serialize(h, buf.ctypes.data, size, ctypes.byref(written)),
+                   "serialize")
+        return buf[:written.value]
+
+    def to_bytes(self) -> bytes:
+        """The index as bytes, for `Index.from_bytes`."""
+        return self._serialize().tobytes()
+
+    def save(self, path: Union[str, os.PathLike]) -> None:
+        """Write the index to a file, for `Index.load`.
+
+        Written to a temporary file beside `path` and renamed into place, so a crash
+        part way through never leaves a truncated index under the real name.
+        """
+        data = self._serialize()
+        path = Path(path)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            with open(tmp, "xb") as f:
+                f.write(memoryview(data))
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    @classmethod
+    def from_bytes(cls, data) -> "Index":
+        """Rebuild an index from `to_bytes` output (bytes, bytearray, memoryview or a
+        uint8 array). The data is copied, so it can be discarded afterwards."""
+        buf = np.frombuffer(data, dtype=np.uint8)
+        if buf.size == 0:
+            raise FormatError("from_bytes: no data", ZQ_ERR_FORMAT)
+        handle = ctypes.c_void_p()
+        _check(_LIB.zq_index_deserialize(buf.ctypes.data, buf.shape[0], ctypes.byref(handle)),
+               "from_bytes")
+        index = cls.__new__(cls)
+        index._adopt(handle.value)
+        return index
+
+    @classmethod
+    def load(cls, path: Union[str, os.PathLike]) -> "Index":
+        """Read an index written by `save`."""
+        return cls.from_bytes(np.fromfile(os.fspath(path), dtype=np.uint8))
 
     def __repr__(self) -> str:
         with self._rw.read():

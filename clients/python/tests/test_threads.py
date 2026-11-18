@@ -130,8 +130,8 @@ def test_add_and_calibrate_concurrent_with_searches():
     join = spawn(N_THREADS, searcher)
     try:
         ix.calibrate(x[:500])
-        for b in batches:
-            ix.add(b)
+        for j, b in enumerate(batches):
+            ix.add(b, threads=1 + 3 * (j % 2))
     finally:
         stop.set()
         join()
@@ -144,8 +144,7 @@ def test_add_and_calibrate_concurrent_with_searches():
         for b in batches:
             ref.add(b)
         assert len(ix) == len(ref) == len(x)
-        a, b = ix.search(q, k=10), ref.search(q, k=10)
-        assert np.array_equal(a[0], b[0]) and np.array_equal(a[1], b[1])
+        assert ix.to_bytes() == ref.to_bytes()
     ix.close()
 
 

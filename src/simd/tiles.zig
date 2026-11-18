@@ -10,6 +10,7 @@
 //! Without dispatch, `FlatIndex` calls the same functions directly.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const scan = @import("scan.zig");
 const dot = @import("dot.zig");
 const shuffle = @import("shuffle.zig");
@@ -20,6 +21,15 @@ const packing = @import("../quant/packing.zig");
 /// other shape was reliably faster on any of them; docs/notes.md has the numbers.
 pub const batch_tile = 4;
 pub const batch_group = 4;
+/// x86 without AVX scores a 1-bit batch tile as two 2x4 halves. Its 4x4 tile holds 16
+/// accumulators in 16 registers, and with SSE's two-operand instructions the spills
+/// that forces made it a performance cliff: on a Zen 3 it ran at 68-95 M scores/s
+/// against 109 for the same kernel with AVX encodings, varying with nothing more than
+/// where the code was placed. 2x4 measured 104-106 in every run. The other code widths
+/// do not show it, and with AVX the 4x4 tile is fine.
+const split_one_bit = builtin.cpu.arch == .x86_64 and
+    !std.Target.x86.featureSetHas(builtin.cpu.features, .avx);
+
 /// Vectors per tile for a single query. Q=1 leaves registers free, so it is wider.
 pub const single_tile = 8;
 
@@ -67,7 +77,14 @@ pub fn batchTile(job: *const Job, v0: usize) void {
     } else {
         const table: *const scan.Table = @ptrCast(@alignCast(job.table));
         const layout = packing.Layout.init(job.padded, @intCast(job.bits));
-        while (i + batch_group <= job.n) : (i += batch_group) {
+        if (split_one_bit and job.bits == 1) {
+            while (i + batch_group <= job.n) : (i += batch_group) {
+                inline for (0..2) |h| {
+                    const rows = batch_tile / 2;
+                    scan.scoreInt8Tiled(rows, batch_group, layout, table.*, queries[i..], base + h * rows * job.stride, job.stride, job.padded, job.out[h * rows * os + i ..][0 .. (rows - 1) * os + batch_group], os);
+                }
+            }
+        } else while (i + batch_group <= job.n) : (i += batch_group) {
             scan.scoreInt8Tiled(batch_tile, batch_group, layout, table.*, queries[i..], base, job.stride, job.padded, outAt(job, i, batch_tile, batch_group), os);
         }
         while (i < job.n) : (i += 1) {

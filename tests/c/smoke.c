@@ -73,6 +73,18 @@ int main(void) {
     st = zq_search(ix, se, base, nq, ids, scores);
     if (st != ZQ_OK) { printf("FAIL search: %s\n", zq_status_string(st)); return 1; }
 
+    /* A searcher belongs to the index it was created from. Used on another - here one
+     * with a much larger dimension - it would index past its own buffers. */
+    {
+        zq_config big = cfg; big.dim = 1024; zq_index *other = NULL;
+        if (zq_index_create(&big, &other) != ZQ_OK) { printf("FAIL create other\n"); return 1; }
+        float *q = calloc(1024, sizeof(float)); q[0] = 1;
+        if (zq_index_add(other, q, 1) != ZQ_OK) { printf("FAIL add other\n"); return 1; }
+        if (zq_search(other, se, q, 1, ids, scores) != ZQ_ERR_INVALID) { printf("FAIL: foreign searcher accepted\n"); return 1; }
+        free(q);
+        zq_index_free(other);
+    }
+
     /* Each corpus vector queried against itself should rank itself first. */
     int self_hits = 0;
     for (size_t i = 0; i < nq; i++) if (ids[i*K] == (uint32_t)i) self_hits++;

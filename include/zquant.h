@@ -75,7 +75,9 @@ zq_status zq_searcher_create(zq_index *index, size_t batch, size_t k,
 void      zq_searcher_free(zq_searcher *searcher);
 size_t    zq_searcher_capacity(const zq_searcher *searcher);
 
-/* Writes nq*k ids and scores, query-major. Caller owns both buffers.
+/* Writes nq*k ids and scores, query-major. Caller owns both buffers. The searcher must
+ * have been created from this index; one from any other index is refused with
+ * ZQ_ERR_INVALID.
  * Where the index holds fewer than k vectors the tail is UINT32_MAX / -inf. */
 zq_status zq_search(zq_index *index, zq_searcher *searcher,
                     const float *queries, size_t nq,

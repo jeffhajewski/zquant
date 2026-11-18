@@ -54,6 +54,10 @@ const Index = struct {
 };
 
 const Searcher = struct {
+    /// The index this searcher's scratch was sized for. Query state depends on the
+    /// index's dimension, layout and residency, so a searcher used on another index
+    /// indexes past its buffers — a heap overflow in ReleaseFast, with OK returned.
+    owner: *const Index,
     batch: zq.flat.FlatIndex.BatchSearcher,
     parallel: ?zq.flat.FlatIndex.ParallelSearcher,
     k: usize,
@@ -190,6 +194,7 @@ export fn zq_searcher_create(
         allocator.destroy(s);
         return ZQ_ERR_ALLOC;
     };
+    s.owner = ix;
     s.k = k;
     s.parallel = null;
     s.capacity = batch;
@@ -234,6 +239,7 @@ export fn zq_search(
     const q = queries orelse return ZQ_ERR_INVALID;
     const ids = out_ids orelse return ZQ_ERR_INVALID;
     const scores = out_scores orelse return ZQ_ERR_INVALID;
+    if (s.owner != ix) return ZQ_ERR_INVALID;
     if (nq == 0) return ZQ_OK;
     if (nq > s.capacity) return ZQ_ERR_INVALID;
 

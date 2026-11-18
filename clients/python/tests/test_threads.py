@@ -5,6 +5,7 @@ library at the same time. Before the searcher pool, two threads searching one In
 shared one native searcher and got each other's results back, with no error.
 """
 import threading
+import time
 
 import numpy as np
 import pytest
@@ -127,15 +128,24 @@ def test_add_and_calibrate_concurrent_with_searches():
             check_result(ids, scores, len(x), 7)
             searched[i] += 1
 
+    def wait_for_a_search():
+        # Writers are preferred, so back-to-back adds could keep every search waiting
+        # until the end. Letting at least one through between adds makes sure reads
+        # and writes really interleave, however the scheduler behaves.
+        before, deadline = sum(searched), time.monotonic() + 30
+        while sum(searched) == before and time.monotonic() < deadline:
+            time.sleep(0.001)
+
     join = spawn(N_THREADS, searcher)
     try:
         ix.calibrate(x[:500])
         for j, b in enumerate(batches):
             ix.add(b, threads=1 + 3 * (j % 2))
+            wait_for_a_search()
     finally:
         stop.set()
         join()
-    assert sum(searched) > 0
+    assert sum(searched) >= len(batches)
 
     # Nothing was lost or scrambled: the same calls made with nobody else around give
     # the same index, result for result.

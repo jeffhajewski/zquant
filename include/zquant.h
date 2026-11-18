@@ -79,6 +79,14 @@ void      zq_index_free(zq_index *index);
  * It is not free - on low-rank zero-mean data it can cost recall. */
 zq_status zq_index_calibrate(zq_index *index, const float *rows, size_t n);
 
+/* Measure the sample's centroid norm and calibrate only if it is at least 0.3, where
+ * calibration measured a gain; below it, it measured neutral or worse. Stores the norm
+ * in *centroid_norm and whether calibration was applied in *applied; either may be
+ * NULL. Fails exactly as zq_index_calibrate would, whatever the measurement. The
+ * sensible default when you do not know your data. */
+zq_status zq_index_calibrate_auto(zq_index *index, const float *rows, size_t n,
+                                  float *centroid_norm, int *applied);
+
 /* Append n row-major vectors of dim floats each. A batch containing any NaN or
  * infinity is refused whole with ZQ_ERR_INVALID; nothing from it is added. Queries,
  * calibration samples and codec input are checked the same way. */

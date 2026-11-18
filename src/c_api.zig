@@ -168,6 +168,30 @@ export fn zq_index_calibrate(index: ?*Index, rows: ?[*]const f32, n: usize) c_in
     return ZQ_OK;
 }
 
+/// Calibrate only if the sample's centroid norm says it will help. Either out pointer
+/// may be null.
+export fn zq_index_calibrate_auto(
+    index: ?*Index,
+    rows: ?[*]const f32,
+    n: usize,
+    centroid_norm: ?*f32,
+    applied: ?*c_int,
+) c_int {
+    const ix = index orelse return ZQ_ERR_INVALID;
+    const data = rows orelse return ZQ_ERR_INVALID;
+    if (n == 0) return ZQ_ERR_INVALID;
+    const sample = rowsOf(data, n, ix.inner.dim()) orelse return ZQ_ERR_INVALID;
+    const got = ix.inner.calibrateAuto(sample) catch |e| return switch (e) {
+        error.OutOfMemory => ZQ_ERR_ALLOC,
+        error.IndexNotEmpty => ZQ_ERR_STATE,
+        error.EmptySample, error.NonFiniteInput => ZQ_ERR_INVALID,
+        error.CalibrationNeedsScalarCorrection => ZQ_ERR_UNSUPPORTED,
+    };
+    if (centroid_norm) |c| c.* = got.centroid_norm;
+    if (applied) |a| a.* = @intFromBool(got.applied);
+    return ZQ_OK;
+}
+
 export fn zq_index_add(index: ?*Index, rows: ?[*]const f32, n: usize) c_int {
     const ix = index orelse return ZQ_ERR_INVALID;
     const data = rows orelse return ZQ_ERR_INVALID;

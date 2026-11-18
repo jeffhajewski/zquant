@@ -179,6 +179,28 @@ int main(void) {
         }
     }
 
+    /* Auto calibration: the smoke corpus is zero-mean Gaussian, so its centroid norm is
+     * near 0 and calibration is skipped; shifted, it is applied. */
+    {
+        zq_index *a = NULL; float cn = -1; int applied = -1;
+        if (zq_index_create(&cfg, &a) != ZQ_OK) { printf("FAIL create auto\n"); return 1; }
+        if (zq_index_calibrate_auto(a, base, N, &cn, &applied) != ZQ_OK || applied != 0 || cn > 0.1f) {
+            printf("FAIL: auto calibration on a centred corpus (norm %.3f, applied %d)\n", cn, applied); return 1;
+        }
+        zq_index_free(a);
+        float *shifted = malloc(sizeof(float) * N * DIM);
+        for (size_t i = 0; i < (size_t)N * DIM; i++) shifted[i] = base[i] + 0.5f;
+        if (zq_index_create(&cfg, &a) != ZQ_OK) { printf("FAIL create auto\n"); return 1; }
+        if (zq_index_calibrate_auto(a, shifted, N, NULL, &applied) != ZQ_OK || applied != 1) {
+            printf("FAIL: auto calibration skipped an off-centre corpus\n"); return 1;
+        }
+        if (zq_index_calibrate_auto(a, shifted, N, NULL, NULL) != ZQ_OK) { printf("FAIL: recalibration with null outputs\n"); return 1; }
+        zq_index_add(a, shifted, 1);
+        if (zq_index_calibrate_auto(a, shifted, N, NULL, NULL) != ZQ_ERR_STATE) { printf("FAIL: auto calibration after add\n"); return 1; }
+        free(shifted);
+        zq_index_free(a);
+    }
+
     /* Each corpus vector queried against itself should rank itself first. */
     int self_hits = 0;
     for (size_t i = 0; i < nq; i++) if (ids[i*K] == (uint32_t)i) self_hits++;

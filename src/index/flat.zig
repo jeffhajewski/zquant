@@ -354,6 +354,39 @@ pub const FlatIndex = struct {
         };
     }
 
+    /// Centroid norm at or above which `calibrateAuto` calibrates.
+    ///
+    /// Measured with the spectrum held fixed (docs/notes.md, "The variable is the
+    /// centroid norm"): calibration gained +0.9 points of R@10 at 0.124, +3.2 at 0.410
+    /// and +11.4 at 0.648 (bits=3), and the real corpora at those norms agreed to
+    /// within half a point. On a low-rank zero-mean corpus it *cost* 3 points, which
+    /// is why it is not simply always on.
+    pub const auto_calibration_threshold: f32 = 0.3;
+
+    pub const AutoCalibration = struct {
+        /// `centroidNorm` of the sample.
+        centroid_norm: f32,
+        /// Whether the index was calibrated.
+        applied: bool,
+    };
+
+    /// Calibrate if the sample says it will help: when its `centroidNorm` is at least
+    /// `auto_calibration_threshold`. Fails exactly as `calibrate` would, whichever
+    /// way the measurement goes, so a caller's error handling does not depend on data.
+    pub fn calibrateAuto(self: *FlatIndex, sample: []const f32) !AutoCalibration {
+        if (self.count() > 0) return error.IndexNotEmpty;
+        if (self.correction != .scalar) return error.CalibrationNeedsScalarCorrection;
+        const d = self.dim();
+        std.debug.assert(sample.len % d == 0);
+        if (!allFinite(sample)) return error.NonFiniteInput;
+        if (sample.len / d < 2) return error.EmptySample;
+
+        const c = try centroidNorm(self.allocator, sample, d);
+        if (c < auto_calibration_threshold) return .{ .centroid_norm = c, .applied = false };
+        try self.calibrate(sample);
+        return .{ .centroid_norm = c, .applied = true };
+    }
+
     /// Fit a per-coordinate `(shift, scale)` by quantile anchoring.
     ///
     /// Each coordinate is mapped by `z = (y + shift) * scale` before quantizing, with
@@ -1408,6 +1441,32 @@ pub const FlatIndex = struct {
         };
     }
 };
+
+/// `‖mean(x/‖x‖)‖` over the rows of `sample`: how far off the origin the corpus's
+/// directions sit, from 0 (directions spread evenly) to 1 (all the same). It predicts
+/// whether `calibrate` helps; see `FlatIndex.auto_calibration_threshold`. Zero rows
+/// have no direction and are skipped.
+pub fn centroidNorm(allocator: Allocator, sample: []const f32, dim: usize) Allocator.Error!f32 {
+    std.debug.assert(dim > 0 and sample.len % dim == 0);
+    const mean = try allocator.alloc(f64, dim);
+    defer allocator.free(mean);
+    @memset(mean, 0);
+    var rows: usize = 0;
+    var i: usize = 0;
+    while (i < sample.len) : (i += dim) {
+        const row = sample[i..][0..dim];
+        var sq: f64 = 0;
+        for (row) |v| sq += @as(f64, v) * v;
+        if (sq == 0) continue;
+        const inv = 1 / @sqrt(sq);
+        for (mean, row) |*m, v| m.* += v * inv;
+        rows += 1;
+    }
+    if (rows == 0) return 0;
+    var sq: f64 = 0;
+    for (mean) |m| sq += m * m;
+    return @floatCast(@sqrt(sq) / @as(f64, @floatFromInt(rows)));
+}
 
 /// Per-vector coefficients of `scalarScore`.
 const VectorTerms = struct { factor: f32, offset: f32 };
@@ -2693,4 +2752,45 @@ test "scoreIds reports exactly the scores search does" {
         var out: [2]f32 = undefined;
         try testing.expectError(error.IdOutOfRange, index.scoreIds(q, &bad, &out, &searcher));
     }
+}
+
+test "centroidNorm: 0 for balanced directions, 1 for identical ones" {
+    const a = [_]f32{ 1, 0, -1, 0, 0, 2, 0, -2 };
+    try testing.expectApproxEqAbs(@as(f32, 0), try centroidNorm(testing.allocator, &a, 2), 1e-6);
+    const b = [_]f32{ 3, 4, 6, 8, 0, 0 }; // the zero row is skipped
+    try testing.expectApproxEqAbs(@as(f32, 1), try centroidNorm(testing.allocator, &b, 2), 1e-6);
+    const z = [_]f32{ 0, 0, 0, 0 };
+    try testing.expectEqual(@as(f32, 0), try centroidNorm(testing.allocator, &z, 2));
+}
+
+test "calibrateAuto calibrates an off-centre corpus and leaves a centred one alone" {
+    var prng = std.Random.DefaultPrng.init(0xA070);
+    const random = prng.random();
+    const dim = 64;
+    const n = 2000;
+    const data = try testing.allocator.alloc(f32, n * dim);
+    defer testing.allocator.free(data);
+
+    for ([_]f32{ 0, 0.5 }) |offset| {
+        for (data) |*v| v.* = random.floatNorm(f32) + offset;
+        var index = try FlatIndex.init(testing.allocator, .{ .dim = dim, .bits = 4 });
+        defer index.deinit();
+        const got = try index.calibrateAuto(data);
+        try testing.expectEqual(offset > 0, got.applied);
+        try testing.expectEqual(got.applied, index.calibrated);
+        // Offset o in d dims: o·√d / √(d·(1 + o²)) = 0.447 at o = 0.5; ~1/√n at 0.
+        if (offset == 0)
+            try testing.expect(got.centroid_norm < 0.1)
+        else
+            try testing.expectApproxEqAbs(@as(f32, 0.447), got.centroid_norm, 0.03);
+    }
+
+    // The same errors as calibrate, whatever the data.
+    var full = try FlatIndex.init(testing.allocator, .{ .dim = dim, .bits = 4 });
+    defer full.deinit();
+    _ = try full.add(data[0..dim]);
+    try testing.expectError(error.IndexNotEmpty, full.calibrateAuto(data));
+    var sketch = try FlatIndex.init(testing.allocator, .{ .dim = dim, .bits = 4, .correction = .qjl_sketch });
+    defer sketch.deinit();
+    try testing.expectError(error.CalibrationNeedsScalarCorrection, sketch.calibrateAuto(data));
 }

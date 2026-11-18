@@ -29,10 +29,10 @@ jobs:
         # instruction, and the Python and TypeScript clients fall back to
         # libzquant-portable automatically when it sits alongside.
         include:
-          - { target: x86_64-linux-gnu,    cpu: x86_64_v2,       lib: zquant,          name: linux-x86_64 }
-          - { target: x86_64-linux-gnu,    cpu: baseline,        lib: zquant-portable, name: linux-x86_64-portable }
-          - { target: aarch64-linux-gnu,   cpu: generic+dotprod, lib: zquant,          name: linux-aarch64 }
-          - { target: aarch64-linux-gnu,   cpu: baseline,        lib: zquant-portable, name: linux-aarch64-portable }
+          - { target: x86_64-linux-gnu.2.17,  cpu: x86_64_v2,       lib: zquant,          name: linux-x86_64 }
+          - { target: x86_64-linux-gnu.2.17,  cpu: baseline,        lib: zquant-portable, name: linux-x86_64-portable }
+          - { target: aarch64-linux-gnu.2.17, cpu: generic+dotprod, lib: zquant,          name: linux-aarch64 }
+          - { target: aarch64-linux-gnu.2.17, cpu: baseline,        lib: zquant-portable, name: linux-aarch64-portable }
           - { target: x86_64-macos,        cpu: baseline,        lib: zquant,          name: macos-x86_64 }
           - { target: aarch64-macos,       cpu: baseline,        lib: zquant,          name: macos-aarch64 }
           - { target: x86_64-windows-gnu,  cpu: x86_64_v2,       lib: zquant,          name: windows-x86_64 }
@@ -57,6 +57,18 @@ jobs:
           lib=$(find zig-out -name '*.so' -o -name '*.dylib' -o -name '*.dll' | head -1)
           grep -a -o 'zquant-kernels [a-z=]* [a-z=]*' "$lib"
           grep -a -q 'zquant-kernels shuffle=native dot=native' "$lib"
+
+      # Linux libraries target glibc 2.17 (RHEL 7, and the manylinux_2_17 wheels'
+      # promise). The default Zig picks is newer: the arm64 library imported exp and log
+      # at GLIBC_2.29 and would not load on RHEL 8, Debian 10 or Amazon Linux 2. The
+      # version strings are in .dynstr, so a grep reads them for any architecture.
+      - name: Check the glibc floor
+        if: contains(matrix.target, 'linux')
+        run: |
+          lib=$(find zig-out -name 'libzquant*.so' | head -1)
+          newest=$(grep -a -o 'GLIBC_[0-9][0-9.]*' "$lib" | sed 's/^GLIBC_//' | sort -uV | tail -1)
+          echo "$lib: newest glibc symbol version $newest"
+          [ "$(printf '%s\n' "$newest" 2.17 | sort -V | tail -1)" = 2.17 ]
 
       # bin/ holds the Windows DLL; lib/ holds its import library, the static library
       # and the pkg-config file.

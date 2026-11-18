@@ -411,10 +411,10 @@ jobs:
       matrix:
         # The release matrix, target and CPU alike (release.yml explains the CPUs).
         include:
-          - { target: x86_64-linux-gnu,   cpu: x86_64_v2 }
-          - { target: x86_64-linux-gnu,   cpu: baseline }
-          - { target: aarch64-linux-gnu,  cpu: generic+dotprod }
-          - { target: aarch64-linux-gnu,  cpu: baseline }
+          - { target: x86_64-linux-gnu.2.17,  cpu: x86_64_v2 }
+          - { target: x86_64-linux-gnu.2.17,  cpu: baseline }
+          - { target: aarch64-linux-gnu.2.17, cpu: generic+dotprod }
+          - { target: aarch64-linux-gnu.2.17, cpu: baseline }
           - { target: x86_64-macos,       cpu: baseline }
           - { target: aarch64-macos,      cpu: baseline }
           - { target: x86_64-windows-gnu, cpu: x86_64_v2 }
@@ -442,3 +442,15 @@ jobs:
           lib=$(find zig-out -name 'libzquant.so' -o -name 'libzquant.dylib' -o -name 'zquant.dll' | head -1)
           grep -a -o 'zquant-kernels [a-z=]* [a-z=]*' "$lib"
           grep -a -q 'zquant-kernels shuffle=native dot=native' "$lib"
+
+      # Linux libraries target glibc 2.17 (RHEL 7, and the manylinux_2_17 wheels'
+      # promise). The default Zig picks is newer: the arm64 library imported exp and log
+      # at GLIBC_2.29 and would not load on RHEL 8, Debian 10 or Amazon Linux 2. The
+      # version strings are in .dynstr, so a grep reads them for any architecture.
+      - name: Check the glibc floor
+        if: contains(matrix.target, 'linux')
+        run: |
+          lib=$(find zig-out -name 'libzquant*.so' | head -1)
+          newest=$(grep -a -o 'GLIBC_[0-9][0-9.]*' "$lib" | sed 's/^GLIBC_//' | sort -uV | tail -1)
+          echo "$lib: newest glibc symbol version $newest"
+          [ "$(printf '%s\n' "$newest" 2.17 | sort -V | tail -1)" = 2.17 ]

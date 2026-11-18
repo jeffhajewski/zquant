@@ -1886,3 +1886,97 @@ head. A shared PRNG stream had given each row different positions. Several perpl
 in the logs took ~1000 s where neighbours took ~20 s. That was the machine sleeping in
 thermal dark-wake cycles (`pmset -g log`), not anything in the code; results are
 unaffected. SmolLM2-135M ran 64 windows of 1024 tokens; the other two ran 16 windows.
+
+
+## A review pass: what shipped was not what was measured
+
+A review of the whole project, set aside from the documentation, found the measured
+system and the shipped one had drifted apart in several places. Each item below was fixed
+and then measured through the public API, not the internals.
+
+**The release libraries had no fast kernels.** The kernels pick instructions at compile
+time, and `release.yml` built every target for its architecture baseline. That baseline
+has no SSSE3 on x86_64 and no dot product on arm64 Linux. The x86_64 `.so` contained no
+`pshufb` at all. Every number in this log was measured with native builds, so none of
+them described what a user downloaded. Releases now target `x86_64_v2` and
+`generic+dotprod`, with a `libzquant-portable` beside each. Those targets assume a CPU,
+so the library now carries a probe, compiled separately for the baseline, that checks
+the features the rest was built with. Under Rosetta, which reports no AVX by default, an
+`x86_64_v3` build is refused with `ZQ_ERR_CPU` instead of crashing. The Python loader
+then loads the portable library and searches correctly. Every fast release build
+embeds a `zquant-kernels shuffle=native dot=native` string that CI greps for.
+
+**The C boundary trusted its callers.**
+- bits=1 reached `8 % 0` in the packing layout.
+- A large `k` or `n` wrapped a size computation into a small allocation.
+- A searcher used on another index indexed past its buffers.
+- A NaN broke the top-k ordering for every query, not just its own.
+
+Each of these is now an error, and each has a C smoke test. In the bindings, Python
+threads sharing an `Index` shared one cached searcher and silently got each other's
+results. ctypes releases the GIL during the call, so this is a real race. Go had no
+`runtime.KeepAlive`, and `Close` could free a handle mid-search. Both are fixed, and
+both have tests that fail without the fix (a threaded Python test, and `go test -race`).
+
+**The index stored a sketch nothing read.** The QJL sketch was computed and stored for
+every vector under the scalar correction, which never reads it. At d=256 that was 32
+bytes per vector beyond what `bytesPerVector` reported, so the README's 132 B was really
+164.7 B. Dropping it doubled single-thread add throughput (213k → 414k vec/s). Cosine and
+L2 had no batched fast path and ran at 3,340–3,588 QPS against 5,490 for inner product.
+All three metrics are now one affine map of the same MSE term, specialized at compile
+time so inner product pays nothing for the others. All three now run at about 5,300 QPS.
+
+**Non-power-of-two dimensions padded to the next power of two.** DESIGN §1.4 planned
+block transforms and they were never built, so d=768 cost exactly what d=1024 did. The
+rotation now works on `m·2^a` with a Haar `m×m` mix across blocks; see DESIGN §1.4 *as
+built*. On fashion-mnist (784 → 896, not 1024) storage fell 12% for 0.5 points of R@10.
+On a synthetic d=768 corpus, at equal bytes (388 B), recall went from 0.817 to 0.880.
+
+**What was added, each measured:**
+- Parallel encoding. It is byte-identical to serial and runs at 448k vec/s on 8 threads
+  at d=768, against 84k.
+- Save/load, with a format version and a separate *encoding* version, so codes from an
+  older rotation are refused rather than decoded wrongly. Every single-bit flip of a
+  saved file is rejected.
+- Exact reranking. At bits=3 on fashion-mnist, a 4× over-fetch takes R@10 from 0.724 to
+  0.984 for 3–4% of throughput.
+- `scoreIds`, whose scores equal search's exactly.
+- Automatic calibration at a centroid norm ≥ 0.3. On fashion-mnist (0.769) it calibrated
+  and gained 8.2 points. On synthetic d=768 data (0.135) it skipped calibration, and
+  forcing it would have gained 1.2.
+- A conformance fixture that all three bindings replay byte for byte. Its hashes agree
+  across Debug, ReleaseSafe and ReleaseFast, and on x86_64 under Rosetta at two CPU
+  levels.
+
+**Packaging that only worked on the build machine.**
+- On Windows, the static library and the DLL's import library were both `zquant.lib`,
+  and the release tarball left out `bin/`, so the DLL never shipped.
+- The pkg-config file baked in the absolute build prefix and carried no rpath. On macOS,
+  where the dylib's install name is `@rpath/…`, nothing linked through it could run.
+- The npm package's `main` pointed at a file the build never produced.
+- No binding could be installed outside the repository.
+
+All fixed. CI now installs the wheel and the npm tarball outside the checkout and uses
+them. The pkg-config job moves the prefix after installing. Releases are gated on
+running the suite at every shipped CPU level on x86_64 and arm64 Linux, macOS and
+Windows.
+
+**Larger corpora.** nytimes at its full 290k, and synthetic corpora at 500k × 768 and
+250k × 1536; the README has the table. With a 4× rerank, bits=5 reaches R@10 1.000 on
+both synthetic corpora. There is still no real corpus at d ≥ 768 beyond fashion-mnist's
+60k.
+
+**Not done, or not verifiable here:**
+- *x86 tile shapes.* The x86_64_v3 disassembly of the 4×4 batch tile has 498 stack
+  vector operations in its hot loop, which suggests register spills that 2×4 avoids.
+  Timing under Rosetta could not separate the shapes, so they were left unchanged.
+  Settle it on real x86 hardware.
+- *Kernels not shipped.* No VNNI or 256-bit AVX2 kernel exists. x86 runs 128-bit SSSE3,
+  or VEX-encoded 128-bit on AVX machines.
+- *Windows and arm64 Linux.* Every test binary cross-compiles for both, but they have
+  only ever run in CI, never here.
+- *ThreadSanitizer.* It segfaults on a trivial four-thread program with this toolchain
+  on macOS, so parallel encoding is checked by byte equality with a serial encode, not
+  by TSan.
+- *dump_kv.py.* It still captures pre-RoPE queries. This is documented in the KV
+  section and does not affect the perplexity results.

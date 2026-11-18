@@ -34,32 +34,51 @@ For the competitive comparison against FAISS PQ, FAISS RaBitQ and turbovec, see
 
 | language | how it binds | tests |
 |---|---|---|
-| [Zig](src/root.zig) | native | 175 |
-| [Python](clients/python) | ctypes over the C ABI | 9 |
-| [TypeScript / Node](clients/typescript) | koffi over the C ABI | 8 |
-| [Go](clients/go) | cgo over the C ABI | 9 |
+| [Zig](src/root.zig) | native | 198 |
+| [Python](clients/python) | ctypes over the C ABI | 104 |
+| [TypeScript / Node](clients/typescript) | koffi over the C ABI | 65 |
+| [Go](clients/go) | cgo over the C ABI | 45 |
 
 ```python
 import zquant
-index = zquant.Index(dim=256, bits=5)
-index.add(vectors)
+index = zquant.Index(dim=768, bits=5)
+index.calibrate(sample, auto=True)    # only if the data says it will help
+index.add(vectors, threads=8)
 ids, scores = index.search(queries, k=10, threads=8)
+ids, scores = index.search_rerank(queries, vectors, k=10)   # exact top-k from 4x candidates
+index.save("vectors.zq")
 ```
 
+A flat (exhaustive) index and a standalone quantizer (`Codec`), with the same API in every
+binding:
+
+- **Save and load.** Versioned, checksummed, the same bytes on every platform. A loaded
+  index searches and accepts new vectors exactly as the saved one did.
+- **Exact reranking.** Over-fetch candidates and rescore them against your full-precision
+  vectors. On fashion-mnist this takes R@10 at bits=3 from 0.724 to 0.984, for about 4% of
+  throughput.
+- **Scores for ids you choose**, for ranking a candidate set from a filter or another
+  index without scanning the corpus.
+- **Automatic calibration.** It measures how far off-centre the data is and calibrates
+  only where that has measured a gain.
+- **Parallel encoding.** It produces the same bytes as serial encoding.
+- **Thread safety.** Many threads can search one index at once. Adding, closing and
+  garbage collection are safe against searches in flight.
+
 All three sit on the same [C ABI](include/zquant.h), so a mistake in it surfaces in every
-binding rather than hiding in one. Measured on 100k × 256 vectors at `bits=5`, an Apple M5:
+binding rather than hiding in one. Each replays the same
+[conformance fixture](tests/golden/conformance.json) and must reproduce its hashes byte
+for byte. Measured on 100k × 256 vectors at `bits=5`, an Apple M5:
 
-| | build | 1 thread | 10 threads |
-|---|---|---|---|
-| Zig (native) | — | 5,492 | ~27,000 |
-| Python | 225k vec/s | 5,492 | 28,927 |
-| TypeScript | 227k vec/s | 5,539 | 27,951 |
-| Go | 227k vec/s | 5,655 | 28,127 |
+| | add, 1 thread | add, 10 threads | search, 1 thread | search, 10 threads |
+|---|---|---|---|---|
+| Python | 428k vec/s | 2.39M vec/s | 5,656 QPS | 29,345 QPS |
+| TypeScript | 427k vec/s | 2.44M vec/s | 5,627 QPS | 29,214 QPS |
+| Go | 436k vec/s | 2.43M vec/s | 5,580 QPS | 27,543 QPS |
 
-Every binding lands within noise of the library and of each other, so none of them costs
-anything measurable. Storage is 132 B/vector — 13 MB against 102 MB as float32.
-
-A flat (exhaustive) index and a standalone quantizer.
+The three bindings land within noise of each other, and of the library timed from C
+(5,509 QPS on one thread). None of them costs anything measurable. Creating an index takes
+about 50 ms. Storage is 132 B/vector: 13 MB, against 102 MB as float32.
 
 ## KV-cache compression
 
@@ -235,11 +254,37 @@ zquant wins the high-recall end on both corpora, and is **3–6× faster** throu
 **What we would not claim.** These are two corpora at d=128 and d=256, on one machine. The
 sub-25 B band belongs to PQ. Parallel throughput drifts with thermal state by up to 25% across
 consecutive runs, so treat the QPS column as approximate; single-thread figures are stable to
-about 5%. d=1536–3072 and corpora beyond 100k vectors are untested.
+about 5%.
+
+### Larger corpora and higher dimensions
+
+zquant alone, without the other systems (they were not rerun). nytimes is the full 290k
+corpus with its published ground truth. The two higher-dimensional corpora are
+**synthetic**: unit vectors with a decaying spectrum and a small common offset, with exact
+ground truth. There is no real corpus at d ≥ 768 beyond 60k vectors here yet. `+rr4` is
+`search_rerank` with 4× candidates. "1 thread" is one core searching queries in batches of
+32, as the bindings do. Throughput is k=10, from C, on the M5.
+
+| corpus | bits | B/vec | R@10 | R@10 +rr4 | QPS, 1 thread | QPS, 10 threads | add, 10 threads |
+|---|---|---|---|---|---|---|---|
+| nytimes, 290k × 256 | 3 | 68 | 0.766 | 0.955 | 1,839 | 9,682 | 2.47M/s |
+| | 5 | 132 | 0.918 | 0.985 | 1,953 | 10,758 | 2.58M/s |
+| synthetic, 500k × 768 | 3 | 196 | 0.560 | 0.900 | 402 | 2,153 | 696k/s |
+| | 5 | 388 | 0.866 | 1.000 | 423 | 2,342 | 708k/s |
+| synthetic, 250k × 1536 | 3 | 388 | 0.629 | 0.948 | 409 | 2,242 | 357k/s |
+| | 5 | 772 | 0.883 | 1.000 | 440 | 2,397 | 329k/s |
+
+Search is a linear scan, so throughput falls with n·d as expected. At d=768 the index no
+longer pads to 1024, so these sizes are 25% smaller than they were. bits=4 is left out
+because it is the slow width (its 3-bit codes need bit-plane unpacking; see `Residency` in
+[src/index/flat.zig](src/index/flat.zig)). It runs at about 40% of the speed of bits=3 and
+5. No x86_64 throughput has been measured on real hardware; CI writes the x86_64
+quickbench to its job summary.
 
 ## Status
 
-**P0 (reference core) and P1 (kernels, flat index, comparison) complete.** 175 tests passing.
+**P0 (reference core) and P1 (kernels, flat index, comparison) complete.** 198 Zig tests
+passing, plus 214 across the three bindings.
 
 Reproduced from the paper: Lloyd-Max levels (the classic Max table to six decimals),
 `D_mse` of 0.36/0.117/0.03/0.009 for b=1..4 measured end to end, the 2/π inner-product
@@ -262,7 +307,22 @@ Requires Zig 0.16.0.
 
 ```sh
 zig build test
+zig build lib            # the C library, header and pkg-config file, into zig-out/
 ```
+
+### Prebuilt libraries and CPUs
+
+The scan kernels are chosen at compile time, so a library built for one CPU uses that CPU's
+instructions unconditionally. Releases are built for SSSE3 on x86_64 (`x86_64_v2`) and for
+the dot-product extension on arm64. Search is 6–10× slower without them. Each release
+also has a `-portable` build for the bare baseline, named `libzquant-portable`, for older
+CPUs.
+
+The library checks at load time rather than crashing: `zq_cpu_supported()` is safe on any
+CPU, and creating an index on an unsupported one returns `ZQ_ERR_CPU`. The Python and
+TypeScript bindings fall back to `libzquant-portable` automatically when it sits beside
+the main library. `zq_build_cpu()` and `zq_build_kernels()` say what a given build
+contains. `zig build lib` with no options builds for the machine you're on.
 
 ### macOS note
 

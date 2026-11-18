@@ -19,7 +19,7 @@ import (
 	"fmt"
 	"runtime"
 	"sync"
-	"unsafe"
+	"sync/atomic"
 )
 
 // Metric selects how a stored vector is scored against a query.
@@ -48,6 +48,15 @@ func check(status C.int, context string) error {
 	return &Error{Status: int(status), Context: context}
 }
 
+// ErrClosed is returned, wrapped, by any call on an Index or Searcher after its Close.
+var ErrClosed = errors.New("zquant: use after Close")
+
+// closedError names what was closed while still matching ErrClosed under errors.Is.
+type closedError string
+
+func (e closedError) Error() string        { return "zquant: " + string(e) + " is closed" }
+func (e closedError) Is(target error) bool { return target == ErrClosed }
+
 // Version reports the native library version.
 func Version() string { return C.GoString(C.zq_version()) }
 
@@ -65,18 +74,33 @@ type Config struct {
 	Expanded bool
 }
 
+// indexIDs hands each Index a unique identity, so a Searcher can tell whether it is
+// being used with the index it was made for without holding a pointer back to it.
+var indexIDs atomic.Uint64
+
 // Index is a flat (exhaustive) quantized index. Every vector is scanned for every
 // query, so recall is bounded only by quantization and cost grows linearly with the
 // corpus.
 //
-// An Index is safe for concurrent Search calls. Add and Calibrate are not, and must not
-// run concurrently with anything else on the same Index.
+// Every method is safe to call from any goroutine. Searches run in parallel with each
+// other; Add and Calibrate wait for searches in flight and hold new ones off until they
+// finish, because the native library forbids a mutation overlapping any other call on
+// the same index. Close waits for every call in flight, and any call after it returns
+// an error wrapping ErrClosed.
 type Index struct {
+	// mu guards handle. Calls that only read the index (search, count, serialize,
+	// creating a searcher) hold it shared; calls that modify it, and Close, hold it
+	// exclusively. Holding it across each native call is what stops Close freeing the
+	// handle under a search.
+	mu     sync.RWMutex
 	handle *C.zq_index
 	dim    int
+	id     uint64
 
-	mu        sync.Mutex
-	searchers map[[2]int]*Searcher
+	// cacheMu guards cache. It is only taken with mu already held, shared or
+	// exclusive, so the lock order is always mu then cacheMu.
+	cacheMu sync.Mutex
+	cache   map[[2]int]*Searcher
 }
 
 // New creates an empty index.
@@ -107,42 +131,87 @@ func New(cfg Config) (*Index, error) {
 	if err := check(C.zq_index_create(&c, &handle), "create"); err != nil {
 		return nil, err
 	}
-	ix := &Index{handle: handle, dim: cfg.Dim, searchers: map[[2]int]*Searcher{}}
-	// A finalizer is a backstop, not the contract: callers should Close. Without it a
-	// dropped Index leaks native memory the garbage collector cannot see.
-	runtime.SetFinalizer(ix, func(i *Index) { i.Close() })
-	return ix, nil
+	return wrapIndex(handle), nil
 }
 
-// Close releases the index and every searcher created from it. It is idempotent.
+// wrapIndex takes ownership of a native index handle.
+func wrapIndex(handle *C.zq_index) *Index {
+	ix := &Index{
+		handle: handle,
+		dim:    int(C.zq_index_dim(handle)),
+		id:     indexIDs.Add(1),
+		cache:  map[[2]int]*Searcher{},
+	}
+	// A finalizer is a backstop, not the contract: callers should Close. Without it a
+	// dropped Index leaks native memory the garbage collector cannot see. Nothing the
+	// Index reaches points back at it, so it never sits in a cycle, which would stop
+	// the finalizer from running at all.
+	runtime.SetFinalizer(ix, (*Index).Close)
+	return ix
+}
+
+// Close releases the index and the searchers Search cached for it. It waits for calls
+// in flight to finish, and is idempotent.
+//
+// Searchers made with NewSearcher are not closed here; close them yourself. Once the
+// index is closed they can no longer search, but releasing them is still safe.
 func (ix *Index) Close() error {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
-	for _, s := range ix.searchers {
-		s.close()
+	if ix.handle == nil {
+		return nil
 	}
-	ix.searchers = map[[2]int]*Searcher{}
-	if ix.handle != nil {
-		C.zq_index_free(ix.handle)
-		ix.handle = nil
-		runtime.SetFinalizer(ix, nil)
+	// No other call can hold mu, so none is using a cached searcher.
+	ix.cacheMu.Lock()
+	for _, s := range ix.cache {
+		s.Close()
 	}
+	ix.cache = nil
+	ix.cacheMu.Unlock()
+
+	C.zq_index_free(ix.handle)
+	ix.handle = nil
+	runtime.SetFinalizer(ix, nil)
 	return nil
 }
+
+// errIndexClosed is what every call on a closed index returns.
+const errIndexClosed = closedError("index")
 
 // Dim reports the vector dimension.
 func (ix *Index) Dim() int { return ix.dim }
 
-// Len reports how many vectors the index holds.
-func (ix *Index) Len() int { return int(C.zq_index_count(ix.handle)) }
+// Len reports how many vectors the index holds, or 0 once it is closed.
+func (ix *Index) Len() int {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	return ix.lenLocked()
+}
 
-// BytesPerVector reports storage per vector, codes and scalars together.
-func (ix *Index) BytesPerVector() int { return int(C.zq_index_bytes_per_vector(ix.handle)) }
-
-func (ix *Index) rows(v []float32, name string) (int, error) {
+func (ix *Index) lenLocked() int {
 	if ix.handle == nil {
-		return 0, errors.New("zquant: index is closed")
+		return 0
 	}
+	n := int(C.zq_index_count(ix.handle))
+	runtime.KeepAlive(ix)
+	return n
+}
+
+// BytesPerVector reports storage per vector, codes and scalars together, or 0 once the
+// index is closed.
+func (ix *Index) BytesPerVector() int {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	if ix.handle == nil {
+		return 0
+	}
+	n := int(C.zq_index_bytes_per_vector(ix.handle))
+	runtime.KeepAlive(ix)
+	return n
+}
+
+// rows checks that v holds a whole, non-zero number of vectors and returns how many.
+func (ix *Index) rows(v []float32, name string) (int, error) {
 	if len(v) == 0 || len(v)%ix.dim != 0 {
 		return 0, fmt.Errorf("zquant: %s length %d is not a positive multiple of dim %d", name, len(v), ix.dim)
 	}
@@ -159,119 +228,28 @@ func (ix *Index) Calibrate(sample []float32) error {
 	if err != nil {
 		return err
 	}
-	return check(C.zq_index_calibrate(ix.handle, (*C.float)(&sample[0]), C.size_t(n)), "calibrate")
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	if ix.handle == nil {
+		return errIndexClosed
+	}
+	st := C.zq_index_calibrate(ix.handle, (*C.float)(&sample[0]), C.size_t(n))
+	runtime.KeepAlive(ix)
+	return check(st, "calibrate")
 }
 
-// Add appends vectors to the index.
+// Add appends vectors to the index. Ids are assigned in insertion order, from 0.
 func (ix *Index) Add(vectors []float32) error {
 	n, err := ix.rows(vectors, "vectors")
 	if err != nil {
 		return err
 	}
-	return check(C.zq_index_add(ix.handle, (*C.float)(&vectors[0]), C.size_t(n)), "add")
-}
-
-// Searcher holds the scratch space one search needs. Each goroutine searching
-// concurrently must own a distinct Searcher.
-type Searcher struct {
-	handle   *C.zq_searcher
-	k        int
-	capacity int
-}
-
-// NewSearcher creates search scratch for a given k and thread count. threads greater
-// than one splits a batch across workers, which only pays for batches at least that
-// large.
-func (ix *Index) NewSearcher(k, threads int) (*Searcher, error) {
-	if k < 1 {
-		return nil, errors.New("zquant: k must be at least 1")
-	}
-	if threads < 1 {
-		threads = 1
-	}
-	var handle *C.zq_searcher
-	const batch = 32
-	if err := check(C.zq_searcher_create(ix.handle, batch, C.size_t(k), C.size_t(threads), &handle), "searcher"); err != nil {
-		return nil, err
-	}
-	return &Searcher{handle: handle, k: k, capacity: int(C.zq_searcher_capacity(handle))}, nil
-}
-
-// Close releases the searcher. It is idempotent.
-func (s *Searcher) Close() error { s.close(); return nil }
-
-func (s *Searcher) close() {
-	if s.handle != nil {
-		C.zq_searcher_free(s.handle)
-		s.handle = nil
-	}
-}
-
-// Results holds nq*K ids and scores, query-major and best first. Where the index holds
-// fewer than K vectors the tail is math.MaxUint32 and negative infinity.
-type Results struct {
-	IDs    []uint32
-	Scores []float32
-	K      int
-}
-
-// At returns the ids and scores for query i.
-func (r Results) At(i int) ([]uint32, []float32) {
-	return r.IDs[i*r.K : (i+1)*r.K], r.Scores[i*r.K : (i+1)*r.K]
-}
-
-// SearchWith runs a search using a caller-owned Searcher, which is the form to use when
-// searching concurrently: give each goroutine its own.
-func (ix *Index) SearchWith(s *Searcher, queries []float32) (Results, error) {
-	nq, err := ix.rows(queries, "queries")
-	if err != nil {
-		return Results{}, err
-	}
-	if s.handle == nil {
-		return Results{}, errors.New("zquant: searcher is closed")
-	}
-	if ix.Len() == 0 {
-		return Results{}, &Error{Status: C.ZQ_ERR_STATE, Context: "search on an empty index"}
-	}
-
-	ids := make([]uint32, nq*s.k)
-	scores := make([]float32, nq*s.k)
-	// The native call takes at most capacity queries; chunk here rather than making
-	// that the caller's problem.
-	for start := 0; start < nq; start += s.capacity {
-		n := s.capacity
-		if n > nq-start {
-			n = nq - start
-		}
-		st := C.zq_search(
-			ix.handle, s.handle,
-			(*C.float)(&queries[start*ix.dim]), C.size_t(n),
-			(*C.uint32_t)(unsafe.Pointer(&ids[start*s.k])),
-			(*C.float)(&scores[start*s.k]),
-		)
-		if err := check(st, "search"); err != nil {
-			return Results{}, err
-		}
-	}
-	return Results{IDs: ids, Scores: scores, K: s.k}, nil
-}
-
-// Search is the convenience form: it reuses a cached Searcher per (k, threads).
-//
-// Safe to call concurrently, but serialized by a mutex, because a Searcher cannot be
-// shared across goroutines. For concurrent throughput use NewSearcher and SearchWith
-// with one searcher per goroutine.
-func (ix *Index) Search(queries []float32, k, threads int) (Results, error) {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
-	key := [2]int{k, threads}
-	s, ok := ix.searchers[key]
-	if !ok {
-		var err error
-		if s, err = ix.NewSearcher(k, threads); err != nil {
-			return Results{}, err
-		}
-		ix.searchers[key] = s
+	if ix.handle == nil {
+		return errIndexClosed
 	}
-	return ix.SearchWith(s, queries)
+	st := C.zq_index_add(ix.handle, (*C.float)(&vectors[0]), C.size_t(n))
+	runtime.KeepAlive(ix)
+	return check(st, "add")
 }

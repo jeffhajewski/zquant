@@ -1,6 +1,7 @@
 package zquant
 
 import (
+	"fmt"
 	"math"
 	"math/rand"
 	"sort"
@@ -291,7 +292,7 @@ func TestConcurrentSearchers(t *testing.T) {
 				}
 				for j := range want.IDs {
 					if got.IDs[j] != want.IDs[j] {
-						errs <- err
+						errs <- fmt.Errorf("result %d: id %d, want %d", j, got.IDs[j], want.IDs[j])
 						return
 					}
 				}

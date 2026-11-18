@@ -152,6 +152,33 @@ int main(void) {
         zq_searcher_free(lse); zq_index_free(loaded);
     }
 
+    /* zq_score_ids reports exactly the scores search did for the same ids. */
+    {
+        float got[K];
+        if (zq_score_ids(ix, se, base, ids, K, got) != ZQ_OK) { printf("FAIL score_ids\n"); return 1; }
+        if (memcmp(got, scores, sizeof got)) { printf("FAIL: score_ids disagrees with search\n"); return 1; }
+        uint32_t past = (uint32_t)zq_index_count(ix);
+        if (zq_score_ids(ix, se, base, &past, 1, got) != ZQ_ERR_INVALID) { printf("FAIL: out-of-range id scored\n"); return 1; }
+    }
+
+    /* Rerank: exact scores against the originals, best first, at most the searcher's k. */
+    {
+        uint32_t rids[32 * 3]; float rsc[32 * 3];
+        if (zq_search_rerank(ix, se, base, nq, base, N, K + 1, rids, rsc) != ZQ_ERR_INVALID) { printf("FAIL: rerank k above searcher k\n"); return 1; }
+        if (zq_search_rerank(ix, se, base, nq, base, N - 1, 3, rids, rsc) != ZQ_ERR_INVALID) { printf("FAIL: short originals accepted\n"); return 1; }
+        if (zq_search_rerank(ix, se, base, nq, base, N, 3, rids, rsc) != ZQ_OK) { printf("FAIL rerank\n"); return 1; }
+        for (size_t i = 0; i < nq; i++) {
+            const float *q = base + i * DIM;
+            for (int j = 0; j < 3; j++) {
+                const float *x = base + (size_t)rids[i * 3 + j] * DIM;
+                double dot = 0; for (int t = 0; t < DIM; t++) dot += (double)q[t] * x[t];
+                if (fabs(dot - rsc[i * 3 + j]) > 1e-4) { printf("FAIL: rerank score is not exact\n"); return 1; }
+                if (j && rsc[i * 3 + j] > rsc[i * 3 + j - 1]) { printf("FAIL: rerank order\n"); return 1; }
+            }
+            if (rids[i * 3] != (uint32_t)i) { printf("FAIL: rerank lost the self match\n"); return 1; }
+        }
+    }
+
     /* Each corpus vector queried against itself should rank itself first. */
     int self_hits = 0;
     for (size_t i = 0; i < nq; i++) if (ids[i*K] == (uint32_t)i) self_hits++;

@@ -65,6 +65,8 @@ const Searcher = struct {
     owner: *const Index,
     batch: zq.flat.FlatIndex.BatchSearcher,
     parallel: ?zq.flat.FlatIndex.ParallelSearcher,
+    /// Single-query state for `zq_score_ids`.
+    scorer: zq.flat.FlatIndex.Searcher,
     k: usize,
     capacity: usize,
 };
@@ -265,12 +267,18 @@ export fn zq_searcher_create(
         allocator.destroy(s);
         return ZQ_ERR_ALLOC;
     };
+    s.scorer = zq.flat.FlatIndex.Searcher.init(allocator, ix.inner, 1) catch {
+        s.batch.deinit();
+        allocator.destroy(s);
+        return ZQ_ERR_ALLOC;
+    };
     s.owner = ix;
     s.k = k;
     s.parallel = null;
     s.capacity = batch;
     if (threads > 1) {
         s.parallel = zq.flat.FlatIndex.ParallelSearcher.init(allocator, ix.inner, threads, batch, k) catch {
+            s.scorer.deinit();
             s.batch.deinit();
             allocator.destroy(s);
             return ZQ_ERR_ALLOC;
@@ -284,6 +292,7 @@ export fn zq_searcher_create(
 export fn zq_searcher_free(searcher: ?*Searcher) void {
     const s = searcher orelse return;
     if (s.parallel) |*p| p.deinit();
+    s.scorer.deinit();
     s.batch.deinit();
     allocator.destroy(s);
 }
@@ -292,6 +301,41 @@ export fn zq_searcher_free(searcher: ?*Searcher) void {
 export fn zq_searcher_capacity(searcher: ?*const Searcher) usize {
     const s = searcher orelse return 0;
     return s.capacity;
+}
+
+/// Validate a search call and run it. Returns the searcher's results, `s.k` per query,
+/// of which the first `@min(s.k, count)` in each row are real.
+fn runSearch(ix: *Index, s: *Searcher, q: [*]const f32, nq: usize) error{ Invalid, Alloc }![]const zq.flat.Entry {
+    if (s.owner != ix) return error.Invalid;
+    if (nq > s.capacity) return error.Invalid;
+    const batch = rowsOf(q, nq, ix.inner.dim()) orelse return error.Invalid;
+    // A NaN query scores NaN against everything and the collector's order is then
+    // meaningless; refuse it rather than return confident garbage.
+    if (!zq.flat.allFinite(batch)) return error.Invalid;
+    return if (s.parallel) |*p|
+        ix.inner.searchBatchParallel(batch, p) catch return error.Alloc
+    else
+        ix.inner.searchBatch(batch, &s.batch);
+}
+
+fn statusOf(e: error{ Invalid, Alloc }) c_int {
+    return switch (e) {
+        error.Invalid => ZQ_ERR_INVALID,
+        error.Alloc => ZQ_ERR_ALLOC,
+    };
+}
+
+/// Write `k` results per row, padding past `found` with id UINT32_MAX and score -inf.
+fn writeRow(row: []const zq.flat.Entry, k: usize, ids: [*]u32, scores: [*]f32) void {
+    for (0..k) |j| {
+        if (j < row.len) {
+            ids[j] = row[j].id;
+            scores[j] = row[j].score;
+        } else {
+            ids[j] = std.math.maxInt(u32);
+            scores[j] = -std.math.inf(f32);
+        }
+    }
 }
 
 /// Writes `nq * k` ids and scores, query-major. Ids are indices in insertion order.
@@ -310,34 +354,76 @@ export fn zq_search(
     const q = queries orelse return ZQ_ERR_INVALID;
     const ids = out_ids orelse return ZQ_ERR_INVALID;
     const scores = out_scores orelse return ZQ_ERR_INVALID;
-    if (s.owner != ix) return ZQ_ERR_INVALID;
-    if (nq == 0) return ZQ_OK;
-    if (nq > s.capacity) return ZQ_ERR_INVALID;
+    if (nq == 0) return if (s.owner == ix) ZQ_OK else ZQ_ERR_INVALID;
 
+    const results = runSearch(ix, s, q, nq) catch |e| return statusOf(e);
     const k = s.k;
     const found = @min(k, ix.inner.count());
-    const batch = rowsOf(q, nq, ix.inner.dim()) orelse return ZQ_ERR_INVALID;
-    // A NaN query scores NaN against everything and the collector's order is then
-    // meaningless; refuse it rather than return confident garbage.
-    if (!zq.flat.allFinite(batch)) return ZQ_ERR_INVALID;
+    for (0..nq) |i| writeRow(results[i * k ..][0..found], k, ids + i * k, scores + i * k);
+    return ZQ_OK;
+}
 
-    const results = if (s.parallel) |*p|
-        ix.inner.searchBatchParallel(batch, p) catch return ZQ_ERR_ALLOC
-    else
-        ix.inner.searchBatch(batch, &s.batch);
+/// Search, then rescore the candidates exactly against the caller's originals.
+///
+/// The searcher's `k` is the number of candidates fetched; `k` here, at most that, is
+/// how many come back. `originals` holds `n_originals` row-major vectors indexed by id,
+/// and must cover every id in the index.
+export fn zq_search_rerank(
+    index: ?*Index,
+    searcher: ?*Searcher,
+    queries: ?[*]const f32,
+    nq: usize,
+    originals: ?[*]const f32,
+    n_originals: usize,
+    k: usize,
+    out_ids: ?[*]u32,
+    out_scores: ?[*]f32,
+) c_int {
+    const ix = index orelse return ZQ_ERR_INVALID;
+    const s = searcher orelse return ZQ_ERR_INVALID;
+    const q = queries orelse return ZQ_ERR_INVALID;
+    const orig = originals orelse return ZQ_ERR_INVALID;
+    const ids = out_ids orelse return ZQ_ERR_INVALID;
+    const scores = out_scores orelse return ZQ_ERR_INVALID;
+    if (k == 0 or k > s.k) return ZQ_ERR_INVALID;
+    const count = ix.inner.count();
+    if (n_originals < count) return ZQ_ERR_INVALID;
+    const d = ix.inner.dim();
+    const corpus = rowsOf(orig, n_originals, d) orelse return ZQ_ERR_INVALID;
+    if (nq == 0) return if (s.owner == ix) ZQ_OK else ZQ_ERR_INVALID;
 
+    const results = runSearch(ix, s, q, nq) catch |e| return statusOf(e);
+    const found = @min(s.k, count);
     for (0..nq) |i| {
-        const row = results[i * k ..];
-        for (0..k) |j| {
-            if (j < found) {
-                ids[i * k + j] = row[j].id;
-                scores[i * k + j] = row[j].score;
-            } else {
-                ids[i * k + j] = std.math.maxInt(u32);
-                scores[i * k + j] = -std.math.inf(f32);
-            }
-        }
+        // The searcher's result buffer is scratch until the next search, so reranking
+        // in place is safe.
+        const row: []zq.flat.Entry = @constCast(results[i * s.k ..][0..found]);
+        const best = zq.rerank.rerank(ix.inner.metric, q[i * d ..][0..d], corpus, d, row, k);
+        writeRow(best, k, ids + i * k, scores + i * k);
     }
+    return ZQ_OK;
+}
+
+/// Score specific stored vectors against one query, with the same estimate search
+/// reports: `scores[j]` for `ids[j]`. For ranking a candidate set chosen elsewhere.
+export fn zq_score_ids(
+    index: ?*Index,
+    searcher: ?*Searcher,
+    query: ?[*]const f32,
+    ids: ?[*]const u32,
+    n: usize,
+    out_scores: ?[*]f32,
+) c_int {
+    const ix = index orelse return ZQ_ERR_INVALID;
+    const s = searcher orelse return ZQ_ERR_INVALID;
+    const q = query orelse return ZQ_ERR_INVALID;
+    const id_ptr = ids orelse return ZQ_ERR_INVALID;
+    const scores = out_scores orelse return ZQ_ERR_INVALID;
+    if (s.owner != ix) return ZQ_ERR_INVALID;
+    if (n == 0) return ZQ_OK;
+    const row = q[0..ix.inner.dim()];
+    if (!zq.flat.allFinite(row)) return ZQ_ERR_INVALID;
+    ix.inner.scoreIds(row, id_ptr[0..n], scores[0..n], &s.scorer) catch return ZQ_ERR_INVALID;
     return ZQ_OK;
 }
 

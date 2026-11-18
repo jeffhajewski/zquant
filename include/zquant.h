@@ -129,6 +129,24 @@ zq_status zq_search(zq_index *index, zq_searcher *searcher,
                     const float *queries, size_t nq,
                     uint32_t *out_ids, float *out_scores);
 
+/* Search, then rescore each query's candidates exactly against the original vectors
+ * and keep the best k (at most the searcher's k, which is how many candidates are
+ * fetched: over-fetching 4-10x and reranking recovers near-exact top-k). `originals`
+ * holds n_originals row-major vectors of dim floats, row i being the vector added as
+ * id i; it must cover every id in the index. Writes nq * k ids and exact scores, padded
+ * as zq_search pads. Scores use the index's metric. */
+zq_status zq_search_rerank(zq_index *index, zq_searcher *searcher,
+                           const float *queries, size_t nq,
+                           const float *originals, size_t n_originals, size_t k,
+                           uint32_t *ids, float *scores);
+
+/* Score specific stored vectors against one query: scores[j] is the estimate search
+ * would report for ids[j]. For ranking a candidate set chosen elsewhere (a metadata
+ * filter, another index) without scanning the whole corpus. An id at or past
+ * zq_index_count gives ZQ_ERR_INVALID. */
+zq_status zq_score_ids(zq_index *index, zq_searcher *searcher, const float *query,
+                       const uint32_t *ids, size_t n, float *scores);
+
 /* ── Codec: encode and decode without an index ──────────────────────────────────
  *
  * The index answers "which stored vectors best match this query". A KV cache asks

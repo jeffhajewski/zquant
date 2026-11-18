@@ -25,6 +25,7 @@ pub const simd_sketch = @import("simd/sketch.zig");
 pub const topk = @import("index/topk.zig");
 pub const flat = @import("index/flat.zig");
 pub const persist = @import("index/persist.zig");
+pub const rerank = @import("index/rerank.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

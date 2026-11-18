@@ -1216,43 +1216,13 @@ pub const FlatIndex = struct {
     /// Top-k search. Results are written into `searcher`'s heap and returned as a
     /// slice into it, valid until the next search.
     pub fn search(self: *FlatIndex, query: []const f32, searcher: *Searcher) []Entry {
-        std.debug.assert(query.len == self.dim());
         std.debug.assert(searcher.heap.len > 0);
-
-        // One rotation and one sketch for the whole corpus — the point of staying in
-        // the rotated basis (docs/DESIGN.md §1.3).
-        if (self.storesSketch()) {
-            self.quantizer.prepareQuery(query, &searcher.query_state, &searcher.workspace);
-        } else {
-            self.quantizer.prepareQueryRotated(query, &searcher.query_state, &searcher.workspace);
-        }
-        // ⟨p, ỹ⟩ = Σ (p_j/scale_j)·c[code_j] − ⟨p, shift⟩; the second term is the
-        // same for every vector and cannot reorder them, but is included so scores
-        // are real inner-product estimates.
-        var shift_term: f32 = 0;
-        if (self.calibrated) {
-            var acc: f64 = 0;
-            for (searcher.query_state.rotated, self.shifts) |p, sh| acc += @as(f64, p) * sh;
-            shift_term = @floatCast(-acc);
-            for (searcher.query_state.rotated, self.scales) |*p, sc| p.* /= sc;
-        }
-        const use_simd = self.vectorized();
-        if (use_simd) {
-            searcher.scan_query.load(searcher.query_state.rotated);
-            if (self.storesSketch()) searcher.sketch_query.load(searcher.query_state.sketched);
-        }
-
-        const query_norm = if (self.metric == .cosine or self.metric == .l2)
-            euclideanNorm(query)
-        else
-            0;
-        const query_terms = queryTerms(self.metric, query_norm);
+        const prepared = self.prepareSingle(query, searcher);
+        const use_simd = prepared.use_simd;
 
         var collector = topk.TopK.init(searcher.heap);
         const stride = self.codeStride();
-        const sketch_len = self.sketchStride();
         const padded = self.quantizer.padded();
-        const centroids = self.quantizer.mse.codebook.centroids;
 
         // A single query cannot tile over queries, but it can still tile over stored
         // vectors: the one query chunk stays in a register and is reused across the
@@ -1297,54 +1267,126 @@ pub const FlatIndex = struct {
                     ),
                 }
             } else for (0..take) |u| {
-                const slot = self.codes.items[(v0 + u) * stride ..][0..stride];
-                block[u] = switch (self.residency) {
-                    .expanded => scan.scoreExpanded(
-                        @ptrCast(slot),
-                        searcher.scan_query,
-                        self.table.scale,
-                        padded,
-                    ),
-                    .compact => if (use_simd)
-                        scan.scoreInt8(self.layout, searcher.table, searcher.scan_query, slot, padded)
-                    else
-                        scan.scoreExact(self.layout, centroids, searcher.query_state.rotated, slot),
-                };
+                block[u] = self.mseTermAt(v0 + u, prepared, searcher);
             }
 
             for (0..take) |u| {
                 const i = v0 + u;
-                const scalars = self.scalars.items[i];
-                const sketch_slot = self.sketches.items[i * sketch_len ..][0..sketch_len];
-
-                const mse_term = block[u];
-
-                const norm: f32 = scalars.norm;
-                const gamma: f32 = scalars.gamma;
-
-                const sc = switch (self.correction) {
-                    .scalar => scalarScore(
-                        vectorTerms(self.metric, norm, gamma),
-                        query_terms,
-                        shift_term + mse_term,
-                    ),
-                    .qjl_sketch => blk: {
-                        const sketch_term = if (!self.use_sketch)
-                            0
-                        else if (use_simd)
-                            sketch_kernel.signDot(searcher.sketch_query, sketch_slot, padded)
-                        else
-                            sketch_kernel.signDotExact(searcher.query_state.sketched, sketch_slot);
-                        const estimate = norm * (mse_term + gamma * self.quantizer.sketch_scale * sketch_term);
-                        break :blk self.score(estimate, norm, query_norm);
-                    },
-                };
-
-                collector.offer(sc, @intCast(i));
+                collector.offer(self.finishScore(i, block[u], prepared, searcher), @intCast(i));
             }
         }
 
         return collector.drain();
+    }
+
+    /// Score the stored vectors `ids` against one query, writing `out[j]` for `ids[j]`.
+    ///
+    /// The scores are exactly the ones `search` reports for those vectors, so this is
+    /// the way to rank a candidate set from elsewhere — a metadata filter, another
+    /// index — with this index's estimates, without scanning the rest of the corpus.
+    pub fn scoreIds(
+        self: *FlatIndex,
+        query: []const f32,
+        ids: []const u32,
+        out: []f32,
+        searcher: *Searcher,
+    ) error{IdOutOfRange}!void {
+        std.debug.assert(ids.len == out.len);
+        for (ids) |id| if (id >= self.count()) return error.IdOutOfRange;
+        const prepared = self.prepareSingle(query, searcher);
+        for (ids, out) |id, *o| o.* = self.finishScore(id, self.mseTermAt(id, prepared, searcher), prepared, searcher);
+    }
+
+    /// Per-query state shared by `search` and `scoreIds`, beyond what `searcher` holds.
+    const Prepared = struct {
+        shift_term: f32,
+        use_simd: bool,
+        query_norm: f32,
+        query_terms: QueryTerms,
+    };
+
+    fn prepareSingle(self: *FlatIndex, query: []const f32, searcher: *Searcher) Prepared {
+        std.debug.assert(query.len == self.dim());
+
+        // One rotation and one sketch for the whole corpus — the point of staying in
+        // the rotated basis (docs/DESIGN.md §1.3).
+        if (self.storesSketch()) {
+            self.quantizer.prepareQuery(query, &searcher.query_state, &searcher.workspace);
+        } else {
+            self.quantizer.prepareQueryRotated(query, &searcher.query_state, &searcher.workspace);
+        }
+        // ⟨p, ỹ⟩ = Σ (p_j/scale_j)·c[code_j] − ⟨p, shift⟩; the second term is the
+        // same for every vector and cannot reorder them, but is included so scores
+        // are real inner-product estimates.
+        var shift_term: f32 = 0;
+        if (self.calibrated) {
+            var acc: f64 = 0;
+            for (searcher.query_state.rotated, self.shifts) |p, sh| acc += @as(f64, p) * sh;
+            shift_term = @floatCast(-acc);
+            for (searcher.query_state.rotated, self.scales) |*p, sc| p.* /= sc;
+        }
+        const use_simd = self.vectorized();
+        if (use_simd) {
+            searcher.scan_query.load(searcher.query_state.rotated);
+            if (self.storesSketch()) searcher.sketch_query.load(searcher.query_state.sketched);
+        }
+
+        const query_norm = if (self.metric == .cosine or self.metric == .l2)
+            euclideanNorm(query)
+        else
+            0;
+        return .{
+            .shift_term = shift_term,
+            .use_simd = use_simd,
+            .query_norm = query_norm,
+            .query_terms = queryTerms(self.metric, query_norm),
+        };
+    }
+
+    /// ⟨p, ỹ_i⟩ for one stored vector, by the per-vector kernel. The tiled kernels in
+    /// `search` compute the same integer dot products, so the results agree exactly.
+    inline fn mseTermAt(self: *const FlatIndex, i: usize, prepared: Prepared, searcher: *const Searcher) f32 {
+        const stride = self.codeStride();
+        const padded = self.quantizer.padded();
+        const slot = self.codes.items[i * stride ..][0..stride];
+        return switch (self.residency) {
+            .expanded => scan.scoreExpanded(
+                @ptrCast(slot),
+                searcher.scan_query,
+                self.table.scale,
+                padded,
+            ),
+            .compact => if (prepared.use_simd)
+                scan.scoreInt8(self.layout, searcher.table, searcher.scan_query, slot, padded)
+            else
+                scan.scoreExact(self.layout, self.quantizer.mse.codebook.centroids, searcher.query_state.rotated, slot),
+        };
+    }
+
+    /// The reported score of stored vector `i`, given its MSE term.
+    inline fn finishScore(self: *const FlatIndex, i: usize, mse_term: f32, prepared: Prepared, searcher: *const Searcher) f32 {
+        const scalars = self.scalars.items[i];
+        const norm: f32 = scalars.norm;
+        const gamma: f32 = scalars.gamma;
+        return switch (self.correction) {
+            .scalar => scalarScore(
+                vectorTerms(self.metric, norm, gamma),
+                prepared.query_terms,
+                prepared.shift_term + mse_term,
+            ),
+            .qjl_sketch => blk: {
+                const sketch_len = self.sketchStride();
+                const sketch_slot = self.sketches.items[i * sketch_len ..][0..sketch_len];
+                const sketch_term = if (!self.use_sketch)
+                    0
+                else if (prepared.use_simd)
+                    sketch_kernel.signDot(searcher.sketch_query, sketch_slot, self.quantizer.padded())
+                else
+                    sketch_kernel.signDotExact(searcher.query_state.sketched, sketch_slot);
+                const estimate = norm * (mse_term + gamma * self.quantizer.sketch_scale * sketch_term);
+                break :blk self.score(estimate, norm, prepared.query_norm);
+            },
+        };
     }
 
     /// Map an inner-product estimate onto the metric, always larger-is-better. The
@@ -2613,4 +2655,42 @@ test "parallel add refuses a non-finite batch whole" {
     batch[1999 * 32] = std.math.nan(f32);
     try testing.expectError(error.NonFiniteInput, index.addBatchParallel(batch, 4));
     try testing.expectEqual(@as(usize, 0), index.count());
+}
+
+test "scoreIds reports exactly the scores search does" {
+    var prng = std.Random.DefaultPrng.init(0x5C0E);
+    const random = prng.random();
+    const dim = 128;
+    const n = 300;
+    var data: [n * dim]f32 = undefined;
+    for (0..n) |i| randomUnit(data[i * dim ..][0..dim], random);
+
+    const Case = struct { params: Params, calibrate: bool };
+    for ([_]Case{
+        .{ .params = .{ .dim = dim, .bits = 5 }, .calibrate = false },
+        .{ .params = .{ .dim = dim, .bits = 4, .metric = .cosine }, .calibrate = true },
+        .{ .params = .{ .dim = dim, .bits = 4, .metric = .l2, .residency = .expanded }, .calibrate = false },
+        .{ .params = .{ .dim = dim, .bits = 3, .correction = .qjl_sketch }, .calibrate = false },
+        .{ .params = .{ .dim = dim, .bits = 4, .exact_scan = true }, .calibrate = false },
+    }) |case| {
+        var index = try FlatIndex.init(testing.allocator, case.params);
+        defer index.deinit();
+        if (case.calibrate) try index.calibrate(&data);
+        try index.addBatch(&data);
+        var searcher = try FlatIndex.Searcher.init(testing.allocator, index, 20);
+        defer searcher.deinit();
+
+        const q = data[17 * dim ..][0..dim];
+        var found: [20]Entry = undefined;
+        @memcpy(&found, index.search(q, &searcher));
+        var ids: [20]u32 = undefined;
+        for (&ids, found) |*id, e| id.* = e.id;
+        var scores: [20]f32 = undefined;
+        try index.scoreIds(q, &ids, &scores, &searcher);
+        for (found, scores) |e, got| try testing.expectEqual(e.score, got);
+
+        const bad = [_]u32{ 0, n };
+        var out: [2]f32 = undefined;
+        try testing.expectError(error.IdOutOfRange, index.scoreIds(q, &bad, &out, &searcher));
+    }
 }

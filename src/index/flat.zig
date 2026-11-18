@@ -357,9 +357,14 @@ pub const FlatIndex = struct {
     /// dominated by tail noise. Prefer several thousand rows, and more as bit-width
     /// rises since the anchor moves further out.
     ///
-    /// Must be called before any `add`.
+    /// Must be called before any `add`, and only with the `.scalar` correction.
     pub fn calibrate(self: *FlatIndex, sample: []const f32) !void {
         if (self.count() > 0) return error.IndexNotEmpty;
+        // The calibrated encoder writes no sketch and stores α where the sketch path
+        // expects a residual norm, and the sketch scoring has no shift term. Together
+        // that silently cost a third of recall (0.751 to 0.472, R@10 at d=128, bits=4),
+        // so the combination is refused rather than half-supported.
+        if (self.correction != .scalar) return error.CalibrationNeedsScalarCorrection;
         const d = self.dim();
         std.debug.assert(sample.len % d == 0);
         // One NaN poisons the column sort and with it a coordinate's fitted scale.
@@ -2317,4 +2322,12 @@ test "non-finite vectors are refused and leave the index unchanged" {
     var fresh = try FlatIndex.init(testing.allocator, .{ .dim = 32, .bits = 4 });
     defer fresh.deinit();
     try testing.expectError(error.NonFiniteInput, fresh.calibrate(&batch));
+}
+
+test "calibration is refused with the QJL sketch correction" {
+    var index = try FlatIndex.init(testing.allocator, .{ .dim = 32, .bits = 4, .correction = .qjl_sketch });
+    defer index.deinit();
+    const sample: [8 * 32]f32 = @splat(0.5);
+    try testing.expectError(error.CalibrationNeedsScalarCorrection, index.calibrate(&sample));
+    try testing.expect(!index.calibrated);
 }

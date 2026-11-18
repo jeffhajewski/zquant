@@ -139,6 +139,7 @@ export fn zq_index_calibrate(index: ?*Index, rows: ?[*]const f32, n: usize) c_in
         error.OutOfMemory => ZQ_ERR_ALLOC,
         error.IndexNotEmpty => ZQ_ERR_STATE,
         error.EmptySample, error.NonFiniteInput => ZQ_ERR_INVALID,
+        error.CalibrationNeedsScalarCorrection => ZQ_ERR_UNSUPPORTED,
     };
     return ZQ_OK;
 }

@@ -75,7 +75,9 @@ pub fn main() !void {
     const variants = [_]Variant{
         .{ .name = "shipped (int8)", .exact = false, .correction = .scalar, .sketch = true },
         .{ .name = "exact f32 scan", .exact = true, .correction = .scalar, .sketch = true },
-        .{ .name = "qjl sketch", .exact = false, .correction = .qjl_sketch, .sketch = true },
+        // Uncalibrated: calibration is only defined for the scalar correction, and this
+        // row used to calibrate anyway, which measured a broken combination.
+        .{ .name = "qjl sketch (no cal)", .exact = false, .correction = .qjl_sketch, .sketch = true },
     };
 
     // Fewer dimensions at higher precision, same bytes.
@@ -157,7 +159,7 @@ pub fn main() !void {
                 .correction = vr.correction,
             });
             defer index.deinit();
-            try index.calibrate(base.data);
+            if (vr.correction == .scalar) try index.calibrate(base.data);
             try index.addBatch(base.data);
 
             var searcher = try zq.flat.FlatIndex.Searcher.init(a, index, K);

@@ -50,6 +50,14 @@ const has_ssse3 = switch (builtin.cpu.arch) {
     else => false,
 };
 
+/// VEX encoding where available. `pshufb` in AVX code is a legacy-SSE instruction
+/// among VEX ones, which costs a state transition or a false dependency (depending on
+/// the core) whenever the upper ymm halves are dirty.
+const has_avx = switch (builtin.cpu.arch) {
+    .x86, .x86_64 => std.Target.x86.featureSetHas(builtin.cpu.features, .avx),
+    else => false,
+};
+
 /// Whether this target has a single-instruction path. False means correct but slow.
 pub const accelerated = has_neon or has_ssse3;
 
@@ -65,6 +73,14 @@ pub inline fn table16(table: Vec, idx: Idx) Vec {
             : [out] "=w" (-> Vec),
             : [t] "w" (table),
               [i] "w" (idx),
+        );
+    }
+
+    if (comptime has_avx) {
+        return asm ("vpshufb %[i], %[t], %[out]"
+            : [out] "=x" (-> Vec),
+            : [t] "x" (table),
+              [i] "x" (idx),
         );
     }
 

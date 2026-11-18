@@ -16,12 +16,17 @@ assigned in the order you add vectors, starting at 0.
 
 The package links against `libzquant`. There are two ways to point it there.
 
-**Installed** (the default build):
+**Installed** (the default build). Any prefix works, and so does an unpacked release
+tarball:
 
 ```sh
-zig build install --prefix /usr/local
+zig build lib --prefix /usr/local
 PKG_CONFIG_PATH=/usr/local/lib/pkgconfig go test ./...
 ```
+
+The pkg-config file finds the library relative to its own location and adds an rpath. So
+the prefix can be moved after installing, and binaries find the shared library at run time
+without `LD_LIBRARY_PATH` or `DYLD_LIBRARY_PATH`.
 
 **Repository-local**, for working on zquant itself:
 

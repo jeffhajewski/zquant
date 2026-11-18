@@ -306,10 +306,9 @@ test "non-power-of-two dimensions work end to end" {
         var q = try Mse.init(testing.allocator, .{ .dim = dim, .bits = 4, .seed = 3 });
         defer q.deinit();
         try testing.expect(q.padded >= dim);
-        try testing.expect(std.math.isPowerOfTwo(q.padded));
 
         const measured = try measureDistortion(q, 60, 0xD1);
-        // Padding costs bits, not accuracy: the reconstruction is still good.
+        // Padding or block mixing, the reconstruction is just as good.
         try testing.expect(measured < 0.02);
     }
 }

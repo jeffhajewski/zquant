@@ -21,6 +21,27 @@
 //! round does not — and dropping it keeps `apply` allocation-free and thread-safe,
 //! since permuting in place otherwise needs scratch. The mixing tests below are what
 //! justify the omission; if they ever fail, add rounds first.
+//!
+//! ## Dimensions that are not a power of two
+//!
+//! FWHT needs a power of two, and zero-padding up to one wastes up to half the codes:
+//! the rotation spreads the input over every padded coordinate, so all of them must be
+//! stored. The common embedding sizes are the worst case — 384, 768, 1536 and 3072 all
+//! pad by a third, so d=768 cost exactly what d=1024 did.
+//!
+//! Instead the working dimension is `m·B` for a block size `B = 2^a ≥ 128` and a small
+//! odd `m`, which covers those sizes exactly (768 = 3·256). Each round is then
+//!
+//!     x ← (Q_r ⊗ H_B) · D_r · x
+//!
+//! — signs, a Hadamard transform within each of the m blocks, and a Haar-random m×m
+//! orthogonal matrix Q_r mixing the blocks column by column. The Kronecker product is
+//! orthogonal, a single round already makes every output depend on every input, and
+//! three rounds with independent D and Q pass the same moment and mixing tests as the
+//! power-of-two path. Q costs m multiply-adds per coordinate on top of FWHT's log₂B,
+//! which is why m is capped: past 15 the next power of two wins anyway. The 128 floor on
+//! B keeps the working dimension a multiple of 128, which every vectorized scan kernel
+//! needs, and keeps blocks large enough that the Hadamard does most of the mixing.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -42,15 +63,57 @@ pub const default_rounds: u32 = 3;
 /// Smallest working dimension. See the note in `Rotation.init`.
 pub const min_padded_dim: u32 = 4;
 
+/// Smallest Hadamard block when the working dimension is not a power of two.
+pub const min_block: u32 = 128;
+
+/// Largest number of blocks mixed by the dense m×m stage.
+pub const max_blocks: u32 = 15;
+
+/// The working dimension for `dim`, and how it splits into Hadamard blocks.
+pub const Shape = struct {
+    /// Working dimension, `blocks * block`.
+    padded: u32,
+    /// Hadamard block size, a power of two.
+    block: u32,
+    /// Number of blocks, odd and at most `max_blocks`. 1 means the plain RHT.
+    blocks: u32,
+};
+
+/// The smallest working dimension of the form `m·2^a` (m odd, m ≤ `max_blocks`,
+/// 2^a ≥ `min_block`) that holds `dim`, preferring fewer blocks on a tie. Powers of
+/// two, and anything at or below `min_block`, keep the plain power-of-two padding, so
+/// their rotation — and every code ever produced for them — is unchanged.
+pub fn shapeFor(dim: u32) Shape {
+    std.debug.assert(dim >= 1 and dim <= 1 << 30);
+    const pow2 = @max(min_padded_dim, std.math.ceilPowerOfTwoAssert(u32, dim));
+    var best: Shape = .{ .padded = pow2, .block = pow2, .blocks = 1 };
+    if (dim <= min_block or std.math.isPowerOfTwo(dim)) return best;
+
+    var m: u32 = 3;
+    while (m <= max_blocks) : (m += 2) {
+        // Smallest power-of-two block, at least min_block, with m blocks covering dim.
+        const need = (dim + m - 1) / m;
+        const block = @max(min_block, std.math.ceilPowerOfTwoAssert(u32, need));
+        const padded = m * block;
+        if (padded < best.padded) best = .{ .padded = padded, .block = block, .blocks = m };
+    }
+    return best;
+}
+
 pub const Rotation = struct {
     /// Logical input dimension.
     dim: u32,
-    /// Working dimension: `dim` rounded up to a power of two.
+    /// Working dimension, `blocks * block` (see `shapeFor`).
     padded: u32,
+    /// Hadamard block size: `padded` itself unless the dimension is split.
+    block: u32,
+    /// Blocks mixed by the dense stage; 1 for the plain power-of-two transform.
+    blocks: u32,
     kind: Kind,
     rounds: u32,
 
-    /// `.hadamard`: rounds × padded sign flips. `.dense`: padded × padded, row-major.
+    /// `.hadamard`: rounds × padded sign flips, then (when `blocks > 1`) rounds ×
+    /// blocks × blocks mixing matrices, row-major. `.dense`: padded × padded.
     data: []f32,
     allocator: Allocator,
 
@@ -68,24 +131,37 @@ pub const Rotation = struct {
         // anyway. Zero-padding a 1- or 2-dimensional vector into R⁴ is well defined
         // and costs three wasted codes; crashing on an assert three modules down is
         // not. Useful guarantees still need d in the hundreds.
-        const padded = @max(min_padded_dim, std.math.ceilPowerOfTwoAssert(u32, dim));
+        const shape = shapeFor(dim);
+        const padded = shape.padded;
         const rounds = default_rounds;
+        const mixing = rounds * shape.blocks * shape.blocks;
 
         const data = switch (kind) {
-            .hadamard => try allocator.alloc(f32, rounds * padded),
+            .hadamard => try allocator.alloc(f32, rounds * padded + if (shape.blocks > 1) mixing else 0),
             .dense => try allocator.alloc(f32, @as(usize, padded) * padded),
         };
         errdefer allocator.free(data);
 
         var stream = rng.Philox.init(seed).stream(purpose);
         switch (kind) {
-            .hadamard => stream.fillSigns(data),
+            .hadamard => {
+                // Signs first, so a power-of-two rotation draws exactly what it always has.
+                stream.fillSigns(data[0 .. rounds * padded]);
+                if (shape.blocks > 1) {
+                    const m = shape.blocks;
+                    for (0..rounds) |r| {
+                        buildDense(data[rounds * padded + r * m * m ..][0 .. m * m], m, &stream);
+                    }
+                }
+            },
             .dense => buildDense(data, padded, &stream),
         }
 
         return .{
             .dim = dim,
             .padded = padded,
+            .block = shape.block,
+            .blocks = shape.blocks,
             .kind = kind,
             .rounds = rounds,
             .data = data,
@@ -113,7 +189,8 @@ pub const Rotation = struct {
                 @memset(dst[src.len..], 0);
                 for (0..self.rounds) |round| {
                     applySigns(dst, self.signsFor(round));
-                    walshHadamard(dst);
+                    self.blockHadamard(dst);
+                    if (self.blocks > 1) mixBlocks(dst, self.mixingFor(round), self.blocks, self.block, false);
                 }
             },
             .dense => {
@@ -144,7 +221,8 @@ pub const Rotation = struct {
                 var round = self.rounds;
                 while (round > 0) {
                     round -= 1;
-                    walshHadamard(dst);
+                    if (self.blocks > 1) mixBlocks(dst, self.mixingFor(round), self.blocks, self.block, true);
+                    self.blockHadamard(dst);
                     applySigns(dst, self.signsFor(round));
                 }
             },
@@ -163,7 +241,41 @@ pub const Rotation = struct {
     fn signsFor(self: Rotation, round: usize) []const f32 {
         return self.data[round * self.padded ..][0..self.padded];
     }
+
+    fn mixingFor(self: Rotation, round: usize) []const f32 {
+        const m = self.blocks;
+        return self.data[self.rounds * self.padded + round * m * m ..][0 .. m * m];
+    }
+
+    /// Normalized FWHT on each block. With one block this is the whole-vector transform.
+    fn blockHadamard(self: Rotation, x: []f32) void {
+        var b: usize = 0;
+        while (b < self.padded) : (b += self.block) walshHadamard(x[b..][0..self.block]);
+    }
 };
+
+/// `x ← (Q ⊗ I_B)·x`: block i becomes Σ_j Q[i][j]·block j, or Qᵀ with `transpose`.
+///
+/// Column chunks of `chunk` lanes are staged on the stack, so this is in place and
+/// allocation-free like the rest of `apply`.
+fn mixBlocks(x: []f32, q: []const f32, m: u32, block: u32, transpose: bool) void {
+    const chunk = 16;
+    const V = @Vector(chunk, f32);
+    std.debug.assert(m <= max_blocks and block % chunk == 0);
+    var in: [max_blocks]V = undefined;
+    var c: usize = 0;
+    while (c < block) : (c += chunk) {
+        for (0..m) |j| in[j] = x[j * block + c ..][0..chunk].*;
+        for (0..m) |i| {
+            var acc: V = @splat(0);
+            for (0..m) |j| {
+                const w = if (transpose) q[j * m + i] else q[i * m + j];
+                acc += @as(V, @splat(w)) * in[j];
+            }
+            x[i * block + c ..][0..chunk].* = acc;
+        }
+    }
+}
 
 /// Both transforms stage through `dst` and then work in place, so an aliasing
 /// `src` would be partially overwritten before it is read. Caught here rather than
@@ -481,12 +593,128 @@ test "hadamard and dense rotations agree statistically" {
     try testing.expectApproxEqRel(moments[1], moments[0], 0.05);
 }
 
-test "non-power-of-two dimensions are padded" {
-    for ([_][2]u32{ .{ 200, 256 }, .{ 768, 1024 }, .{ 1536, 2048 }, .{ 3, 4 } }) |case| {
+test "common embedding sizes are not padded at all" {
+    // The sizes that motivated block mixing: each used to pad by a third.
+    for ([_][3]u32{
+        .{ 384, 384, 3 },   .{ 768, 768, 3 },   .{ 1536, 1536, 3 },
+        .{ 3072, 3072, 3 }, .{ 640, 640, 5 },   .{ 1280, 1280, 5 },
+        .{ 2560, 2560, 5 }, .{ 784, 896, 7 },   .{ 300, 384, 3 },
+        .{ 200, 256, 1 },   .{ 1000, 1024, 1 }, .{ 3, 4, 1 },
+        .{ 100, 128, 1 },   .{ 960, 1024, 1 },
+    }) |case| {
         var rot = try Rotation.init(testing.allocator, case[0], .hadamard, 1, .rht_signs);
         defer rot.deinit();
         try testing.expectEqual(case[1], rot.padded);
+        try testing.expectEqual(case[2], rot.blocks);
+        // Every vectorized scan kernel needs a multiple of 128 above that size.
+        if (rot.padded > min_block) try testing.expectEqual(@as(u32, 0), rot.padded % min_block);
     }
+}
+
+test "block rotations are orthogonal: norms, inverses and inner products" {
+    var stream = rng.Philox.init(0xB10C).stream(.testing);
+    for ([_]u32{ 300, 384, 768, 784 }) |dim| {
+        for ([_]Kind{ .hadamard, .dense }) |kind| {
+            var rot = try Rotation.init(testing.allocator, dim, kind, 0x77, .rht_signs);
+            defer rot.deinit();
+            const a = try testing.allocator.alloc(f32, dim);
+            defer testing.allocator.free(a);
+            const b = try testing.allocator.alloc(f32, dim);
+            defer testing.allocator.free(b);
+            const ra = try testing.allocator.alloc(f32, rot.padded);
+            defer testing.allocator.free(ra);
+            const rb = try testing.allocator.alloc(f32, rot.padded);
+            defer testing.allocator.free(rb);
+            const back = try testing.allocator.alloc(f32, rot.padded);
+            defer testing.allocator.free(back);
+
+            randomUnitVector(a, &stream);
+            randomUnitVector(b, &stream);
+            rot.apply(a, ra);
+            rot.apply(b, rb);
+
+            var norm: f64 = 0;
+            for (ra) |v| norm += @as(f64, v) * v;
+            try testing.expectApproxEqAbs(@as(f64, 1), norm, 1e-5);
+
+            var before: f64 = 0;
+            var after: f64 = 0;
+            for (a, b) |x, y| before += @as(f64, x) * y;
+            for (ra, rb) |x, y| after += @as(f64, x) * y;
+            try testing.expectApproxEqAbs(before, after, 1e-5);
+
+            rot.applyInverse(ra, back);
+            for (a, back[0..dim]) |want, got| try testing.expectApproxEqAbs(want, got, 1e-5);
+            for (back[dim..]) |v| try testing.expectApproxEqAbs(@as(f32, 0), v, 1e-5);
+        }
+    }
+}
+
+test "block rotations reproduce the sphere-coordinate moments" {
+    // The same gate as the power-of-two path: coordinates of Πx must have variance 1/d
+    // and fourth moment 3/(d(d+2)), and match the dense Haar reference.
+    const dim: u32 = 384;
+    const trials = 1500;
+    var moments: [2]f64 = undefined;
+    for ([_]Kind{ .hadamard, .dense }, 0..) |kind, ki| {
+        var stream = rng.Philox.init(0x3333).stream(.testing);
+        var rot = try Rotation.init(testing.allocator, dim, kind, 0x4444, .rht_signs);
+        defer rot.deinit();
+        try testing.expectEqual(dim, rot.padded);
+
+        var src: [dim]f32 = undefined;
+        var dst: [dim]f32 = undefined;
+        var sum2: f64 = 0;
+        var sum4: f64 = 0;
+        for (0..trials) |_| {
+            randomUnitVector(&src, &stream);
+            rot.apply(&src, &dst);
+            for (dst) |v| {
+                const sq = @as(f64, v) * v;
+                sum2 += sq;
+                sum4 += sq * sq;
+            }
+        }
+        const count: f64 = @floatFromInt(trials * dim);
+        const d: f64 = @floatFromInt(dim);
+        try testing.expectApproxEqRel(1.0 / d, sum2 / count, 0.02);
+        try testing.expectApproxEqRel(3.0 / (d * (d + 2.0)), sum4 / count, 0.05);
+        moments[ki] = sum4 / count;
+    }
+    try testing.expectApproxEqRel(moments[1], moments[0], 0.05);
+}
+
+test "block rotations mix a basis vector, including across blocks" {
+    // The adversarial input for a Hadamard rotation, and for block mixing the worst
+    // case: all energy in one block. After the rotation every block must carry its
+    // share, and magnitudes must spread rather than sit at a few values.
+    const dim: u32 = 768;
+    var rot = try Rotation.init(testing.allocator, dim, .hadamard, 0xAAAA, .rht_signs);
+    defer rot.deinit();
+    try testing.expectEqual(@as(u32, 3), rot.blocks);
+
+    var src = [_]f32{0} ** dim;
+    src[5] = 1.0;
+    var dst: [dim]f32 = undefined;
+    rot.apply(&src, &dst);
+
+    for (0..rot.blocks) |b| {
+        var energy: f64 = 0;
+        for (dst[b * rot.block ..][0..rot.block]) |v| energy += @as(f64, v) * v;
+        // 1/3 each in expectation; a block left near-empty would mean no mixing.
+        try testing.expect(energy > 0.15 and energy < 0.55);
+    }
+
+    var mean: f64 = 0;
+    for (dst) |v| mean += @abs(v);
+    mean /= dim;
+    var variance: f64 = 0;
+    for (dst) |v| {
+        const dev = @abs(v) - mean;
+        variance += dev * dev;
+    }
+    variance /= dim;
+    try testing.expect(@sqrt(variance) / mean > 0.3);
 }
 
 test "tiny dimensions are floored to the minimum" {

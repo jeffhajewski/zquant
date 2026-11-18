@@ -49,7 +49,9 @@ const cases = [_]Case{
     .{ .dim = 64, .bits = 2, .seed = 0x0000, .mse_codes = 0x41FF3623EE0B2BF0, .prod_codes = 0x34459518EB6DD855, .prod_sketch = 0x9597AB384A5B9740 },
     .{ .dim = 128, .bits = 4, .seed = 0x5EED, .mse_codes = 0x633C2947182A864A, .prod_codes = 0xDE0792743302E32E, .prod_sketch = 0xDBB94FCF30B69464 },
     .{ .dim = 256, .bits = 4, .seed = 0xABCD, .mse_codes = 0x6B47F14A5C926498, .prod_codes = 0x6FC03CDB922E86E3, .prod_sketch = 0x457D58AA34212933 },
-    .{ .dim = 768, .bits = 3, .seed = 0x1234, .mse_codes = 0xDEE536CD5D4F2EA9, .prod_codes = 0xC33AB1BE40F09B4A, .prod_sketch = 0xD80300BD4BC98CE2 },
+    // Regenerated when 768 stopped being padded to 1024 (block-mixed rotation); every
+    // power-of-two case is untouched, which is the check that nothing else moved.
+    .{ .dim = 768, .bits = 3, .seed = 0x1234, .mse_codes = 0xFCD757224A3643A9, .prod_codes = 0xF2DEDC6EB6FF0618, .prod_sketch = 0x9EE15198D47F5528 },
     .{ .dim = 1024, .bits = 4, .seed = 0xFEED, .mse_codes = 0xA1F06845B9EA72EB, .prod_codes = 0x8F88C8B1FE0462C5, .prod_sketch = 0x81009704C69D33BA },
 };
 

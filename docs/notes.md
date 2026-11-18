@@ -1924,7 +1924,8 @@ bytes per vector beyond what `bytesPerVector` reported, so the README's 132 B wa
 164.7 B. Dropping it doubled single-thread add throughput (213k → 414k vec/s). Cosine and
 L2 had no batched fast path and ran at 3,340–3,588 QPS against 5,490 for inner product.
 All three metrics are now one affine map of the same MSE term, specialized at compile
-time so inner product pays nothing for the others. All three now run at about 5,300 QPS.
+time so inner product pays nothing for the others. Across two runs each, all three now
+measure 4,966–5,498 QPS, with inner product at the top of that range as before.
 
 **Non-power-of-two dimensions padded to the next power of two.** DESIGN §1.4 planned
 block transforms and they were never built, so d=768 cost exactly what d=1024 did. The

@@ -14,6 +14,9 @@
  * which costs a copy; pass a `Float32Array` to avoid it.
  */
 import { native, OK } from './native.js';
+import { type Vector, type Vectors, asRows } from './rows.js';
+
+export type { Vector, Vectors };
 
 export type Metric = 'ip' | 'inner_product' | 'cosine' | 'l2';
 
@@ -63,34 +66,6 @@ export interface SearchResult {
   /** `nq * k` scores, aligned with `ids`. */
   scores: Float32Array;
   k: number;
-}
-
-/** Rows of `dim` floats each: a flat Float32Array, or an array of arrays. */
-export type Vectors = Float32Array | number[][] | number[];
-
-function asRows(x: Vectors, dim: number, name: string): Float32Array {
-  if (x instanceof Float32Array) {
-    if (x.length % dim !== 0) {
-      throw new Error(`${name} length ${x.length} is not a multiple of dim ${dim}`);
-    }
-    return x;
-  }
-  if (Array.isArray(x) && x.length > 0 && Array.isArray(x[0])) {
-    const rows = x as number[][];
-    const out = new Float32Array(rows.length * dim);
-    rows.forEach((row, i) => {
-      if (row.length !== dim) {
-        throw new Error(`${name} row ${i} has dim ${row.length}, index expects ${dim}`);
-      }
-      out.set(row, i * dim);
-    });
-    return out;
-  }
-  const flat = x as number[];
-  if (flat.length % dim !== 0) {
-    throw new Error(`${name} length ${flat.length} is not a multiple of dim ${dim}`);
-  }
-  return Float32Array.from(flat);
 }
 
 /**

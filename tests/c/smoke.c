@@ -47,6 +47,21 @@ int main(void) {
     /* out-of-range bits must be refused */
     zq_config bad = cfg; bad.bits = 99; zq_index *tmp = NULL;
     if (zq_index_create(&bad, &tmp) != ZQ_ERR_INVALID) { printf("FAIL: bits=99 accepted\n"); return 1; }
+    /* bits=1 leaves the index's codebook no bits; it used to be accepted and crash later */
+    bad.bits = 1;
+    if (zq_index_create(&bad, &tmp) != ZQ_ERR_INVALID) { printf("FAIL: bits=1 accepted\n"); return 1; }
+    /* a dimension past the limit, including one that would overflow when rounded up */
+    bad = cfg; bad.dim = ZQ_MAX_DIM + 1;
+    if (zq_index_create(&bad, &tmp) != ZQ_ERR_INVALID) { printf("FAIL: dim above max accepted\n"); return 1; }
+    bad.dim = 0xFFFFFFFFu;
+    if (zq_index_create(&bad, &tmp) != ZQ_ERR_INVALID) { printf("FAIL: dim=2^32-1 accepted\n"); return 1; }
+    /* sizes whose product wraps must be refused, not turned into a small allocation */
+    zq_searcher *huge = NULL;
+    if (zq_searcher_create(ix, 32, (size_t)1 << 59, 1, &huge) != ZQ_ERR_INVALID) { printf("FAIL: wrapping k accepted\n"); return 1; }
+    if (zq_searcher_create(ix, 32, K, ZQ_MAX_THREADS + 1, &huge) != ZQ_ERR_INVALID) { printf("FAIL: thread count above max accepted\n"); return 1; }
+    if (zq_index_add(ix, base, ((size_t)-1) / 2) != ZQ_ERR_INVALID) { printf("FAIL: wrapping n accepted\n"); return 1; }
+    zq_codec_config cbad = { .dim = 0xFFFFFFFFu, .bits = 4, .seed = 1 }; zq_codec *ctmp = NULL;
+    if (zq_codec_create(&cbad, &ctmp) != ZQ_ERR_INVALID) { printf("FAIL: codec dim=2^32-1 accepted\n"); return 1; }
 
     zq_searcher *se = NULL;
     st = zq_searcher_create(ix, 32, K, 1, &se);

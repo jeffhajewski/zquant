@@ -25,13 +25,23 @@ pub const ZQ_ERR_INVALID: c_int = -2;
 pub const ZQ_ERR_STATE: c_int = -3;
 pub const ZQ_ERR_UNSUPPORTED: c_int = -4;
 
+/// Largest dimension the library accepts. Far above any embedding or head dimension in
+/// use, and low enough that `dim` rounded up for the rotation, and every per-vector
+/// size derived from it, fits comfortably in the integer types that hold them.
+pub const ZQ_MAX_DIM: u32 = 1 << 16;
+
+/// Largest worker count a searcher accepts. A guard against a garbage argument
+/// becoming a request for millions of threads, not a tuning limit.
+pub const ZQ_MAX_THREADS: usize = 1024;
+
 pub const ZQ_METRIC_INNER_PRODUCT: c_int = 0;
 pub const ZQ_METRIC_COSINE: c_int = 1;
 pub const ZQ_METRIC_L2: c_int = 2;
 
 pub const ZqConfig = extern struct {
     dim: u32,
-    /// Total bit budget per coordinate, 2..6. The scalar codebook uses `bits - 1`.
+    /// Total bit budget per coordinate, 2..6. The scalar codebook uses `bits - 1`, so
+    /// 1 would leave it no bits at all.
     bits: u8,
     metric: c_int,
     seed: u64,
@@ -49,6 +59,13 @@ const Searcher = struct {
     k: usize,
     capacity: usize,
 };
+
+/// `n` rows of `d` floats as a slice, or null if `n * d` does not fit in a `usize`.
+/// Without the check a huge `n` wraps and the slice silently covers the wrong length.
+fn rowsOf(ptr: [*]const f32, n: usize, d: usize) ?[]const f32 {
+    const len = std.math.mul(usize, n, d) catch return null;
+    return ptr[0..len];
+}
 
 fn metricFrom(m: c_int) ?zq.flat.Metric {
     return switch (m) {
@@ -77,7 +94,10 @@ export fn zq_status_string(status: c_int) [*:0]const u8 {
 export fn zq_index_create(config: ?*const ZqConfig, out: ?**Index) c_int {
     const cfg = config orelse return ZQ_ERR_INVALID;
     const slot = out orelse return ZQ_ERR_INVALID;
-    if (cfg.dim == 0 or cfg.bits < 1 or cfg.bits > 6) return ZQ_ERR_INVALID;
+    // bits = 1 used to be accepted here and then reached `8 % 0` in the packing layout:
+    // a crash at search time in ReleaseFast rather than an error at create.
+    if (cfg.dim == 0 or cfg.dim > ZQ_MAX_DIM) return ZQ_ERR_INVALID;
+    if (cfg.bits < 2 or cfg.bits > 6) return ZQ_ERR_INVALID;
     const metric = metricFrom(cfg.metric) orelse return ZQ_ERR_INVALID;
 
     const index = allocator.create(Index) catch return ZQ_ERR_ALLOC;
@@ -110,8 +130,8 @@ export fn zq_index_calibrate(index: ?*Index, rows: ?[*]const f32, n: usize) c_in
     const ix = index orelse return ZQ_ERR_INVALID;
     const data = rows orelse return ZQ_ERR_INVALID;
     if (n == 0) return ZQ_ERR_INVALID;
-    const d = ix.inner.dim();
-    ix.inner.calibrate(data[0 .. n * d]) catch |e| return switch (e) {
+    const sample = rowsOf(data, n, ix.inner.dim()) orelse return ZQ_ERR_INVALID;
+    ix.inner.calibrate(sample) catch |e| return switch (e) {
         error.OutOfMemory => ZQ_ERR_ALLOC,
         error.IndexNotEmpty => ZQ_ERR_STATE,
         error.EmptySample => ZQ_ERR_INVALID,
@@ -123,8 +143,8 @@ export fn zq_index_add(index: ?*Index, rows: ?[*]const f32, n: usize) c_int {
     const ix = index orelse return ZQ_ERR_INVALID;
     const data = rows orelse return ZQ_ERR_INVALID;
     if (n == 0) return ZQ_OK;
-    const d = ix.inner.dim();
-    ix.inner.addBatch(data[0 .. n * d]) catch return ZQ_ERR_ALLOC;
+    const vectors = rowsOf(data, n, ix.inner.dim()) orelse return ZQ_ERR_INVALID;
+    ix.inner.addBatch(vectors) catch return ZQ_ERR_ALLOC;
     return ZQ_OK;
 }
 
@@ -156,6 +176,12 @@ export fn zq_searcher_create(
     const slot = out orelse return ZQ_ERR_INVALID;
     if (batch == 0 or k == 0) return ZQ_ERR_INVALID;
     if (batch > zq.flat.max_batch) return ZQ_ERR_UNSUPPORTED;
+    if (threads > ZQ_MAX_THREADS) return ZQ_ERR_INVALID;
+    // The searcher holds `threads * batch * k` results. Unchecked, a large k wrapped
+    // that product to a small allocation and the search wrote past it.
+    const workers = @max(threads, 1);
+    const per_batch = std.math.mul(usize, batch, k) catch return ZQ_ERR_INVALID;
+    _ = std.math.mul(usize, per_batch, workers) catch return ZQ_ERR_INVALID;
 
     const s = allocator.create(Searcher) catch return ZQ_ERR_ALLOC;
     errdefer allocator.destroy(s);
@@ -211,14 +237,14 @@ export fn zq_search(
     if (nq == 0) return ZQ_OK;
     if (nq > s.capacity) return ZQ_ERR_INVALID;
 
-    const d = ix.inner.dim();
     const k = s.k;
     const found = @min(k, ix.inner.count());
+    const batch = rowsOf(q, nq, ix.inner.dim()) orelse return ZQ_ERR_INVALID;
 
     const results = if (s.parallel) |*p|
-        ix.inner.searchBatchParallel(q[0 .. nq * d], p) catch return ZQ_ERR_ALLOC
+        ix.inner.searchBatchParallel(batch, p) catch return ZQ_ERR_ALLOC
     else
-        ix.inner.searchBatch(q[0 .. nq * d], &s.batch);
+        ix.inner.searchBatch(batch, &s.batch);
 
     for (0..nq) |i| {
         const row = results[i * k ..];
@@ -255,8 +281,8 @@ const Codec = struct {
 
 pub const ZqCodecConfig = extern struct {
     dim: u32,
-    /// 2..6. Unlike the index this is the codebook width directly: there is no residual
-    /// sketch to reserve a bit for.
+    /// 1..6. Unlike the index this is the codebook width directly: there is no residual
+    /// sketch to reserve a bit for, so even one bit leaves a codebook.
     bits: u8,
     seed: u64,
 };
@@ -264,7 +290,8 @@ pub const ZqCodecConfig = extern struct {
 export fn zq_codec_create(config: ?*const ZqCodecConfig, out: ?**Codec) c_int {
     const cfg = config orelse return ZQ_ERR_INVALID;
     const slot = out orelse return ZQ_ERR_INVALID;
-    if (cfg.dim == 0 or cfg.bits < 1 or cfg.bits > 6) return ZQ_ERR_INVALID;
+    if (cfg.dim == 0 or cfg.dim > ZQ_MAX_DIM) return ZQ_ERR_INVALID;
+    if (cfg.bits < 1 or cfg.bits > 6) return ZQ_ERR_INVALID;
 
     const codec = allocator.create(Codec) catch return ZQ_ERR_ALLOC;
     codec.mse = zq.mse.Mse.init(allocator, .{
@@ -327,6 +354,8 @@ export fn zq_codec_encode(
 
     const d = c.mse.dim;
     const stride = c.layout.codeBytes();
+    _ = rowsOf(src, n, d) orelse return ZQ_ERR_INVALID;
+    _ = std.math.mul(usize, n, stride) catch return ZQ_ERR_INVALID;
     for (0..n) |i| {
         nrm[i] = c.mse.encode(src[i * d ..][0..d], c.scratch, &c.workspace);
         c.layout.pack(c.scratch, dst[i * stride ..][0..stride]);
@@ -350,6 +379,8 @@ export fn zq_codec_decode(
 
     const d = c.mse.dim;
     const stride = c.layout.codeBytes();
+    _ = std.math.mul(usize, n, d) catch return ZQ_ERR_INVALID;
+    _ = std.math.mul(usize, n, stride) catch return ZQ_ERR_INVALID;
     for (0..n) |i| {
         c.layout.unpack(src[i * stride ..][0..stride], c.scratch);
         c.mse.decode(c.scratch, nrm[i], dst[i * d ..][0..d], &c.workspace);

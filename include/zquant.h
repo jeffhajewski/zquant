@@ -24,6 +24,10 @@ typedef int zq_status;
 #define ZQ_ERR_STATE       -3
 #define ZQ_ERR_UNSUPPORTED -4
 
+/* Largest accepted dimension, and largest worker count for a searcher. */
+#define ZQ_MAX_DIM     65536
+#define ZQ_MAX_THREADS 1024
+
 #define ZQ_METRIC_INNER_PRODUCT 0
 #define ZQ_METRIC_COSINE        1
 #define ZQ_METRIC_L2            2
@@ -32,8 +36,10 @@ typedef struct zq_index zq_index;
 typedef struct zq_searcher zq_searcher;
 
 typedef struct {
+    /* 1..ZQ_MAX_DIM. */
     uint32_t dim;
-    /* Total bit budget per coordinate, 2..6. The scalar codebook uses bits-1. */
+    /* Total bit budget per coordinate, 2..6. The scalar codebook uses bits-1, so 1 is
+     * rejected rather than leaving it no bits. */
     uint8_t  bits;
     int      metric;
     uint64_t seed;
@@ -61,8 +67,9 @@ size_t   zq_index_count(const zq_index *index);
 size_t   zq_index_bytes_per_vector(const zq_index *index);
 uint32_t zq_index_dim(const zq_index *index);
 
-/* threads <= 1 searches on the calling thread; greater spreads queries across workers.
- * Capacity is batch, or threads*batch when threaded. */
+/* threads <= 1 searches on the calling thread; greater spreads queries across workers,
+ * up to ZQ_MAX_THREADS. Capacity is batch, or threads*batch when threaded. Sizes whose
+ * product overflows are rejected with ZQ_ERR_INVALID. */
 zq_status zq_searcher_create(zq_index *index, size_t batch, size_t k,
                              size_t threads, zq_searcher **out);
 void      zq_searcher_free(zq_searcher *searcher);
@@ -91,8 +98,9 @@ zq_status zq_search(zq_index *index, zq_searcher *searcher,
 typedef struct zq_codec zq_codec;
 
 typedef struct {
+    /* 1..ZQ_MAX_DIM. */
     uint32_t dim;
-    /* 2..6, the codebook width directly: unlike the index there is no residual
+    /* 1..6, the codebook width directly: unlike the index there is no residual
      * sketch reserving a bit. */
     uint8_t  bits;
     uint64_t seed;

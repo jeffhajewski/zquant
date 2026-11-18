@@ -124,6 +124,21 @@ def zquant_codec(bits, head_dim):
     return fn
 
 
+def centred(q):
+    """Subtract each channel's mean over the window before `q`, add it back after.
+
+    Keys in models with a k_proj bias (Qwen2.5) carry a large constant offset per channel.
+    A norm-scaled code spends its whole range on that offset; a per-channel zero point
+    (KIVI) removes it. This says whether the offset is what zquant is losing to. The mean
+    is taken over the window at once, like KIVI's groups here, and costs one f16 per
+    channel per sequence, which the bytes column leaves out.
+    """
+    def fn(x):
+        mu = f16(x.mean(dim=2, keepdim=True))
+        return q(x - mu) + mu
+    return fn
+
+
 def methods(head_dim):
     d = head_dim
 
@@ -151,6 +166,9 @@ def methods(head_dim):
     z4 = zquant_codec(4, d)
     m.append(("KIVI-4 g64 K + zquant b=4 V", chan_bytes(4, 64) + z4.code_bytes + 4,
               per_channel(4, 64), z4))
+    for bits in (4, 5):
+        z = zquant_codec(bits, d)
+        m.append((f"zquant b={bits} K centred", 2 * (z.code_bytes + 4), centred(z), z))
     wanted = os.environ.get("KV_PPL_METHODS")
     if wanted:
         keep = set(wanted.split(","))

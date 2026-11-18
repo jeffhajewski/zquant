@@ -176,6 +176,21 @@ export fn zq_index_add(index: ?*Index, rows: ?[*]const f32, n: usize) c_int {
     return ZQ_OK;
 }
 
+/// `zq_index_add` with encoding spread over up to `threads` threads. Same result,
+/// byte for byte; small batches run on the calling thread.
+export fn zq_index_add_parallel(index: ?*Index, rows: ?[*]const f32, n: usize, threads: usize) c_int {
+    const ix = index orelse return ZQ_ERR_INVALID;
+    const data = rows orelse return ZQ_ERR_INVALID;
+    if (threads > ZQ_MAX_THREADS) return ZQ_ERR_INVALID;
+    if (n == 0) return ZQ_OK;
+    const vectors = rowsOf(data, n, ix.inner.dim()) orelse return ZQ_ERR_INVALID;
+    ix.inner.addBatchParallel(vectors, @max(threads, 1)) catch |e| return switch (e) {
+        error.OutOfMemory => ZQ_ERR_ALLOC,
+        error.NonFiniteInput => ZQ_ERR_INVALID,
+    };
+    return ZQ_OK;
+}
+
 export fn zq_index_count(index: ?*const Index) usize {
     const ix = index orelse return 0;
     return ix.inner.count();

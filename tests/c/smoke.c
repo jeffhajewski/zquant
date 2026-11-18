@@ -108,6 +108,25 @@ int main(void) {
         free(q);
     }
 
+    /* A parallel add must give the same index: same results, to the bit. */
+    {
+        zq_index *par = NULL; zq_searcher *pse = NULL;
+        if (zq_index_create(&cfg, &par) != ZQ_OK) { printf("FAIL create par\n"); return 1; }
+        if (zq_index_calibrate(par, base, N) != ZQ_OK) { printf("FAIL calibrate par\n"); return 1; }
+        if (zq_index_add_parallel(par, base, N, ZQ_MAX_THREADS + 1) != ZQ_ERR_INVALID) { printf("FAIL: thread count above max accepted\n"); return 1; }
+        if (zq_index_add_parallel(par, base, N, 4) != ZQ_OK) { printf("FAIL add_parallel\n"); return 1; }
+        if (zq_index_count(par) != zq_index_count(ix)) { printf("FAIL: parallel count\n"); return 1; }
+        if (zq_searcher_create(par, 32, K, 1, &pse) != ZQ_OK) { printf("FAIL searcher par\n"); return 1; }
+        uint32_t *pids = malloc(sizeof(uint32_t) * nq * K);
+        float *pscores = malloc(sizeof(float) * nq * K);
+        if (zq_search(par, pse, base, nq, pids, pscores) != ZQ_OK) { printf("FAIL search par\n"); return 1; }
+        if (memcmp(pids, ids, sizeof(uint32_t) * nq * K) || memcmp(pscores, scores, sizeof(float) * nq * K)) {
+            printf("FAIL: parallel add changed search results\n"); return 1;
+        }
+        free(pids); free(pscores);
+        zq_searcher_free(pse); zq_index_free(par);
+    }
+
     /* Each corpus vector queried against itself should rank itself first. */
     int self_hits = 0;
     for (size_t i = 0; i < nq; i++) if (ids[i*K] == (uint32_t)i) self_hits++;

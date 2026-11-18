@@ -83,6 +83,13 @@ zq_status zq_index_calibrate(zq_index *index, const float *rows, size_t n);
  * calibration samples and codec input are checked the same way. */
 zq_status zq_index_add(zq_index *index, const float *rows, size_t n);
 
+/* zq_index_add, encoding on up to `threads` threads (0 or 1: the calling thread;
+ * at most ZQ_MAX_THREADS). The index ends up byte-for-byte the same as after
+ * zq_index_add. Below a few hundred vectors per thread it runs on the calling thread,
+ * since starting a thread costs more than that much encoding. Like every call that
+ * modifies an index, it must not overlap any other call on the same index. */
+zq_status zq_index_add_parallel(zq_index *index, const float *rows, size_t n, size_t threads);
+
 size_t   zq_index_count(const zq_index *index);
 size_t   zq_index_bytes_per_vector(const zq_index *index);
 uint32_t zq_index_dim(const zq_index *index);

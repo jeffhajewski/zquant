@@ -447,27 +447,41 @@ pub const FlatIndex = struct {
         // collector breaks its ordering for every query, not just for this vector.
         if (!allFinite(vector)) return error.NonFiniteInput;
 
+        // Reserved first, so nothing after this point can fail half-way through.
+        try self.reserve(1);
+        const id = self.count();
+        self.growAssumeCapacity(1);
+        self.encodeAt(id, vector, self.encode_scratch, &self.workspace);
+        return @intCast(id);
+    }
+
+    /// Grow storage by `n` zeroed vectors. Capacity must already be reserved.
+    fn growAssumeCapacity(self: *FlatIndex, n: usize) void {
+        @memset(self.codes.addManyAsSliceAssumeCapacity(n * self.codeStride()), 0);
+        @memset(self.sketches.addManyAsSliceAssumeCapacity(n * self.sketchStride()), 0);
+        _ = self.scalars.addManyAsSliceAssumeCapacity(n);
+    }
+
+    /// Encode `vector` into the already-allocated slot `id`.
+    ///
+    /// Reads only state that is fixed once vectors are being added (quantizer,
+    /// calibration, layout) and writes only slot `id`, `scratch` and `ws`. So threads
+    /// with their own scratch and workspace can fill disjoint slots concurrently, and
+    /// a vector's bytes do not depend on which thread encoded it.
+    fn encodeAt(self: *const FlatIndex, id: usize, vector: []const f32, scratch: []u8, ws: *prod_mod.Workspace) void {
         const stride = self.codeStride();
         const sketch_len = self.sketchStride();
+        const codes_slot = self.codes.items[id * stride ..][0..stride];
+        const sketch_slot = self.sketches.items[id * sketch_len ..][0..sketch_len];
 
         // Encode into scratch, then pack. The quantizer emits one byte per
         // coordinate; storage wants them bit-packed.
-        const scratch = self.encode_scratch;
-
-        try self.codes.appendNTimes(self.allocator, 0, stride);
-        errdefer self.codes.shrinkRetainingCapacity(self.codes.items.len - stride);
-        try self.sketches.appendNTimes(self.allocator, 0, sketch_len);
-        errdefer self.sketches.shrinkRetainingCapacity(self.sketches.items.len - sketch_len);
-
-        const codes_slot = self.codes.items[self.codes.items.len - stride ..];
-        const sketch_slot = self.sketches.items[self.sketches.items.len - sketch_len ..];
-
         var scalars = if (self.calibrated)
-            self.encodeCalibrated(vector, scratch)
+            self.encodeCalibrated(vector, scratch, ws)
         else if (self.storesSketch())
-            self.quantizer.encode(vector, scratch, sketch_slot, &self.workspace)
+            self.quantizer.encode(vector, scratch, sketch_slot, ws)
         else
-            self.quantizer.encodeCodes(vector, scratch, &self.workspace);
+            self.quantizer.encodeCodes(vector, scratch, ws);
 
         switch (self.residency) {
             .compact => self.layout.pack(scratch, codes_slot),
@@ -500,16 +514,14 @@ pub const FlatIndex = struct {
             scalars.gamma = if (recon_sq > 0) @floatCast(dot / recon_sq) else 1.0;
         }
 
-        try self.scalars.append(self.allocator, StoredScalars.from(scalars));
-        return @intCast(self.scalars.items.len - 1);
+        self.scalars.items[id] = StoredScalars.from(scalars);
     }
 
     /// Rotate, rescale by the fitted per-coordinate scales, and encode.
     ///
     /// `gamma` comes back as the residual norm in the rotated basis, matching what
     /// `Prod.encode` returns, so the α computation downstream is unchanged.
-    fn encodeCalibrated(self: *FlatIndex, vector: []const f32, codes: []u8) prod_mod.Scalars {
-        const ws = &self.workspace;
+    fn encodeCalibrated(self: *const FlatIndex, vector: []const f32, codes: []u8, ws: *prod_mod.Workspace) prod_mod.Scalars {
         const norm = self.quantizer.mse.encodeRotated(vector, ws.rotated, ws.staging);
 
         // z = (y + shift) · scale, quantized against the shared codebook.
@@ -544,7 +556,85 @@ pub const FlatIndex = struct {
         // before it added: a batch either goes in whole or not at all.
         if (!allFinite(vectors)) return error.NonFiniteInput;
         try self.reserve(n);
-        for (0..n) |i| _ = try self.add(vectors[i * d ..][0..d]);
+        const first = self.count();
+        self.growAssumeCapacity(n);
+        for (0..n) |i| self.encodeAt(first + i, vectors[i * d ..][0..d], self.encode_scratch, &self.workspace);
+    }
+
+    /// Below this many vectors per thread, spawning costs more than it saves: a thread
+    /// takes ~30 µs to start and a vector a few µs to encode.
+    const min_rows_per_thread = 256;
+
+    /// `addBatch` on up to `threads` threads.
+    ///
+    /// The result is byte-for-byte what `addBatch` produces — same ids, codes and
+    /// scalars — because each vector encodes independently into its own slot, so how
+    /// the batch is split cannot show. Like `addBatch`, the batch goes in whole or
+    /// not at all; a thread that fails to start has its share encoded on this one.
+    pub fn addBatchParallel(self: *FlatIndex, vectors: []const f32, threads: usize) !void {
+        const d = self.dim();
+        std.debug.assert(vectors.len % d == 0);
+        const n = vectors.len / d;
+        const workers = @max(1, @min(threads, n / min_rows_per_thread));
+        if (workers <= 1) return self.addBatch(vectors);
+        if (!allFinite(vectors)) return error.NonFiniteInput;
+
+        // Every allocation before the index changes, so a failure leaves it as it was.
+        // Worker 0 is this thread and uses the index's own scratch and workspace.
+        const extra = workers - 1;
+        const scratch = try self.allocator.alloc(u8, extra * self.encode_scratch.len);
+        defer self.allocator.free(scratch);
+        const spaces = try self.allocator.alloc(prod_mod.Workspace, extra);
+        defer self.allocator.free(spaces);
+        var made: usize = 0;
+        defer for (spaces[0..made]) |*ws| ws.deinit();
+        while (made < extra) : (made += 1) spaces[made] = try prod_mod.Workspace.init(self.allocator, self.quantizer);
+        const handles = try self.allocator.alloc(?std.Thread, extra);
+        defer self.allocator.free(handles);
+        try self.reserve(n);
+
+        const first = self.count();
+        self.growAssumeCapacity(n);
+
+        const Chunk = struct {
+            index: *const FlatIndex,
+            vectors: []const f32,
+            first: usize,
+            scratch: []u8,
+            ws: *prod_mod.Workspace,
+
+            fn run(c: @This()) void {
+                const dd = c.index.dim();
+                const rows = c.vectors.len / dd;
+                for (0..rows) |i| c.index.encodeAt(c.first + i, c.vectors[i * dd ..][0..dd], c.scratch, c.ws);
+            }
+        };
+        const base = n / workers;
+        const rem = n % workers;
+        var start: usize = 0;
+        var own: Chunk = undefined;
+        for (0..workers) |w| {
+            const take = base + @intFromBool(w < rem);
+            const chunk = Chunk{
+                .index = self,
+                .vectors = vectors[start * d ..][0 .. take * d],
+                .first = first + start,
+                .scratch = if (w == 0) self.encode_scratch else scratch[(w - 1) * self.encode_scratch.len ..][0..self.encode_scratch.len],
+                .ws = if (w == 0) &self.workspace else &spaces[w - 1],
+            };
+            start += take;
+            if (w == 0) {
+                // This thread's share runs once the others have started.
+                own = chunk;
+                continue;
+            }
+            handles[w - 1] = std.Thread.spawn(.{}, Chunk.run, .{chunk}) catch blk: {
+                chunk.run();
+                break :blk null;
+            };
+        }
+        own.run();
+        for (handles) |h| if (h) |t| t.join();
     }
 
     /// Per-query state. Held by the caller so repeated searches allocate nothing.
@@ -2465,4 +2555,57 @@ test "resident storage is what bytesPerVector reports" {
             try testing.expectEqual(correction == .qjl_sketch, index.sketches.items.len > 0);
         }
     }
+}
+
+test "parallel add produces exactly the bytes of a serial add" {
+    // Each configuration that encodes differently: scalar and sketch corrections,
+    // calibrated codes, expanded residency, and a row count no thread count divides.
+    var prng = std.Random.DefaultPrng.init(0x9A2A);
+    const random = prng.random();
+    const dim = 96;
+    const n = 1500;
+    const data = try testing.allocator.alloc(f32, n * dim);
+    defer testing.allocator.free(data);
+    for (0..n) |i| randomUnit(data[i * dim ..][0..dim], random);
+
+    const Case = struct { correction: Correction, residency: Residency, calibrate: bool };
+    for ([_]Case{
+        .{ .correction = .scalar, .residency = .compact, .calibrate = false },
+        .{ .correction = .scalar, .residency = .compact, .calibrate = true },
+        .{ .correction = .scalar, .residency = .expanded, .calibrate = false },
+        .{ .correction = .qjl_sketch, .residency = .compact, .calibrate = false },
+    }) |case| {
+        for ([_]usize{ 2, 3, 7, 64 }) |threads| {
+            var serial = try FlatIndex.init(testing.allocator, .{ .dim = dim, .bits = 4, .correction = case.correction, .residency = case.residency });
+            defer serial.deinit();
+            var parallel = try FlatIndex.init(testing.allocator, .{ .dim = dim, .bits = 4, .correction = case.correction, .residency = case.residency });
+            defer parallel.deinit();
+            if (case.calibrate) {
+                try serial.calibrate(data[0 .. 200 * dim]);
+                try parallel.calibrate(data[0 .. 200 * dim]);
+            }
+
+            // Two batches, so the second starts at a non-zero id.
+            try serial.addBatch(data[0 .. 100 * dim]);
+            try serial.addBatch(data[100 * dim ..]);
+            try parallel.addBatchParallel(data[0 .. 100 * dim], threads);
+            try parallel.addBatchParallel(data[100 * dim ..], threads);
+
+            try testing.expectEqual(serial.count(), parallel.count());
+            try testing.expectEqualSlices(u8, serial.codes.items, parallel.codes.items);
+            try testing.expectEqualSlices(u8, serial.sketches.items, parallel.sketches.items);
+            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(serial.scalars.items), std.mem.sliceAsBytes(parallel.scalars.items));
+        }
+    }
+}
+
+test "parallel add refuses a non-finite batch whole" {
+    var index = try FlatIndex.init(testing.allocator, .{ .dim = 32, .bits = 4 });
+    defer index.deinit();
+    const batch = try testing.allocator.alloc(f32, 2000 * 32);
+    defer testing.allocator.free(batch);
+    @memset(batch, 0.25);
+    batch[1999 * 32] = std.math.nan(f32);
+    try testing.expectError(error.NonFiniteInput, index.addBatchParallel(batch, 4));
+    try testing.expectEqual(@as(usize, 0), index.count());
 }

@@ -146,7 +146,14 @@ const arm = struct {
         switch (builtin.os.tag) {
             .linux => {
                 // AT_HWCAP = 16, HWCAP_ASIMDDP = 1 << 20.
-                return std.os.linux.getauxval(16) & (1 << 20) != 0;
+                //
+                // libc's getauxval, not std.os.linux's. Zig's reads a copy of the auxiliary
+                // vector that only Zig's own `_start` fills in. In a library loaded by a C,
+                // Python, Node or Go program that code never runs, so it returned 0 and
+                // every arm64 Linux CPU was refused. The Zig tests could not see it, since
+                // they run under Zig's `_start`; the C smoke test on an arm64 runner did.
+                const hwcap = if (builtin.link_libc) std.c.getauxval(16) else std.os.linux.getauxval(16);
+                return hwcap & (1 << 20) != 0;
             },
             // Every Apple arm64 CPU has had dot product since the A11; the macOS
             // baseline model already assumes it.

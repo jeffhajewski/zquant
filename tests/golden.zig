@@ -138,3 +138,117 @@ test "packing is stable too" {
     }
     try testing.expectEqual(@as(u64, 0x03317D8F36AA7D8F), hash(stored));
 }
+
+// -- cross-language conformance fixture -----------------------------------------
+//
+// tests/golden/conformance.json is what the Python, TypeScript and Go suites replay
+// through the C ABI. Checking it here, against the library directly, means a binding
+// that fails it has a binding bug: the fixture itself is known good on this commit.
+
+const fixture_json = @embedFile("golden/conformance.json");
+
+const IndexCase = struct {
+    dim: u32,
+    bits: u6,
+    metric: []const u8,
+    seed: []const u8,
+    compact: bool,
+    calibrate: bool,
+    rows: usize,
+    salt: u64,
+    sha256: []const u8,
+};
+
+const CodecCase = struct {
+    dim: u32,
+    bits: u6,
+    seed: []const u8,
+    rows: usize,
+    salt: u64,
+    sha256: []const u8,
+};
+
+const Fixture = struct {
+    encoding_version: u32,
+    index: []const IndexCase,
+    codec: []const CodecCase,
+};
+
+/// The fixture's input formula, exactly as each binding implements it.
+fn fixtureInput(allocator: std.mem.Allocator, rows: usize, dim: usize, salt: u64) ![]f32 {
+    const out = try allocator.alloc(f32, rows * dim);
+    for (0..rows) |r| for (0..dim) |j| {
+        const k: i64 = @intCast((r * 7919 + j * 104729 + salt) % 2001);
+        out[r * dim + j] = @as(f32, @floatFromInt(k - 1000)) / 1024.0;
+    };
+    return out;
+}
+
+fn hexDigest(data: []const []const u8) [64]u8 {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    for (data) |d| h.update(d);
+    var digest: [32]u8 = undefined;
+    h.final(&digest);
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+test "conformance fixture: the library reproduces every hash the bindings replay" {
+    const allocator = testing.allocator;
+    const parsed = try std.json.parseFromSlice(Fixture, allocator, fixture_json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const fixture = parsed.value;
+    try testing.expectEqual(zq.persist.encoding_version, fixture.encoding_version);
+
+    var mismatches: usize = 0;
+    for (fixture.index, 0..) |c, ci| {
+        const input = try fixtureInput(allocator, c.rows, c.dim, c.salt);
+        defer allocator.free(input);
+        // What zq_index_create builds from the corresponding zq_config.
+        var index = try zq.flat.FlatIndex.init(allocator, .{
+            .dim = c.dim,
+            .bits = c.bits,
+            .metric = std.meta.stringToEnum(zq.flat.Metric, c.metric) orelse return error.BadFixture,
+            .seed = try std.fmt.parseInt(u64, c.seed, 0),
+            .residency = if (c.compact) .compact else .expanded,
+        });
+        defer index.deinit();
+        if (c.calibrate) try index.calibrate(input);
+        try index.addBatch(input);
+        const buf = try allocator.alloc(u8, zq.persist.serializedSize(&index));
+        defer allocator.free(buf);
+        _ = try zq.persist.write(&index, buf);
+        const got = hexDigest(&.{buf});
+        if (!std.mem.eql(u8, &got, c.sha256)) {
+            std.debug.print("index case {d}: sha256 {s}, fixture says \"{s}\"\n", .{ ci, got, c.sha256 });
+            mismatches += 1;
+        }
+    }
+
+    for (fixture.codec, 0..) |c, ci| {
+        const input = try fixtureInput(allocator, c.rows, c.dim, c.salt);
+        defer allocator.free(input);
+        // What zq_codec_encode does.
+        var mse = try zq.mse.Mse.init(allocator, .{ .dim = c.dim, .bits = c.bits, .seed = try std.fmt.parseInt(u64, c.seed, 0) });
+        defer mse.deinit();
+        var ws = try zq.mse.Workspace.init(allocator, mse);
+        defer ws.deinit();
+        const layout = zq.packing.Layout.init(mse.padded, c.bits);
+        const scratch = try allocator.alloc(u8, mse.codeLen());
+        defer allocator.free(scratch);
+        const codes = try allocator.alloc(u8, c.rows * layout.codeBytes());
+        defer allocator.free(codes);
+        const norms = try allocator.alloc(u8, c.rows * 4);
+        defer allocator.free(norms);
+        for (0..c.rows) |r| {
+            const norm = mse.encode(input[r * c.dim ..][0..c.dim], scratch, &ws);
+            layout.pack(scratch, codes[r * layout.codeBytes() ..][0..layout.codeBytes()]);
+            std.mem.writeInt(u32, norms[r * 4 ..][0..4], @bitCast(norm), .little);
+        }
+        const got = hexDigest(&.{ codes, norms });
+        if (!std.mem.eql(u8, &got, c.sha256)) {
+            std.debug.print("codec case {d}: sha256 {s}, fixture says \"{s}\"\n", .{ ci, got, c.sha256 });
+            mismatches += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), mismatches);
+}

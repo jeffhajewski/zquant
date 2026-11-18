@@ -1,0 +1,7 @@
+# Native libraries copied in by scripts/build_wheel.sh, and build output.
+zquant/*.so
+zquant/*.dylib
+zquant/*.dll
+build/
+dist/
+*.egg-info/

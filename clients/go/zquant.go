@@ -6,6 +6,11 @@
 //	res, err := index.Search(queries, 10, 8)  // k=10, 8 threads
 //
 // Vectors are float32, row-major, one per row.
+//
+// Beyond that: SearchRerank and ScoreIDs for exact reranking and scoring chosen ids,
+// AddParallel for multi-threaded encoding, Save, Load and MarshalBinary for
+// persistence, and Codec for encoding and decoding vectors without an index. Every
+// error is a *Error that errors.Is matches against one of the Err sentinels.
 package zquant
 
 /*

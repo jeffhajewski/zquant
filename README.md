@@ -246,24 +246,43 @@ footprint is larger (270 B against our 132 B) because they dequantize to int8 in
 
 **Against FAISS PQ, the two systems win at opposite ends.** PQ has better recall per byte at
 low storage — decisively on SIFT (0.511 against 0.356 at 16–20 B, a 15-point gap) and modestly
-on nytimes (0.563 against 0.532 at 32–36 B). Its learned sub-vector codebooks represent
-correlations that a per-coordinate scalar quantizer cannot express at ~1 bit per dimension;
-that is structural and is [documented rather than treated as open](docs/comparison.md).
-zquant wins the high-recall end on both corpora, and is **3–6× faster** throughout.
+on nytimes (0.563 against 0.532 at 32–36 B). zquant wins the high-recall end on both
+corpora, and is **3–6× faster** throughout. This gap was long put down to PQ's learned
+codebooks. An experiment since suggests much of it is in how zquant assembles a score rather
+than in its codes: on SIFT, about two thirds of it
+([docs/notes.md](docs/notes.md), "Partitioning and the low-bit gap").
 
-**What we would not claim.** These are two corpora at d=128 and d=256, on one machine. The
-sub-25 B band belongs to PQ. Parallel throughput drifts with thermal state by up to 25% across
-consecutive runs, so treat the QPS column as approximate; single-thread figures are stable to
-about 5%.
+**What we would not claim.** These are two corpora at d=128 and d=256, on one machine. At
+those dimensions the sub-25 B band belongs to PQ. Parallel throughput drifts with thermal
+state by up to 25% across consecutive runs, so treat the QPS column as approximate;
+single-thread figures are stable to about 5%.
+
+### Real embeddings at d=768 and 1536
+
+Here PQ is no longer the system to beat. On one thread, against FAISS's plain `IndexPQ` and
+`IndexRaBitQ` (`bench/py/highdim.py`; turbovec was not rerun):
+
+| corpus | bits/dim | zquant +cal | FAISS PQ | FAISS RaBitQ | zquant QPS | RaBitQ QPS |
+|---|---|---|---|---|---|---|
+| Cohere, 100k × 768 | ~1 | 0.711 | 0.582 | **0.738** | 1,694 | 495 |
+| | ~2 | 0.847 | 0.753 | **0.861** | 1,722 | 432 |
+| | ~4 | **0.954** | 0.917 | 0.952 | 1,910 | 408 |
+| OpenAI ada-002, 50k × 1536 | ~1 | 0.769 | 0.669 | **0.786** | 1,837 | 805 |
+| | ~2 | 0.871 | 0.828 | **0.890** | 1,933 | 495 |
+| | ~4 | 0.960 | 0.944 | **0.962** | 2,070 | 511 |
+
+PQ trails at every budget, by 10–13 points at 1 bit per dimension. RaBitQ leads by 1.4–2.7
+points at 1–2 bits, using 4–16 B more per vector, and zquant searches 2.3–4.7× faster.
+[docs/comparison.md](docs/comparison.md) has the full table.
 
 ### Larger corpora and higher dimensions
 
 zquant alone, without the other systems (they were not rerun). nytimes is the full 290k
 corpus with its published ground truth. The two higher-dimensional corpora are
 **synthetic**: unit vectors with a decaying spectrum and a small common offset, with exact
-ground truth. There is no real corpus at d ≥ 768 beyond 60k vectors here yet. `+rr4` is
-`search_rerank` with 4× candidates. "1 thread" is one core searching queries in batches of
-32, as the bindings do. Throughput is k=10, from C, on the M5.
+ground truth, because the real corpora at d ≥ 768 in the previous section have only 50k–100k
+vectors. `+rr4` is `search_rerank` with 4× candidates. "1 thread" is one core searching
+queries in batches of 32, as the bindings do. Throughput is k=10, from C, on the M5.
 
 | corpus | bits | B/vec | R@10 | R@10 +rr4 | QPS, 1 thread | QPS, 10 threads | add, 10 threads |
 |---|---|---|---|---|---|---|---|
@@ -301,9 +320,10 @@ orthogonal QJL sketch gives exact rather than asymptotic normalization plus ~2.7
 lower inner-product distortion. See [docs/DESIGN.md](docs/DESIGN.md) §1.2.
 
 See [docs/comparison.md](docs/comparison.md) for the measured comparison against FAISS PQ,
-FAISS RaBitQ, and turbovec. The tables above summarize it. FAISS PQ has better recall per byte
-below about 32 B. From there up, zquant matches turbovec, beats PQ and RaBitQ, and is the fastest
-of the four.
+FAISS RaBitQ, and turbovec. The tables above summarize it. At d=128 and 256, FAISS PQ has better
+recall per byte below about 32 B; from there up, zquant matches turbovec, beats PQ and RaBitQ,
+and is the fastest of the four. At d=768 and 1536, PQ trails at every budget, and FAISS RaBitQ
+leads by 1.4–2.7 points at 1–2 bits per dimension while searching 2.3–4.7× slower.
 
 ## Building
 

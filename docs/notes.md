@@ -2089,3 +2089,173 @@ compiles for x86_64_v4 and for CPUs with AVX-VNNI, and the disassembly shows it 
 No runner has yet drawn a CPU that has VNNI while running this branch, so it is
 unmeasured. It is not one of the release's choices. If a run on a Zen 4/5 or an Ice Lake
 or later shows it pays, it can be added as a second level in `kernelLevelCpus`.
+
+
+## Partitioning and the low-bit gap: a better estimator first, then IVF on top
+
+Two questions prompted this. Should zquant partition its corpus the way an IVF index does?
+And why does FAISS beat it below about 2 bits per dimension? The working answer to the
+second was that PQ's learned vector codebooks capture structure a scalar quantizer cannot
+([comparison.md](comparison.md), "The sub-25 B band is conceded"). That was measured at
+d=128 and d=256 only. Both questions led to the same place: how zquant assembles a score
+from its codes.
+
+Two scripts produced everything below. `bench/py/highdim.py` runs the library against FAISS
+at matched bits per dimension. `bench/py/ivf_lab.py` tests estimator and IVF variants that
+the library cannot express yet, on a numpy copy of its encoder. Two new corpora are real
+embeddings at high dimension: Cohere's multilingual-22-12 (100k × 768) and OpenAI's ada-002
+on C4 (50k × 1536), both from VectorDBBench (`tools/fetch_datasets.sh highdim`). Both sit
+far off the origin, with centroid norms of 0.849 and 0.833.
+
+### At d ≥ 768, PQ is not the competitor
+
+R10@10, one thread, M5. "+cal" is the library's calibration. PQ uses 8-bit codes with M = d/8,
+d/4 and d/2. RaBitQ is FAISS's `IndexRaBitQ`. "Sign BQ" is one sign bit per dimension with
+Hamming distance, which is what binary quantization usually means.
+
+| corpus | ~bits/dim | zquant +cal | FAISS PQ | FAISS RaBitQ | sign BQ |
+|---|---|---|---|---|---|
+| cohere-768 | 1 | 0.711 | 0.582 | **0.738** | 0.496 |
+| | 2 | 0.847 | 0.753 | **0.861** | |
+| | 4 | **0.954** | 0.917 | 0.952 | |
+| openai-1536 | 1 | 0.769 | 0.669 | **0.786** | 0.605 |
+| | 2 | 0.871 | 0.828 | **0.890** | |
+| | 4 | 0.960 | 0.944 | **0.962** | |
+| fashion-mnist-784 | 1 | 0.541 (no cal) | **0.562** | 0.361 | 0.238 |
+| | 2 | **0.810** | 0.737 | 0.646 | |
+| | 4 | **0.939** | 0.897 | 0.910 | |
+
+On cohere and openai, zquant's budgets are 4–16 B per vector smaller than RaBitQ's (100 B
+against 104 at d=768 and 1 bit, for example). On fashion-mnist they are 10–40 B larger, because
+zquant pads d=784 up to 896. On the two embedding corpora PQ trails at every budget, by 10–13
+points at 1 bit per dimension. My earlier guess, that the PQ gap would follow bits per dimension
+up to high d, was wrong. The competitor at these dimensions is RaBitQ, which leads by 1.4–2.7
+points at 1 and 2 bits. RaBitQ is also data-oblivious. It trains nothing but a centroid, so
+the "vector codebooks" explanation cannot cover its lead.
+
+### Why RaBitQ leads: how the score is assembled
+
+At 1 bit, RaBitQ stores the sign of each rotated coordinate of `x − c`, where `c` is the corpus
+centroid. zquant's 1-bit codebook stores the same thing. The codes are the same; the
+estimators differ in two ways.
+
+1. **The centroid's part of the score is exact.** RaBitQ splits
+   `⟨q,x⟩ = ⟨q,c⟩ + ⟨c,x−c⟩ + ⟨q−c, x−c⟩`. The first term is computed once per query, and the
+   second is a per-vector constant fixed when the vector is added. Only the third is
+   estimated. zquant's calibration shifts the codebook instead, so the mean's contribution
+   passes through the quantizer and carries its error.
+2. **The per-vector scalar is normalised differently.** zquant stores `α = ⟨y,ŷ⟩/‖ŷ‖²`, the
+   least-squares fit of the vector `y` against its reconstruction `ŷ`. That is optimal on
+   average over random queries. But it scales the estimate along `y` itself by `cos²(y,ŷ)`,
+   a factor that varies from vector to vector. RaBitQ effectively uses `α = ‖y‖²/⟨y,ŷ⟩`. The
+   score is then exact whenever the query points along the stored vector. The top of a ranking
+   is decided by queries that nearly do, so that is where the second choice pays.
+
+`ivf_lab.py` re-implements the index encoder in numpy, with a dense random rotation instead of
+the Hadamard one, and runs the library beside it. The copy lands within a point of the library
+everywhere except fashion-mnist, where it scores 3.7 points lower at bits=2 and 1.7 lower at
+bits=3. Comparisons inside the lab are like for like. Comparisons between the lab and the
+library are good to about a point, and on fashion-mnist they understate the lab's variants.
+R10@10 with every vector scanned:
+
+| corpus | bits | library today | lab: α exact | lab: centred, α exact | FAISS RaBitQ |
+|---|---|---|---|---|---|
+| cohere-768 | 2 | 0.711 | 0.526 | **0.739** | 0.738 |
+| | 3 | 0.847 | 0.737 | **0.869** | 0.861 |
+| openai-1536 | 2 | 0.769 | 0.636 | **0.796** | 0.786 |
+| | 3 | 0.871 | 0.798 | **0.893** | 0.890 |
+| fashion-mnist | 2 | 0.541 | 0.564 | **0.717** | 0.361 |
+| | 3 | 0.810 | 0.742 | **0.835** | 0.646 |
+| SIFT10K | 2 | 0.355 | 0.336 | **0.456** | 0.355 |
+| | 3 | 0.692 | 0.604 | **0.699** | 0.616 |
+| nytimes-256 | 2 | 0.530 | 0.542 | **0.544** | 0.537 |
+| | 3 | 0.743 | 0.738 | **0.747** | — |
+
+"Library today" is the better of calibrated and uncalibrated. "α exact" alone is the second
+change without centring. "Centred" subtracts the corpus mean, normalises the residual,
+quantizes it and assembles the score as RaBitQ does. It fits no per-coordinate scale.
+
+**With both changes, the copy matches or beats RaBitQ on every corpus and beats today's
+library on every corpus.** On SIFT and nytimes at bits=3 the margin over today (0.7 and 0.4
+points) is inside the lab's own error. Everywhere else it is 1.4–18 points. At bits=5 the gain
+is about a point or less (cohere 0.954 → 0.961, fashion-mnist 0.939 → 0.950). The changes
+matter where a code is coarse.
+
+Each change alone gets much less. With least-squares α, centring gives cohere 0.569 at
+bits=2, not 0.739, and α exact without centring trails today's calibration on cohere, openai
+and SIFT. This may bear on the "Mean-centring: a measured negative" result in comparison.md,
+which kept least-squares α. I have not reproduced that result, so it is a lead rather than
+an explanation. Adding the quantile scale fit on top of the
+new estimator moved recall by at most 3 points, and not consistently in either direction. The
+centred estimator does calibration's job without the fit.
+
+Two corpora show FAISS RaBitQ far below the analysis: SIFT and fashion-mnist, the two
+non-negative ones. At 1 bit the two estimators are algebraically the same. On cohere and openai
+they agree within a point, as they should; on these two FAISS is 8–36 points lower. On SIFT the
+query-bit setting (`qb`) changed nothing. I cannot explain it from outside FAISS, so those two
+RaBitQ figures should not be read as RaBitQ's limit.
+
+### IVF on top: residuals against list centroids
+
+The same estimator works with a list centroid in place of the corpus mean, which is exactly IVF
+with residual encoding. R10@10 with every list probed, so any change is the codes alone:
+
+| corpus | bits | centred (1 list) | 64 lists | 256 lists | 1024 lists |
+|---|---|---|---|---|---|
+| cohere-768 | 2 | 0.739 | 0.778 | 0.791 | **0.794** |
+| | 3 | 0.869 | 0.884 | 0.893 | **0.894** |
+| openai-1536 | 2 | 0.796 | 0.818 | 0.820 | **0.828** |
+| fashion-mnist | 2 | 0.717 | 0.839 | 0.855 | **0.867** |
+| | 3 | 0.835 | 0.916 | 0.925 | **0.930** |
+| SIFT10K | 2 | 0.456 | 0.651 | **0.661** | — |
+| | 3 | 0.699 | 0.816 | **0.833** | — |
+| nytimes-256 | 2 | 0.544 | 0.558 | 0.563 | **0.568** |
+
+At bits=2, SIFT's 0.661 at 20 B would beat FAISS PQ's 0.511 at 16 B and 0.648 at 32 B, but
+only before counting the centroids. On a corpus as small as SIFT10K, 256 of them add 13 B per
+vector. Clumpy corpora gain most (SIFT, fashion-mnist). nytimes, whose centroid is near the
+origin, gains least.
+
+**Recall against the fraction scanned.** Here only the nearest lists are probed, ranked by
+distance to their centroids, with 1024 lists. FAISS IVF-RaBitQ and IVF-PQ are built on the same
+centroids, at code sizes matching zquant's bits=2 (one bit per dimension). R10@10:
+
+| corpus | scanned | exact ceiling | today's codes +cal | zquant IVF | FAISS IVF-RaBitQ | FAISS IVF-PQ |
+|---|---|---|---|---|---|---|
+| cohere-768 | 2.1% | 0.894 | 0.673 | **0.754** | 0.747 | 0.594 |
+| | 4.1% | 0.946 | 0.689 | **0.776** | 0.769 | 0.606 |
+| | 8.1% | 0.977 | 0.698 | **0.788** | 0.783 | 0.612 |
+| openai-1536 | 1.9% | 0.870 | 0.723 | **0.770** | 0.768 | 0.660 |
+| | 3.6% | 0.926 | 0.745 | **0.800** | 0.794 | 0.677 |
+| fashion-mnist | 2.3% | 0.989 | 0.493 | **0.863** | 0.441 | 0.601 |
+| nytimes-256 | 15.6% | 0.767 | 0.491 | 0.521 | 0.520 | **0.528** |
+| | 30.6% | 0.835 | 0.509 | 0.538 | 0.537 | **0.546** |
+
+On the embedding corpora, scanning 4% of the corpus comes within 2–3 points of the
+full-scan recall. nytimes is the exception. Its k-means lists are badly unbalanced, so probing
+4 of 1024 lists already scans 3.6%, and even exact scores reach only 0.77 at 15% scanned. IVF
+would barely speed up a corpus like it.
+
+**Not measured: speed.** These are recall figures from a numpy model. What IVF does to
+throughput depends on things the model does not have:
+- **Coarse search cost.** Ranking 1024 centroids at d=768 is 0.8M multiply-adds per query.
+  That is the same order as scanning 4% of a 100k corpus (3M code entries), so IVF pays off
+  only at larger n.
+- **Batching.** The 4×4 batch tile shares each block of codes across four queries. Queries
+  probe different lists, so batches would have to be regrouped by list, as FAISS does.
+- **Storage.** Centroids cost nlist·d·4 bytes. At 100k vectors with 1024 lists that is 31 B
+  per vector at d=768, but about 3 B at a million vectors with the same lists. List ids add
+  4 B per vector.
+
+### What follows
+
+1. **Change the estimator first.** It is the cheaper change, it helps a flat index on its
+   own, and IVF is built on it. Centre on a sample's mean, normalise the residual, store a
+   per-vector constant for `⟨c,x−c⟩`, and use the along-vector-exact α. The scan kernels are
+   untouched; the encoder, the per-vector scalars and the score epilogue change. It costs
+   one more f16 per vector (2 B), whose precision is untested, and a format version bump. It
+   would replace the quantile calibration, or at least its default. It needs measuring
+   through the library before anything is claimed for it.
+2. **Then IVF, as a layer over that estimator.** It adds about as much recall again or more
+   at bits=2 (cohere +5.5 points, SIFT +20), and that gain is measured here. Its speed gain
+   needs a corpus of a million or more, where the coarse search is small beside the scan.

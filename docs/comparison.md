@@ -21,6 +21,11 @@ fitted per-coordinate shift and scale anchored on the codebook's outermost centr
 and — the one that mattered most on SIFT — fitting the per-vector correction in the same
 basis the estimator applies it in.
 
+**At d=768 and 1536 on real embeddings** the low-byte picture reverses: PQ trails zquant at
+every budget, and the closest competitor is RaBitQ, 1.4–2.7 points ahead at 1–2 bits per
+dimension. An experiment suggests that lead comes from how RaBitQ assembles its scores,
+which zquant could adopt (see "Real embeddings at d=768 and 1536" below).
+
 ## nytimes-256 — real text embeddings, d=256
 
 100,000 × 256 sampled from the ann-benchmarks corpus, 1000 queries, exact
@@ -194,6 +199,66 @@ the d=768–3072 this library targets, 25 B is ~0.2 bits per dimension — a rat
 runs in production. The useful range is 1–4 bits per dimension, and zquant wins every band
 there on both corpora.
 
+**Revisited: much of the limit was the estimator, not the codes.** The first bullet above
+compared the same estimator in f32 and in int8; it never tried a different estimator. A
+numpy copy of the encoder (`bench/py/ivf_lab.py`) tried two changes taken from RaBitQ. One
+computes the corpus mean's share of the score exactly. The other normalises the per-vector
+scalar so the score is exact along the stored vector. With both, SIFT at bits=2 rises from
+0.355 with today's library to 0.456 on the same 20 B, still short of PQ's 0.511 at 16 B.
+Encoding residuals against 256 k-means centroids instead of one mean, which is IVF, takes it
+to 0.661, though on a corpus this small the centroids add 13 B per vector. And at d=768–1536
+on real embeddings, PQ trails zquant at every budget (see the section below). See
+`docs/notes.md`, "Partitioning and the low-bit gap".
+
+## Real embeddings at d=768 and 1536
+
+Cohere multilingual-22-12 (100k × 768) and OpenAI ada-002 on C4 (50k × 1536), both from
+VectorDBBench, plus fashion-mnist (60k × 784, pixels rather than embeddings). 1000 queries,
+exact inner-product ground truth, one thread on the M5. turbovec was not rerun. Produced by
+`bench/py/highdim.py`.
+
+| corpus | system | B/vec | bits/dim | R@10 | QPS, 1 thread |
+|---|---|---|---|---|---|
+| cohere-768 | sign-bit BQ | 96 | 1.00 | 0.496 | 4,004 |
+| | FAISS PQ M=96 | 96 | 1.00 | 0.582 | 597 |
+| | zquant bits=2 +cal | 100 | 1.04 | 0.711 | 1,694 |
+| | FAISS RaBitQ 1-bit | 104 | 1.08 | **0.738** | 495 |
+| | FAISS PQ M=192 | 192 | 2.00 | 0.753 | 208 |
+| | zquant bits=3 +cal | 196 | 2.04 | 0.847 | 1,722 |
+| | FAISS RaBitQ 2-bit | 212 | 2.21 | **0.861** | 432 |
+| | FAISS PQ M=384 | 384 | 4.00 | 0.917 | 67 |
+| | zquant bits=5 +cal | 388 | 4.04 | **0.954** | 1,910 |
+| | FAISS RaBitQ 4-bit | 404 | 4.21 | 0.952 | 408 |
+| openai-1536 | FAISS PQ M=192 | 192 | 1.00 | 0.669 | 384 |
+| | zquant bits=2 +cal | 196 | 1.02 | 0.769 | 1,837 |
+| | FAISS RaBitQ 1-bit | 200 | 1.04 | **0.786** | 805 |
+| | FAISS PQ M=384 | 384 | 2.00 | 0.828 | 131 |
+| | zquant bits=3 +cal | 388 | 2.02 | 0.871 | 1,933 |
+| | FAISS RaBitQ 2-bit | 404 | 2.10 | **0.890** | 495 |
+| | zquant bits=5 +cal | 772 | 4.02 | 0.960 | 2,070 |
+| | FAISS RaBitQ 4-bit | 788 | 4.10 | **0.962** | 511 |
+| fashion-mnist-784 | FAISS PQ M=98 | 98 | 1.00 | **0.562** | 868 |
+| | FAISS RaBitQ 1-bit | 106 | 1.08 | 0.361 | 754 |
+| | zquant bits=2 | 116 | 1.18 | 0.541 | 2,371 |
+| | FAISS PQ M=196 | 196 | 2.00 | 0.737 | 382 |
+| | FAISS RaBitQ 2-bit | 216 | 2.20 | 0.646 | 386 |
+| | zquant bits=3 +cal | 228 | 2.33 | **0.810** | 2,471 |
+
+**PQ trails at every budget on both embedding corpora**, by 10–13 points at 1 bit per
+dimension. The low-byte concession above is a property of d=128 and d=256, not of the
+method. **RaBitQ is the competitor here.** It leads by 1.4–2.7 points at 1 and 2 bits per
+dimension and ties at 4. On one thread zquant searches 2.3–4.7× faster than RaBitQ and at
+least 2.8× faster than PQ. Those are FAISS's plain `IndexPQ` and `IndexRaBitQ`; its
+fast-scan variants were not run. Calibration is worth 9–25 points at 1–2 bits per
+dimension here, because both corpora sit far off the origin (centroid norms 0.849 and
+0.833).
+
+A numpy copy of the encoder suggests RaBitQ's lead is in how it assembles a score, not in
+its codes. Its 1-bit codes are the same as zquant's. With RaBitQ's treatment of the mean and
+its per-vector normalisation, the copy reaches 0.739 on cohere and 0.796 on openai at bits=2.
+That matches or passes RaBitQ, at 4 B less per vector. See `docs/notes.md`, "Partitioning and
+the low-bit gap". It is not in the library yet.
+
 ## The scalar correction
 
 MSE-optimal reconstruction shrinks ỹ, so ⟨p, ỹ⟩ underestimates ⟨p, y⟩. The paper corrects
@@ -301,14 +366,18 @@ it was caught.
 ## Open leads
 
 - **The low-bit regime is the real weakness.** Below 40 B we trail PQ by 22 points. This
-  is likely structural: PQ uses *vector* codebooks (256 centroids over 8 dimensions at
-  M=16), and vector quantization beats scalar quantization hardest at low rates.
-  TurboQuant is scalar by construction. Closing this may need something outside the
-  paper rather than a better implementation of it.
+  was thought structural, since PQ uses *vector* codebooks. It is not, or not mostly. An
+  estimator change measured in a numpy copy of the encoder closes about two thirds of it on
+  SIFT and matches or passes RaBitQ on real embeddings; IVF residuals add more. Not yet in
+  the library.
+  See `docs/notes.md`, "Partitioning and the low-bit gap".
 - **turbovec's calibration is more effective than ours at low bit-widths** — +8.1 points
   at bits=2 against our −1.5. Whatever it fits, it is not just a per-coordinate scale.
   Mean handling is the obvious suspect, and is exactly what we could not make work.
-- **Mean-centring** (above) — the largest identified but unrealized gain.
+- **Mean-centring** (above) — the largest identified but unrealized gain. It works in the
+  numpy copy of the encoder when the mean's share of the score is computed exactly and the
+  per-vector scalar is normalised along the vector rather than fitted by least squares
+  (`docs/notes.md`, "Partitioning and the low-bit gap").
 - **turbovec's bits=3 stores 68 B — the same as its bits=4** — so it pads 3-bit codes
   rather than packing them. Our bit-plane layout does not, and at 68 B we beat that
   configuration on RMS (0.01210 against 0.01370). The gap is specifically against their
@@ -318,10 +387,10 @@ it was caught.
 
 ## Caveats
 
-- Two corpora. SIFT10K is 10k vectors of image descriptors — easier than SIFT1M and not
-  an embedding model's output. nytimes-256 is real text embeddings but sampled to 100k.
-  Higher dimensions (768–3072), where the design's assumptions are strongest, remain
-  unrun.
+- The main tables cover two corpora. SIFT10K is 10k vectors of image descriptors — easier
+  than SIFT1M and not an embedding model's output. nytimes-256 is real text embeddings but
+  sampled to 100k. Real embeddings at d=768 and 1536 have their own section above, against
+  PQ and RaBitQ only, on one thread; turbovec was not rerun there.
 - Results differ substantially between the two, so neither generalizes on its own.
 - **Correction (supersedes the paragraph below).** The figure of 38,052 QPS for turbovec on
   nytimes is not reproducible: three matched runs give 23,810, 22,565 and 21,715. It was
@@ -367,8 +436,13 @@ python bench/py/prepare.py nytimes-256     # or an ann-benchmarks HDF5
 python bench/py/baselines.py       # PQ, RaBitQ, turbovec  -> data/baselines.csv
 zig build compare_bench            # zquant                -> data/zquant.csv
 python bench/py/compare.py         # merged table; refuses to merge mismatched runs
+tools/fetch_datasets.sh highdim    # cohere-768, openai-1536 (VectorDBBench parquet)
+python bench/py/prepare.py cohere-768    # then openai-1536
+python bench/py/highdim.py cohere-768-norm openai-1536-norm   # zquant vs PQ, RaBitQ, sign BQ
+python bench/py/ivf_lab.py cohere-768-norm --curve 1024 --faiss  # estimator and IVF variants
 zig build diagnose                 # rotation moments, D_mse, estimator RMS
 python bench/py/synth.py spectrum --alpha 1.0   # synthetic corpus with one property varied
 ```
 
-Requires `numpy`, `faiss-cpu`, `turbovec` in a virtualenv.
+Requires `numpy`, `faiss-cpu`, `turbovec` in a virtualenv, plus `pyarrow` for the
+parquet corpora and the zquant Python client (`PYTHONPATH=clients/python`) for the last two.

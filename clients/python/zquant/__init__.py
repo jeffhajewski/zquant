@@ -658,7 +658,7 @@ class Codec:
     large per-channel offset (Qwen2.5) zquant's keys failed outright; there is no
     centring option to correct for that yet. On the other models it does beat plain
     int4, and it reconstructs values as well as anything measured: the loss is in keys.
-    The repository README's KV-cache section has the measurements and their caveats.
+    docs/kv-cache.md in the repository has the measurements and their caveats.
 
     A Codec owns native scratch space that two calls cannot share, so its calls take a
     lock: sharing one between threads is safe, but they take turns. To encode on

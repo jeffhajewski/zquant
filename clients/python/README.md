@@ -239,8 +239,8 @@ its bits for a residual sketch, so `Codec(bits=4)` packs as many bits per coordi
 
 As a KV-cache quantizer, it isn't the best one measured. At matched memory, KIVI-style
 4-bit quantization had lower perplexity on every model tried. zquant's keys failed
-outright on a model whose keys carry a large per-channel offset. The repository README's
-KV-cache section has the numbers and caveats.
+outright on a model whose keys carry a large per-channel offset.
+[docs/kv-cache.md](../../docs/kv-cache.md) has the numbers and caveats.
 
 ## Errors
 

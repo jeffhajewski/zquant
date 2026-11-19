@@ -48,8 +48,8 @@ import sys
 import time
 
 # One Accelerate BLAS thread, set before torch loads it, with torch's OpenMP threads (4 in
-# the recorded runs) doing the parallel work. It is what the README numbers ran with; it
-# is not known to matter. (Rows that took ~1000 s in those logs were the machine sleeping
+# the recorded runs) doing the parallel work. It is what docs/kv-cache.md's numbers ran
+# with; it is not known to matter. (Rows that took ~1000 s in those logs were the machine sleeping
 # in thermal dark-wake cycles, not anything here.)
 os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 

@@ -193,10 +193,17 @@ pub const has_avx2 = switch (builtin.cpu.arch) {
 
 /// `vpdpbusd` on ymm registers: the AVX-512 encoding needs VL as well as VNNI; the
 /// VEX encoding (Alder Lake, Zen 5) is a feature of its own.
-const has_vnni_evex = has_avx2 and
+///
+/// Only under LLVM. Zig's own x86_64 backend, which compiles Debug builds, has no
+/// `vpdpbusd` in its assembler, so a Debug build for a VNNI CPU failed to compile. CI
+/// found it the first time a runner drew one (a Granite Rapids). The fallback chain
+/// gives the same integer sums, and release builds always go through LLVM.
+const vnni_assembles = builtin.zig_backend == .stage2_llvm;
+const has_vnni_evex = has_avx2 and vnni_assembles and
     std.Target.x86.featureSetHas(builtin.cpu.features, .avx512vnni) and
     std.Target.x86.featureSetHas(builtin.cpu.features, .avx512vl);
-const has_vnni_vex = has_avx2 and std.Target.x86.featureSetHas(builtin.cpu.features, .avxvnni);
+const has_vnni_vex = has_avx2 and vnni_assembles and
+    std.Target.x86.featureSetHas(builtin.cpu.features, .avxvnni);
 pub const has_vnni = has_vnni_evex or has_vnni_vex;
 
 /// `accumulate` on 32 bytes. `b` must not contain −128, as there.

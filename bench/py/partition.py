@@ -4,8 +4,8 @@ corpora named on the command line.
     python bench/py/partition.py cohere-768-norm openai-1536-norm sift-norm
 
 For each bit width: a calibrated flat index, then a partitioned one with about sqrt(n)
-lists at a range of probe counts, and FAISS's IndexIVFRaBitQ at 1, 2 and 4 bits with the
-same lists and probes, where FAISS is installed. R10@10 is the true top-10 found in the
+lists at a range of probe counts, and FAISS's IndexIVFRaBitQ and IndexIVFRaBitQFastScan
+at 1, 2 and 4 bits with the same lists and probes, where FAISS is installed. R10@10 is the true top-10 found in the
 returned top-10. QPS is one thread, 1000 queries in batches as the client sends them,
 k=10. The partitioned index trains on 256 rows per list at most; FAISS trains on the
 whole corpus. Needs numpy, faiss-cpu, and the zquant Python client on PYTHONPATH
@@ -103,6 +103,19 @@ for ds in sys.argv[1:]:
                 ix.nprobe = pr
                 (_, ids), dt = timed(lambda: ix.search(query, 10))
                 report(ds, "FAISS", f"IVFRaBitQ {nb}-bit", ix.code_size, pr, ids, dt, gt)
+            faiss.omp_set_num_threads(8)
+
+            # The fast-scan layout, FAISS's speed-tuned version: blocks of 32 codes scored
+            # by SIMD table lookups.
+            coarse = faiss.IndexFlatIP(d)
+            ix = faiss.IndexIVFRaBitQFastScan(coarse, d, lists, faiss.METRIC_INNER_PRODUCT, 32, True, nb)
+            ix.train(base)
+            ix.add(base)
+            faiss.omp_set_num_threads(1)
+            for pr in sweep:
+                ix.nprobe = pr
+                (_, ids), dt = timed(lambda: ix.search(query, 10))
+                report(ds, "FAISS", f"IVFRaBitQ-FS {nb}-bit", ix.code_size, pr, ids, dt, gt)
             faiss.omp_set_num_threads(8)
 
 if rows:

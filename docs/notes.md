@@ -1962,10 +1962,29 @@ them. The pkg-config job moves the prefix after installing. Releases are gated o
 running the suite at every shipped CPU level on x86_64 and arm64 Linux, macOS and
 Windows.
 
-**Larger corpora.** nytimes at its full 290k, and synthetic corpora at 500k × 768 and
-250k × 1536; the README has the table. With a 4× rerank, bits=5 reaches R@10 1.000 on
-both synthetic corpora. There is still no real corpus at d ≥ 768 beyond fashion-mnist's
-60k.
+**Larger corpora.** nytimes at its full 290k with its published ground truth, and
+synthetic corpora at 500k × 768 and 250k × 1536: unit vectors with a decaying spectrum and
+a small common offset, with exact ground truth. Recall is uncalibrated; `+rr4` is
+`search_rerank` with 4× candidates. "1 thread" is one core searching queries in batches of
+32, as the bindings do. Throughput is k=10, from C, on the M5. With a 4× rerank, bits=5
+reaches R@10 1.000 on both synthetic corpora. There is still no real corpus at d ≥ 768
+beyond fashion-mnist's 60k. (This table sat in the README until the README was rewritten
+after partitioning landed; it predates the centred estimator.)
+
+| corpus | bits | B/vec | R@10 | R@10 +rr4 | QPS, 1 thread | QPS, 10 threads | add, 10 threads |
+|---|---|---|---|---|---|---|---|
+| nytimes, 290k × 256 | 3 | 68 | 0.766 | 0.955 | 1,839 | 9,682 | 2.47M/s |
+| | 5 | 132 | 0.918 | 0.985 | 1,953 | 10,758 | 2.58M/s |
+| synthetic, 500k × 768 | 3 | 196 | 0.560 | 0.900 | 402 | 2,153 | 696k/s |
+| | 5 | 388 | 0.866 | 1.000 | 423 | 2,342 | 708k/s |
+| synthetic, 250k × 1536 | 3 | 388 | 0.629 | 0.948 | 409 | 2,242 | 357k/s |
+| | 5 | 772 | 0.883 | 1.000 | 440 | 2,397 | 329k/s |
+
+Search is a linear scan, so throughput falls with n·d as expected. At d=768 the index no
+longer pads to 1024, so these sizes are 25% smaller than they were. bits=4 is left out
+because it is the slow width (its 3-bit codes need bit-plane unpacking; see `Residency` in
+[src/index/flat.zig](../src/index/flat.zig)). It runs at about 40% of the speed of bits=3
+and 5.
 
 **Not done, or not verifiable here:**
 - *x86 tile shapes.* The x86_64_v3 disassembly of the 4×4 batch tile has 498 stack
@@ -2378,7 +2397,9 @@ What this says:
 - **Scanning everything costs nothing extra at d ≥ 768** (194 QPS against flat's 187 at 1M)
   and about 12% at d=128 on SIFT10K, where lists of 100 vectors leave more per-list
   overhead per code byte.
-- **Against FAISS IVF-RaBitQ at one bit,** on the same number of lists, single-threaded:
+- **Against FAISS IVF-RaBitQ at one bit** (the plain index; the next section measures its
+  fast-scan version, which is the fair speed baseline), on the same number of lists,
+  single-threaded:
   zquant's bits=2 is 1.3 to 1.8 points higher at 2 B more per vector, and 1.5 to 2.7 times
   as fast at the same probe count. The exception is the fewest probes, where ranking the
   centroids is most of the work: on OpenAI at 3 probes the two tie on recall and FAISS is
@@ -2400,3 +2421,51 @@ vector).
 
 **Not done yet:** saving and loading a partitioned index, `score_ids` on one (it needs an
 id-to-slot map), and a faster k-means.
+
+## Correction: the speed comparisons were against FAISS's slow indexes
+
+Every speed comparison with RaBitQ so far used FAISS's `IndexRaBitQ` and `IndexIVFRaBitQ`.
+FAISS 1.16 also has `IndexRaBitQFastScan` and `IndexIVFRaBitQFastScan`, which store codes
+in blocks of 32 and score them with SIMD table lookups, as its PQ fast-scan does. They are
+the versions anyone choosing FAISS for speed would use, and they were never run. They are
+now in `bench/py/highdim.py` and `bench/py/partition.py`, along with `IndexPQFastScan`.
+
+Flat, one thread, k=100, on the M5 (`docs/comparison.md` has every row):
+
+| corpus | bits/dim | zquant | RaBitQ plain | RaBitQ fast-scan |
+|---|---|---|---|---|
+| Cohere 100k × 768 | 1 | **0.750** / 1,786 | 0.738 / 490 | 0.739 / **2,682** |
+| | 2 | **0.868 / 1,835** | 0.861 / 426 | 0.861 / 1,547 |
+| | 4 | **0.960 / 1,979** | 0.952 / 408 | 0.952 / 1,393 |
+| OpenAI 50k × 1536 | 1 | 0.791 / 1,873 | 0.786 / 834 | **0.795 / 3,034** |
+| | 2 | **0.894 / 1,934** | 0.890 / 617 | 0.890 / 1,345 |
+| | 4 | **0.967 / 2,069** | 0.962 / 556 | 0.962 / 1,236 |
+
+Fast-scan finds the same neighbours as plain RaBitQ, give or take a query, at 2.2 to 5.5
+times the speed. Against it, zquant's "2.2–4.8× faster" becomes 1.5 to 1.7 times *slower*
+at one bit per dimension and 1.2 to 1.7 times faster at two and four. The recall lead
+holds, at 0.4 to 1.2 points, except on OpenAI at one bit, where fast-scan's 0.795 passes
+zquant's 0.791.
+
+Why one bit is different shows in the table: zquant's speed barely moves with the bit width
+(1,786 to 1,979 QPS on Cohere from one bit to four), while fast-scan's halves (2,682 to
+1,393). zquant's scan costs about the same per dimension whatever the width, so at one bit
+it does four bits' worth of work for one bit of code. A kernel that scores packed 1-bit
+codes directly, as fast-scan and sign-bit BQ do, is the obvious way to close that gap, and
+the place to look first.
+
+Partitioned, the picture favours zquant more (`docs/comparison.md`, "Partitioned search
+against FAISS IVF-RaBitQ"). From about 6% of the lists, zquant finds 0.5 to 1.5 points
+more and runs 1.4 to 2.9 times as fast as `IndexIVFRaBitQFastScan`; at the fewest probes
+FAISS is faster. The likely reason is batching: zquant regroups a batch by list and reads
+each list once for every query that probes it, while FAISS scans list by list per query
+and rebuilds its lookup tables for each list's residual. That is a guess from the
+designs, not something measured.
+
+Two caveats that cut FAISS's way. Its fast-scan kernels were written for AVX2 and run on
+Arm through a NEON translation layer, and every number here is from Apple silicon, so x86
+may favour FAISS more. And at the fewest probes, coarse search dominates, and FAISS's is
+faster.
+
+The README's "2.2–4.8× faster" claim is gone with the README rewrite that followed.
+

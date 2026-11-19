@@ -3,12 +3,25 @@
 The P1 acceptance criterion: run PQ, RaBitQ, and turbovec **ourselves, on our hardware,
 in our harness**, rather than quoting published numbers.
 
-**Where it stands, and it depends on the corpus.**
+## Where it stands
 
-On **real text embeddings** (nytimes-256, d=256) zquant **wins the two highest storage
-bands outright**, including beating turbovec's best configuration at identical storage.
-On **SIFT10K** (d=128 image descriptors) it now **wins every band from 25 B up**, and
-trails only below 25 B, where FAISS PQ's learned codebook still leads.
+- **Embeddings at d=768 and 1536** (Cohere, OpenAI). zquant finds the most true neighbours
+  at every budget from 1 to 4 bits per dimension but one, by about a point over FAISS's
+  RaBitQ and by 2 to 17 over PQ. On speed it trails FAISS's fast-scan RaBitQ at 1 bit per
+  dimension, which is 1.5 to 1.7 times faster there, and leads at 2 and 4 bits, by 1.2 to
+  1.9 times.
+- **Partitioned (IVF)**, against FAISS's IVF-RaBitQ fast-scan on the same lists: from
+  about 6% of the lists probed, zquant finds 0.5 to 1.5 points more at 1.4 to 2.9 times
+  the speed. At the fewest probes FAISS is faster.
+- **d=128 and 256** (SIFT, nytimes). PQ still has the best recall per byte at the lowest
+  budgets, below about 25 B on SIFT and 100 B on nytimes. Above them zquant matches or
+  passes turbovec and passes PQ and RaBitQ.
+- **Not compared:** graph indexes such as HNSW, FAISS on x86, and turbovec since the
+  estimator changed. Everything here ran on one Apple M5.
+
+The rest of this page records how that position was reached, measurement by measurement.
+
+## How it got here
 
 The corpus difference is the most important result here. The first pass lost every band
 on SIFT, and it would have been easy to conclude the implementation was simply behind.
@@ -245,75 +258,120 @@ real embeddings, PQ trails zquant at every budget (see the section below). See
 
 Cohere multilingual-22-12 (100k × 768) and OpenAI ada-002 on C4 (50k × 1536), both from
 VectorDBBench, plus fashion-mnist (60k × 784, pixels rather than embeddings). 1000 queries,
-exact inner-product ground truth, one thread on the M5. turbovec was not rerun. Produced by
-`bench/py/highdim.py`.
+k=100, exact inner-product ground truth, one thread on the M5, every row from one run of
+`bench/py/highdim.py`. turbovec was not rerun. FAISS is 1.16.0 from pip. Its fast-scan
+indexes store codes in blocks of 32 and score them with SIMD table lookups; they are its
+speed-tuned versions, and the plain ones are kept for reference.
 
-| corpus | system | B/vec | bits/dim | R@10 | QPS, 1 thread |
-|---|---|---|---|---|---|
-| cohere-768 | sign-bit BQ | 96 | 1.00 | 0.496 | 4,004 |
-| | FAISS PQ M=96 | 96 | 1.00 | 0.582 | 597 |
-| | zquant bits=2 +cal | 100 | 1.04 | 0.711 | 1,694 |
-| | FAISS RaBitQ 1-bit | 104 | 1.08 | **0.738** | 495 |
-| | FAISS PQ M=192 | 192 | 2.00 | 0.753 | 208 |
-| | zquant bits=3 +cal | 196 | 2.04 | 0.847 | 1,722 |
-| | FAISS RaBitQ 2-bit | 212 | 2.21 | **0.861** | 432 |
-| | FAISS PQ M=384 | 384 | 4.00 | 0.917 | 67 |
-| | zquant bits=5 +cal | 388 | 4.04 | **0.954** | 1,910 |
-| | FAISS RaBitQ 4-bit | 404 | 4.21 | 0.952 | 408 |
-| openai-1536 | FAISS PQ M=192 | 192 | 1.00 | 0.669 | 384 |
-| | zquant bits=2 +cal | 196 | 1.02 | 0.769 | 1,837 |
-| | FAISS RaBitQ 1-bit | 200 | 1.04 | **0.786** | 805 |
-| | FAISS PQ M=384 | 384 | 2.00 | 0.828 | 131 |
-| | zquant bits=3 +cal | 388 | 2.02 | 0.871 | 1,933 |
-| | FAISS RaBitQ 2-bit | 404 | 2.10 | **0.890** | 495 |
-| | zquant bits=5 +cal | 772 | 4.02 | 0.960 | 2,070 |
-| | FAISS RaBitQ 4-bit | 788 | 4.10 | **0.962** | 511 |
-| fashion-mnist-784 | FAISS PQ M=98 | 98 | 1.00 | **0.562** | 868 |
-| | FAISS RaBitQ 1-bit | 106 | 1.08 | 0.361 | 754 |
-| | zquant bits=2 | 116 | 1.18 | 0.541 | 2,371 |
-| | FAISS PQ M=196 | 196 | 2.00 | 0.737 | 382 |
-| | FAISS RaBitQ 2-bit | 216 | 2.20 | 0.646 | 386 |
-| | zquant bits=3 +cal | 228 | 2.33 | **0.810** | 2,471 |
+| corpus | system | B/vec | R@10 | QPS, 1 thread |
+|---|---|---|---|---|
+| cohere-768 | FAISS PQ M=96 | 96 | 0.582 | 592 |
+| | FAISS PQ fast-scan M=192 | 96 | 0.540 | 3,832 |
+| | sign-bit BQ | 96 | 0.496 | 4,177 |
+| | zquant bits=2 +cal | 102 | **0.750** | 1,786 |
+| | FAISS RaBitQ 1-bit | 104 | 0.738 | 490 |
+| | FAISS RaBitQ fast-scan 1-bit | 104 | 0.739 | 2,682 |
+| | FAISS PQ M=192 | 192 | 0.753 | 208 |
+| | FAISS PQ fast-scan M=384 | 192 | 0.719 | 1,992 |
+| | zquant bits=3 +cal | 198 | **0.868** | 1,835 |
+| | FAISS RaBitQ 2-bit | 212 | 0.861 | 426 |
+| | FAISS RaBitQ fast-scan 2-bit | 212 | 0.861 | 1,547 |
+| | FAISS PQ M=384 | 384 | 0.917 | 67 |
+| | FAISS PQ fast-scan M=768 | 384 | 0.895 | 1,025 |
+| | zquant bits=5 +cal | 390 | **0.960** | 1,979 |
+| | FAISS RaBitQ 4-bit | 404 | 0.952 | 408 |
+| | FAISS RaBitQ fast-scan 4-bit | 404 | 0.952 | 1,393 |
+| openai-1536 | FAISS PQ M=192 | 192 | 0.669 | 394 |
+| | FAISS PQ fast-scan M=384 | 192 | 0.643 | 3,800 |
+| | sign-bit BQ | 192 | 0.605 | 5,580 |
+| | zquant bits=2 +cal | 198 | 0.791 | 1,873 |
+| | FAISS RaBitQ 1-bit | 200 | 0.786 | 834 |
+| | FAISS RaBitQ fast-scan 1-bit | 200 | **0.795** | 3,034 |
+| | FAISS PQ M=384 | 384 | 0.828 | 129 |
+| | FAISS PQ fast-scan M=768 | 384 | 0.788 | 1,993 |
+| | zquant bits=3 +cal | 390 | **0.894** | 1,934 |
+| | FAISS RaBitQ 2-bit | 404 | 0.890 | 617 |
+| | FAISS RaBitQ fast-scan 2-bit | 404 | 0.890 | 1,345 |
+| | FAISS PQ M=768 | 768 | 0.944 | 55 |
+| | FAISS PQ fast-scan M=1536 | 768 | 0.860 | 1,009 |
+| | zquant bits=5 +cal | 774 | **0.967** | 2,069 |
+| | FAISS RaBitQ 4-bit | 788 | 0.962 | 556 |
+| | FAISS RaBitQ fast-scan 4-bit | 788 | 0.962 | 1,236 |
+| fashion-mnist-784 | FAISS PQ M=98 | 98 | 0.562 | 961 |
+| | FAISS PQ fast-scan M=196 | 98 | 0.403 | 5,595 |
+| | sign-bit BQ | 98 | 0.238 | 5,617 |
+| | FAISS RaBitQ 1-bit | 106 | 0.361 | 768 |
+| | FAISS RaBitQ fast-scan 1-bit | 106 | 0.361 | 4,273 |
+| | zquant bits=2 +cal | 118 | **0.728** | 2,499 |
+| | FAISS PQ M=196 | 196 | 0.737 | 375 |
+| | FAISS PQ fast-scan M=392 | 196 | 0.618 | 3,009 |
+| | FAISS RaBitQ 2-bit | 216 | 0.646 | 643 |
+| | FAISS RaBitQ fast-scan 2-bit | 216 | 0.646 | 2,153 |
+| | zquant bits=3 +cal | 230 | **0.850** | 2,612 |
+| | FAISS PQ M=392 | 392 | 0.897 | 124 |
+| | FAISS PQ fast-scan M=784 | 392 | 0.832 | 1,605 |
+| | FAISS RaBitQ 4-bit | 412 | 0.910 | 597 |
+| | FAISS RaBitQ fast-scan 4-bit | 412 | 0.910 | 1,508 |
+| | zquant bits=5 +cal | 454 | **0.951** | 2,798 |
 
-**PQ trails at every budget on both embedding corpora**, by 10–13 points at 1 bit per
-dimension. The low-byte concession above is a property of d=128 and d=256, not of the
-method. **RaBitQ is the competitor here.** It leads by 1.4–2.7 points at 1 and 2 bits per
-dimension and ties at 4. On one thread zquant searches 2.3–4.7× faster than RaBitQ and at
-least 2.8× faster than PQ. Those are FAISS's plain `IndexPQ` and `IndexRaBitQ`; its
-fast-scan variants were not run. Calibration is worth 9–25 points at 1–2 bits per
-dimension here, because both corpora sit far off the origin (centroid norms 0.849 and
-0.833).
+**Recall: zquant finds the most at every budget but one.** On the two embedding corpora it
+is 0.4 to 1.2 points ahead of RaBitQ, plain or fast-scan, which find the same neighbours as
+each other. The exception is OpenAI at one bit per dimension, where RaBitQ's fast-scan
+version finds 0.795 against zquant's 0.791. PQ trails by 12 to 17 points at one bit per
+dimension and by 2 to 4 at four, and its fast-scan version, with 4-bit sub-quantizers,
+trails further. On fashion-mnist, which is pixels, RaBitQ manages only 0.361 at one bit,
+against zquant's 0.728 at 118 B.
 
-A numpy copy of the encoder suggests RaBitQ's lead is in how it assembles a score, not in
-its codes. Its 1-bit codes are the same as zquant's. With RaBitQ's treatment of the mean and
-its per-vector normalisation, the copy reaches 0.739 on cohere and 0.796 on openai at bits=2.
-That matches or passes RaBitQ, at 4 B less per vector. See `docs/notes.md`, "Partitioning and
-the low-bit gap". It is not in the library yet.
+**Speed: it depends on the bit width.** At one bit per dimension FAISS's fast-scan RaBitQ is
+1.5 to 1.7 times faster than zquant (2,682 QPS against 1,786 on Cohere). At two and four
+bits zquant is faster: 1.2 to 1.9 times. PQ's fast-scan version is the fastest index here
+at one bit, about twice zquant's speed, with 21 points less recall on Cohere. An earlier
+version of this section said zquant searched 2.2 to 4.8 times faster than RaBitQ. That was
+against FAISS's plain `IndexRaBitQ`, whose scalar kernels are much slower than its
+fast-scan ones; it was the wrong baseline for a speed claim.
+
+All of this is on Apple silicon. FAISS's fast-scan kernels were written for AVX2 and run on
+Arm through a NEON translation layer, so an x86 machine may favour FAISS more than these
+numbers do. Neither system has been compared on x86.
+
+Calibration is worth 9 to 22 points at 1 to 2 bits per dimension here, because both
+embedding corpora sit far off the origin (centroid norms 0.849 and 0.833). RaBitQ's former
+lead on recall was in how it assembled a score, not in its codes: its 1-bit codes are the
+same as zquant's. Adopting its treatment of the corpus centre closed the gap
+(`docs/notes.md`, "Partitioning and the low-bit gap", and the section after it).
 
 ## Partitioned search against FAISS IVF-RaBitQ
 
-Both systems partitioned into the same number of k-means lists (about √n), probing the
-same number per query, one thread, k=10 (`bench/py/partition.py`). zquant at bits=2
-(106 B) against FAISS at one bit (104 B). R10@10, then queries per second:
+Both systems partition into the same number of k-means lists (about √n) and probe the same
+number per query; one thread, k=10, 1000 queries, from one run of `bench/py/partition.py`.
+FAISS here is `IndexIVFRaBitQFastScan`, its fastest IVF-RaBitQ. Each cell is R10@10, then
+queries per second:
 
-| corpus | lists | probes | zquant | FAISS IVF-RaBitQ |
+| corpus | bits/dim | probes | zquant | FAISS IVF-RaBitQ fast-scan |
 |---|---|---|---|---|
-| Cohere, 1M × 768 | 1000 | 31 | **0.780 / 2,205** | 0.765 / 1,245 |
-| | | 125 | **0.803 / 866** | 0.786 / 319 |
-| | | all | **0.808 / 194** | 0.787 / 47 |
-| Cohere, 100k × 768 | 316 | 19 | **0.775 / 11,289** | 0.760 / 5,481 |
-| | | all | **0.792 / 1,787** | 0.774 / 397 |
-| OpenAI, 50k × 1536 | 224 | 3 | 0.664 / 22,380 | **0.666 / 28,024** |
-| | | 28 | **0.808 / 6,714** | 0.792 / 3,515 |
-| SIFT10K | 100 | 12 | **0.649 / 136,002** | 0.509 / 37,482 |
+| Cohere, 100k × 768, 316 lists | 1 (106 / 104 B) | 4 | **0.687** / 28,299 | 0.678 / **39,418** |
+| | | 19 | **0.775 / 11,863** | 0.763 / 8,663 |
+| | | 39 | **0.787 / 7,750** | 0.772 / 4,259 |
+| | 2 (202 / 212 B) | 19 | **0.863 / 12,675** | 0.852 / 6,891 |
+| | | 39 | **0.881 / 8,136** | 0.867 / 3,665 |
+| | 4 (394 / 404 B) | 19 | **0.928 / 13,455** | 0.921 / 6,603 |
+| | | 39 | **0.953 / 8,417** | 0.943 / 3,556 |
+| OpenAI, 50k × 1536, 224 lists | 1 (202 / 200 B) | 3 | 0.664 / 24,522 | **0.670 / 29,055** |
+| | | 28 | **0.808 / 7,877** | 0.802 / 3,281 |
+| | 2 (394 / 404 B) | 28 | **0.890 / 8,199** | 0.881 / 2,793 |
+| | 4 (778 / 788 B) | 28 | **0.948 / 8,153** | 0.935 / 2,776 |
 
-zquant finds 1.5 to 2.1 points more on the embeddings, and 14 on SIFT, at 1.8 to 4.5
-times the speed. The exception is the fewest probes on OpenAI, where ranking the centroids
-is most of the work: there the two tie on recall and FAISS is faster. FAISS trains on the whole corpus; zquant on at most
-256 rows per list. FAISS's multi-bit IVF-RaBitQ was not part of these runs. The
-partitioned index's recall also beats the flat calibrated index's at every corpus here,
-since each vector is stored against a nearby centroid ([notes.md](notes.md),
-"Partitioning, measured through the library").
+From about 6% of the lists up, zquant finds 0.5 to 1.5 points more and is 1.4 to 2.9 times
+as fast, the gap widening with more probes and more bits. At the fewest probes FAISS is
+faster, and on OpenAI it finds slightly more too: with 3 or 4 lists scanned, ranking the
+centroids is a large share of the work, and FAISS does that part faster. FAISS trains its
+lists on the whole corpus, zquant on at most 256 rows per list. The full sweep, and FAISS's
+plain `IndexIVFRaBitQ` (slower, with the same recall), are in `data/partition.csv` after a
+run.
+
+The partitioned index's recall also beats the flat calibrated index's on every corpus here,
+since each vector is stored against a nearby centroid rather than the corpus centre
+([notes.md](notes.md), "Partitioning, measured through the library").
 
 ## The scalar correction
 

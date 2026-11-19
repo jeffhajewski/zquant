@@ -1,5 +1,5 @@
-"""zquant against FAISS PQ, FAISS RaBitQ and sign-bit binary quantization, at matched bits
-per dimension, on prepared corpora named on the command line.
+"""zquant against FAISS PQ, FAISS RaBitQ (plain and fast-scan) and sign-bit binary
+quantization, at matched bits per dimension, on prepared corpora named on the command line.
 
     python bench/py/highdim.py cohere-768-norm openai-1536-norm fashion-mnist-784-euclidean-norm
 
@@ -90,12 +90,28 @@ for ds in sys.argv[1:]:
         (_, ids), dt = one_thread(lambda: ix.search(query, 100))
         report(ds, d, "RaBitQ", f"bits={nb}", ix.sa_code_size(), ids, dt, gt)
 
+    # FAISS's fast-scan layouts: codes in blocks of 32 vectors, scored by SIMD table lookups.
+    # These are its speed-tuned versions, and the fair comparison for throughput.
+    for nb in (1, 2, 4):
+        ix = faiss.IndexRaBitQFastScan(d, faiss.METRIC_INNER_PRODUCT, 32, nb)
+        ix.train(base)
+        ix.add(base)
+        (_, ids), dt = one_thread(lambda: ix.search(query, 100))
+        report(ds, d, "RaBitQ FS", f"bits={nb}", ix.code_size, ids, dt, gt)
+
     for m in (d // 8, d // 4, d // 2):
         ix = faiss.IndexPQ(d, m, 8, faiss.METRIC_INNER_PRODUCT)
         ix.train(base)
         ix.add(base)
         (_, ids), dt = one_thread(lambda: ix.search(query, 100))
         report(ds, d, "FAISS PQ", f"M={m},nbits=8", ix.sa_code_size(), ids, dt, gt)
+
+    for m in (d // 4, d // 2, d):  # 4-bit sub-quantizers, so 1, 2 and 4 bits per dimension
+        ix = faiss.IndexPQFastScan(d, m, 4, faiss.METRIC_INNER_PRODUCT)
+        ix.train(base)
+        ix.add(base)
+        (_, ids), dt = one_thread(lambda: ix.search(query, 100))
+        report(ds, d, "PQ FS", f"M={m},nbits=4", m / 2, ids, dt, gt)
 
 if rows:
     with open("data/highdim.csv", "w", newline="") as f:

@@ -10,6 +10,8 @@ induce the *same* ranking, so normalizing removes the metric mismatch outright.
 Usage:
     python bench/py/prepare.py                 # SIFT10K (fvecs)
     python bench/py/prepare.py nytimes-256     # an ann-benchmarks HDF5
+    python bench/py/prepare.py cohere-768      # VectorDBBench parquet (needs pyarrow);
+    python bench/py/prepare.py openai-1536     #   fetch with tools/fetch_datasets.sh highdim
 """
 import numpy as np, os, sys
 
@@ -72,9 +74,34 @@ def load_hdf5(name):
     return base, query, f"{name}-norm"
 
 
+# Real embeddings at d >= 768. VectorDBBench publishes them as parquet, one row per
+# vector with an `id` and an `emb` list column.
+PARQUET = {"cohere-768": "cohere_small_100k", "openai-1536": "openai_small_50k"}
+
+
+def load_parquet(name):
+    import pyarrow.parquet as pq
+    src = f"data/{PARQUET[name]}"
+    if not os.path.isdir(src):
+        sys.exit(f"{src} missing - run tools/fetch_datasets.sh highdim")
+
+    def emb(path):
+        table = pq.read_table(path, columns=["id", "emb"])
+        ids = table["id"].to_numpy()
+        flat = table["emb"].combine_chunks().flatten().to_numpy().astype(np.float32)
+        return flat.reshape(len(ids), -1)[np.argsort(ids)]
+
+    return emb(f"{src}/train.parquet"), emb(f"{src}/test.parquet")[:1000], f"{name}-norm"
+
+
 def main():
     which = sys.argv[1] if len(sys.argv) > 1 else "siftsmall"
-    base, query, out_name = load_siftsmall() if which == "siftsmall" else load_hdf5(which)
+    if which == "siftsmall":
+        base, query, out_name = load_siftsmall()
+    elif which in PARQUET:
+        base, query, out_name = load_parquet(which)
+    else:
+        base, query, out_name = load_hdf5(which)
 
     # Optional corpus cap, as a second argument. Corpus size is a variable worth
     # sweeping and not just a constant: per-query fixed costs amortize over the

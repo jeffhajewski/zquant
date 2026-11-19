@@ -31,3 +31,22 @@ echo "nytimes-256: ready"
 
 # ANN_SIFT1M: 1M base, 10k queries (~160 MB). Uncomment when needed.
 # fetch sift "ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz"
+
+# Real embeddings at d >= 768, from VectorDBBench's public bucket: Cohere
+# multilingual-22-12 (100k x 768, ~320 MB) and OpenAI text-embedding-ada-002 on C4
+# (50k x 1536, ~460 MB), as parquet. Only fetched when asked for, by
+# `tools/fetch_datasets.sh highdim`; `python bench/py/prepare.py cohere-768` (or
+# openai-1536) then turns them into the same prepared layout as everything else.
+if [ "${1:-}" = "highdim" ]; then
+  for corpus in cohere_small_100k openai_small_50k; do
+    mkdir -p "data/$corpus"
+    for part in train test; do
+      if [ ! -f "data/$corpus/$part.parquet" ]; then
+        echo "$corpus/$part: downloading..."
+        curl -sSL --max-time 900 -o "data/$corpus/$part.parquet" \
+          "https://assets.zilliz.com/benchmark/$corpus/$part.parquet"
+      fi
+    done
+    echo "$corpus: ready"
+  done
+fi

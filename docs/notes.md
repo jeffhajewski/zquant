@@ -2253,9 +2253,65 @@ throughput depends on things the model does not have:
    own, and IVF is built on it. Centre on a sample's mean, normalise the residual, store a
    per-vector constant for `⟨c,x−c⟩`, and use the along-vector-exact α. The scan kernels are
    untouched; the encoder, the per-vector scalars and the score epilogue change. It costs
-   one more f16 per vector (2 B), whose precision is untested, and a format version bump. It
-   would replace the quantile calibration, or at least its default. It needs measuring
-   through the library before anything is claimed for it.
+   one more f16 per vector (2 B) and a format version bump. It would replace the quantile
+   calibration. Done; the next section measures it through the library.
 2. **Then IVF, as a layer over that estimator.** It adds about as much recall again or more
    at bits=2 (cohere +5.5 points, SIFT +20), and that gain is measured here. Its speed gain
    needs a corpus of a million or more, where the coarse search is small beside the scan.
+
+### The estimator change, measured through the library
+
+`calibrate` now fits the corpus centre instead of a per-coordinate shift and scale, and the
+per-vector scalar is the along-vector-exact factor whether or not the index is calibrated.
+Saved files moved to format version 2, since version 1's scalars mean something else. The
+codes of an uncalibrated index are unchanged.
+
+R10@10 with every vector scanned, through the Python client. "Before" is the better of
+calibrated and uncalibrated in the previous release. FAISS RaBitQ is at the nearest budget,
+from the table above.
+
+| corpus | bits | before | now | now +cal | lab: centred | FAISS RaBitQ |
+|---|---|---|---|---|---|---|
+| cohere-768 | 2 | 0.711 | 0.533 | **0.750** | 0.739 | 0.738 |
+| | 3 | 0.847 | 0.738 | **0.868** | 0.869 | 0.861 |
+| | 5 | 0.954 | 0.912 | **0.960** | 0.961 | 0.952 |
+| openai-1536 | 2 | 0.769 | 0.631 | **0.792** | 0.796 | 0.786 |
+| | 3 | 0.871 | 0.800 | **0.894** | 0.893 | 0.890 |
+| | 5 | 0.960 | 0.938 | **0.967** | 0.967 | 0.962 |
+| fashion-mnist | 2 | 0.541 | 0.586 | **0.728** | 0.717 | 0.361 |
+| | 3 | 0.810 | 0.761 | **0.850** | 0.835 | 0.646 |
+| | 5 | 0.939 | 0.913 | **0.951** | 0.950 | 0.910 |
+| SIFT10K | 2 | 0.355 | 0.338 | **0.455** | 0.456 | 0.355 |
+| | 3 | 0.692 | 0.610 | **0.705** | 0.699 | 0.616 |
+| | 5 | 0.906 | 0.873 | **0.906** | 0.910 | — |
+| nytimes-256 | 2 | 0.530 | 0.534 | **0.538** | 0.544 | 0.537 |
+| | 3 | 0.743 | 0.730 | **0.742** | 0.747 | — |
+| | 5 | 0.918 | 0.915 | **0.920** | 0.916 | — |
+
+**The library lands where the lab said it would,** within 1.5 points on every row. The
+lab kept its scalars in f32 and the library stores them in f16, so half precision costs
+nothing measurable here. Calibrated, zquant now matches or passes FAISS RaBitQ at every
+matched budget on the two embedding corpora, with 2 B per vector fewer (102 B against 104 at
+Cohere's 1 bit, for example). Against the previous release it gains 2–4 points at bits=2 on
+the embeddings, 10 on SIFT and 19 on fashion-mnist, where the old calibration hurt.
+
+Uncalibrated indexes improve too, by up to 7 points at bits=2 (Cohere 0.463 → 0.533), from
+the scalar alone. Centring then adds 9 to 22 points at bits 2 and 3 on every corpus at a
+centroid norm of 0.65 or more, and about a point on nytimes at 0.12. That is why
+`calibrateAuto` keeps its 0.3 threshold: below it, the gain does not pay for the extra
+2 B per vector. The old quantile calibration needed thousands of sample rows for its tail
+quantiles. A mean does not: on Cohere and SIFT, 100 rows came within a point of 4,096.
+
+**Speed.** Uncalibrated, the score epilogue is the one it was. Calibrated, it adds two
+multiplies and two adds per (vector, query) pair, for ‖q‖·b and ‖x‖·⟨p,c⟩. Through the
+Python client, alternating the two builds, that measured 2–4% slower on nytimes (d=256,
+100k vectors) and within noise at d=768. On SIFT (d=128), where the scan is shortest and
+the epilogue's share largest, `compare_bench` measured it 4–5% slower on one thread, batched
+or not. The quantile calibration it replaces cost nothing at query time, since its scale
+folded into the rotated query.
+
+A first cut was also 10–15% slower on single-query search *uncalibrated*, because the
+one-query path tested the calibration flag per vector. Specializing that path at compile
+time on whether the index is calibrated, as the batch path already was, brought it back to
+level with the old build.
+

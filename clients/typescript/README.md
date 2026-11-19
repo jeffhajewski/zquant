@@ -169,11 +169,12 @@ Each score is what `search` would have reported for that id.
 
 ## Calibration
 
-`index.calibrate(sample)` fits a per-coordinate shift and scale, and has to come before
-any `add`. Whether it helps is predictable from one number: the norm of the mean of the
-unit-normalized vectors. Above about 0.3 expect a real gain (+11 points of recall was
-measured at 0.65); below it expect none, and on low-rank zero-mean data it has cost
-recall.
+`index.calibrate(sample)` fits the corpus centre, and has to come before any `add`. Each
+vector is then stored relative to the centre, and the centre's share of every score is
+computed exactly, for 2 more bytes per vector. Whether it helps is predictable from one
+number: the norm of the mean of the unit-normalized vectors. At 0.65 and above, where real
+embeddings sit, it gained 9 to 22 points of recall@10 at bits 2 and 3; at 0.12, about a
+point.
 
 If you don't know which side of that line your data falls, let the library measure:
 

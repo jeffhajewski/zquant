@@ -7,6 +7,18 @@
 //!
 //! ## The score
 //!
+//! Under the default `.scalar` correction, for a stored direction y = R·x/‖x‖ and the
+//! rotated query p = R·q:
+//!
+//!     ⟨q, x⟩ ≈ ‖x‖ · [ f·⟨p, ũ⟩  +  ‖q‖·b  +  ⟨p, c⟩ ]
+//!                       └ simd/scan ┘
+//!
+//! c is the corpus centre fitted by `calibrate` (zero without it), ũ the codebook
+//! reconstruction of the unit residual (y − c)/‖y − c‖, and f and b per-vector scalars
+//! (`encodeScalar`). Only the scan term is estimated; the centre's share is exact.
+//!
+//! Under `.qjl_sketch`, the paper's construction:
+//!
 //!     ⟨q, x⟩ ≈ ‖x‖ · [ ⟨p, ỹ⟩ + γ·sketch_scale·⟨S'p, qjl⟩ ]
 //!                     └ simd/scan ┘         └ simd/sketch ┘
 //!
@@ -59,18 +71,26 @@ pub const Metric = enum {
 /// the paper's construction and the reference the scalar form is checked against.
 ///
 /// MSE-optimal reconstruction shrinks ỹ, so ⟨p, ỹ⟩ underestimates ⟨p, y⟩. The paper
-/// corrects this with a 1-bit-per-coordinate QJL sketch of the residual. But over
-/// random queries the least-squares estimate of ⟨p, y⟩ from ⟨p, ỹ⟩ is simply
+/// corrects this with a 1-bit-per-coordinate QJL sketch of the residual. One scalar
+/// per *vector* does it instead:
 ///
-///     ⟨p, y⟩ ≈ (⟨y, ỹ⟩ / ‖ỹ‖²) · ⟨p, ỹ⟩
+///     ⟨p, y⟩ ≈ (‖y‖² / ⟨y, ỹ⟩) · ⟨p, ỹ⟩
 ///
-/// — one scalar per *vector*, not one bit per *coordinate*. At d=128 that is 2 bytes
-/// against 16, and the 14 bytes saved buy a whole extra bit of MSE codebook, which is
-/// exactly what a 1-bit sketch costs.
+/// At d=128 that is 2 bytes against 16, and the 14 bytes saved buy a whole extra bit
+/// of MSE codebook, which is exactly what a 1-bit sketch costs.
+///
+/// **Why this scalar and not the least-squares one.** ⟨y, ỹ⟩/‖ỹ‖² is the best fit of
+/// y from ỹ over random queries, and was used here first. The scalar above instead
+/// makes the estimate exact when p points along y. A ranking is decided among the
+/// vectors that point roughly where the query does, so that is the direction to be
+/// exact in: at bits 2 and 3 it measured up to 7 points of R@10 better, and level on
+/// nytimes-256 (docs/notes.md, "Partitioning and the low-bit gap"). It is also the unbiased one in the sense
+/// the test "scalar correction removes the estimator's bias" checks: regressing the
+/// estimate on the truth gives a slope of exactly 1. RaBitQ normalises the same way.
 pub const Correction = enum {
     /// The paper's construction: 1-bit QJL sketch of the residual.
     qjl_sketch,
-    /// Per-vector least-squares rescale. Costs one f16 instead of d bits.
+    /// Per-vector rescale. Costs one f16 instead of d bits.
     scalar,
 };
 
@@ -140,11 +160,20 @@ pub const Params = struct {
 /// Half-precision per-vector scalars. See the field comment on `FlatIndex.scalars`.
 pub const StoredScalars = struct {
     norm: f16,
+    /// Under `.scalar`, the factor f on the scanned term. Under `.qjl_sketch`, the
+    /// residual norm γ that weights the sketch.
     gamma: f16,
 
     fn from(s: prod_mod.Scalars) StoredScalars {
         return .{ .norm = @floatCast(s.norm), .gamma = @floatCast(s.gamma) };
     }
+};
+
+/// What `encodeScalar` produces for one vector.
+const ScalarCode = struct {
+    norm: f32,
+    factor: f32,
+    bias: f32,
 };
 
 /// Largest batch `searchBatch` accepts. Bounded so per-query scratch can live on the
@@ -194,7 +223,7 @@ pub const FlatIndex = struct {
     /// QJL sign bitmaps, `sketchStride()` bytes per vector — none at all unless the
     /// score reads them (see `storesSketch`).
     sketches: std.ArrayList(u8),
-    /// ‖x‖ and ‖y − ỹ‖ per vector, at half precision.
+    /// ‖x‖ and the correction scalar per vector, at half precision.
     ///
     /// f16 rather than f32 because these are per *vector*, not per coordinate, so
     /// they do not shrink with the bit budget: 8 bytes of f32 is under 2% of a
@@ -202,22 +231,22 @@ pub const FlatIndex = struct {
     /// f16 carries ~3 decimal digits, far more than needed for a scale factor whose
     /// own inputs are quantized to 4 bits.
     scalars: std.ArrayList(StoredScalars),
+    /// The per-vector bias b of a calibrated index, at half precision; empty otherwise.
+    /// Held apart from `scalars` so an uncalibrated index does not pay for it.
+    biases: std.ArrayList(f16),
 
-    /// Per-coordinate shifts for the rotated basis, length `padded`. Zero until
-    /// `calibrate` is called.
-    shifts: []f32,
-    /// Per-coordinate scales for the rotated basis, length `padded`. All ones until
-    /// `calibrate` is called.
+    /// The corpus centre c in the rotated basis, length `padded`: the mean of the
+    /// sample's rotated directions. Zero until `calibrate` is called.
     ///
-    /// A random rotation *randomizes* the axes but does not *whiten* them: after
-    /// rotation, coordinate j has variance πⱼᵀCπⱼ, which still tracks the spectrum of
-    /// the data covariance C. On SIFT that leaves a 4.3× spread (cv 0.30) across
-    /// coordinates, so one shared codebook is badly matched at both ends. Scaling each
-    /// coordinate to the variance the codebook was built for fixes that.
+    /// Each vector is stored as c plus a quantized residual, and the centre's share of
+    /// every score is computed exactly rather than estimated, so only the residual's
+    /// share carries quantization error. When the corpus sits well off the origin, as
+    /// real embeddings do, the residual is much shorter than the vector and the error
+    /// shrinks with it.
     ///
-    /// Costs `d` floats for the whole index, not per vector, and nothing at query
-    /// time: the scale folds into the rotated query.
-    scales: []f32,
+    /// Costs `d` floats for the whole index, one dot product per query, and one f16
+    /// per vector (`biases`).
+    centre: []f32,
     /// Whether `calibrate` has been run. Encoding before and after would produce
     /// incompatible codes, so adding after calibration is refused.
     calibrated: bool,
@@ -253,13 +282,9 @@ pub const FlatIndex = struct {
         const encode_scratch = try allocator.alloc(u8, quantizer.codeLen());
         errdefer allocator.free(encode_scratch);
 
-        const scales = try allocator.alloc(f32, quantizer.padded());
-        errdefer allocator.free(scales);
-        @memset(scales, 1.0);
-
-        const shifts = try allocator.alloc(f32, quantizer.padded());
-        errdefer allocator.free(shifts);
-        @memset(shifts, 0.0);
+        const centre = try allocator.alloc(f32, quantizer.padded());
+        errdefer allocator.free(centre);
+        @memset(centre, 0.0);
 
         return .{
             .params = params,
@@ -280,22 +305,22 @@ pub const FlatIndex = struct {
             .codes = .empty,
             .sketches = .empty,
             .scalars = .empty,
+            .biases = .empty,
             .workspace = workspace,
             .encode_scratch = encode_scratch,
-            .scales = scales,
-            .shifts = shifts,
+            .centre = centre,
             .calibrated = false,
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *FlatIndex) void {
-        self.allocator.free(self.shifts);
-        self.allocator.free(self.scales);
+        self.allocator.free(self.centre);
         self.allocator.free(self.encode_scratch);
         self.codes.deinit(self.allocator);
         self.sketches.deinit(self.allocator);
         self.scalars.deinit(self.allocator);
+        self.biases.deinit(self.allocator);
         self.workspace.deinit();
         self.quantizer.deinit();
         self.* = undefined;
@@ -322,9 +347,15 @@ pub const FlatIndex = struct {
     /// Total bytes of index storage per vector, scalars included.
     ///
     /// Includes them deliberately: an earlier version reported only codes and
-    /// sketch, which overstated the compression ratio by 11% at d=128.
+    /// sketch, which overstated the compression ratio by 11% at d=128. Calibrating
+    /// adds two, for the per-vector bias.
     pub fn bytesPerVector(self: FlatIndex) usize {
-        return self.codeBytesPerVector() + @sizeOf(StoredScalars);
+        return self.codeBytesPerVector() + @sizeOf(StoredScalars) + self.biasStride();
+    }
+
+    /// Bytes of bias per vector: two once calibrated, otherwise none.
+    pub fn biasStride(self: FlatIndex) usize {
+        return if (self.calibrated) @sizeOf(f16) else 0;
     }
 
     /// Bytes of codes and sketch only — the part that scales with the bit budget.
@@ -358,11 +389,12 @@ pub const FlatIndex = struct {
 
     /// Centroid norm at or above which `calibrateAuto` calibrates.
     ///
-    /// Measured with the spectrum held fixed (docs/notes.md, "The variable is the
-    /// centroid norm"): calibration gained +0.9 points of R@10 at 0.124, +3.2 at 0.410
-    /// and +11.4 at 0.648 (bits=3), and the real corpora at those norms agreed to
-    /// within half a point. On a low-rank zero-mean corpus it *cost* 3 points, which
-    /// is why it is not simply always on.
+    /// Centring removes the part of every vector the corpus shares, so what it buys
+    /// tracks how much is shared: the centroid norm. At 0.12 (nytimes-256) it gained
+    /// about a point of R@10, which does not pay for its two bytes per vector; at 0.65
+    /// and above (SIFT, fashion-mnist, Cohere, OpenAI) it gained 9 to 22 points at
+    /// bits 2 and 3. Measured through the library; see docs/notes.md, "Partitioning and
+    /// the low-bit gap".
     pub const auto_calibration_threshold: f32 = 0.3;
 
     pub const AutoCalibration = struct {
@@ -389,36 +421,29 @@ pub const FlatIndex = struct {
         return .{ .centroid_norm = c, .applied = true };
     }
 
-    /// Fit a per-coordinate `(shift, scale)` by quantile anchoring.
+    /// Fit the corpus centre from a sample: the mean of its rotated directions.
     ///
-    /// Each coordinate is mapped by `z = (y + shift) * scale` before quantizing, with
-    /// the pair chosen so the coordinate's empirical quantiles land on the codebook's
-    /// outermost centroids. The anchor probability is `P(|x| <= c_outer)` under the
-    /// canonical marginal, taken from the codebook rather than fixed.
+    /// Afterwards each vector is encoded as the centre plus a quantized residual, and
+    /// the centre's share of every score is computed exactly (see `centre`). Rows of
+    /// zero have no direction and are skipped.
     ///
-    /// Approach from turbovec (MIT, Ryan Codrai). Fitting mean and standard deviation
-    /// instead — the obvious thing, and what an earlier version here did — measures
-    /// *worse* than no calibration, because matching σ says nothing about where the
-    /// tails land relative to the outermost centroid, and everything past it collapses
-    /// into one bucket.
-    ///
-    /// **Sample size matters more than it looks.** The anchor sits at ~0.9967 for a
-    /// 4-bit codebook, so the high quantile is an order statistic a few rows from the
-    /// end: a 1024-row sample puts only ~3 rows beyond it, and the resulting fit is
-    /// dominated by tail noise. Prefer several thousand rows, and more as bit-width
-    /// rises since the anchor moves further out.
+    /// This replaced a per-coordinate (shift, scale) fitted by quantile anchoring, an
+    /// approach from turbovec. Centring with the exact centre term matched or beat it
+    /// on every corpus measured, by up to 22 points of R@10 (fashion-mnist, bits=2), and
+    /// the quantile fit on top of centring gained at most 2 points anywhere and lost up
+    /// to 3 elsewhere. A mean also needs far fewer rows than a tail quantile did: 100
+    /// rows came within a point of 4,096.
     ///
     /// Must be called before any `add`, and only with the `.scalar` correction.
     pub fn calibrate(self: *FlatIndex, sample: []const f32) !void {
         if (self.count() > 0) return error.IndexNotEmpty;
-        // The calibrated encoder writes no sketch and stores α where the sketch path
-        // expects a residual norm, and the sketch scoring has no shift term. Together
-        // that silently cost a third of recall (0.751 to 0.472, R@10 at d=128, bits=4),
-        // so the combination is refused rather than half-supported.
+        // The sketch path has no centre term and stores a residual norm where the
+        // scalar path stores its factor. Mixing them once silently cost a third of
+        // recall, so the combination is refused rather than half-supported.
         if (self.correction != .scalar) return error.CalibrationNeedsScalarCorrection;
         const d = self.dim();
         std.debug.assert(sample.len % d == 0);
-        // One NaN poisons the column sort and with it a coordinate's fitted scale.
+        // One NaN would poison the mean, and with it every score.
         if (!allFinite(sample)) return error.NonFiniteInput;
         const rows = sample.len / d;
         if (rows < 2) return error.EmptySample;
@@ -426,48 +451,21 @@ pub const FlatIndex = struct {
         const padded = self.quantizer.padded();
         const staging = try self.allocator.alloc(f32, padded);
         defer self.allocator.free(staging);
-        const rotated = try self.allocator.alloc(f32, rows * padded);
+        const rotated = try self.allocator.alloc(f32, padded);
         defer self.allocator.free(rotated);
+        const sum = try self.allocator.alloc(f64, padded);
+        defer self.allocator.free(sum);
+        @memset(sum, 0);
+
+        var used: usize = 0;
         for (0..rows) |i| {
-            _ = self.quantizer.mse.encodeRotated(
-                sample[i * d ..][0..d],
-                rotated[i * padded ..][0..padded],
-                staging,
-            );
+            const norm = self.quantizer.mse.encodeRotated(sample[i * d ..][0..d], rotated, staging);
+            if (norm == 0) continue;
+            for (sum, rotated) |*acc, y| acc.* += y;
+            used += 1;
         }
-
-        const centroids = self.quantizer.mse.codebook.centroids;
-        var outer: f32 = 0;
-        for (centroids) |c| outer = @max(outer, @abs(c));
-
-        const density = Density.sphereCoord(padded);
-        const p_hi = density.mass(density.support()[0], outer);
-        const p_lo = 1.0 - p_hi;
-
-        const frows: f64 = @floatFromInt(rows);
-        var lo_idx: usize = @intFromFloat(frows * p_lo);
-        var hi_idx: usize = @intFromFloat(frows * p_hi);
-        lo_idx = @min(lo_idx, rows - 2);
-        hi_idx = @max(@min(hi_idx, rows - 1), lo_idx + 1);
-
-        const column = try self.allocator.alloc(f32, rows);
-        defer self.allocator.free(column);
-
-        for (0..padded) |j| {
-            for (0..rows) |i| column[i] = rotated[i * padded + j];
-            std.mem.sort(f32, column, {}, std.sort.asc(f32));
-
-            const q_lo = column[lo_idx];
-            const q_hi = column[hi_idx];
-            const span = q_hi - q_lo;
-            if (!(span > 1e-20) or outer <= 0) {
-                self.shifts[j] = 0;
-                self.scales[j] = 1;
-                continue;
-            }
-            self.scales[j] = 2.0 * outer / span;
-            self.shifts[j] = -0.5 * (q_lo + q_hi);
-        }
+        const scale: f64 = if (used > 0) 1 / @as(f64, @floatFromInt(used)) else 0;
+        for (self.centre, sum) |*c, acc| c.* = @floatCast(acc * scale);
         self.calibrated = true;
     }
 
@@ -475,6 +473,7 @@ pub const FlatIndex = struct {
         try self.codes.ensureUnusedCapacity(self.allocator, additional * self.codeStride());
         try self.sketches.ensureUnusedCapacity(self.allocator, additional * self.sketchStride());
         try self.scalars.ensureUnusedCapacity(self.allocator, additional);
+        if (self.calibrated) try self.biases.ensureUnusedCapacity(self.allocator, additional);
     }
 
     /// Encode and append one vector. Returns its id.
@@ -500,6 +499,7 @@ pub const FlatIndex = struct {
         @memset(self.codes.addManyAsSliceAssumeCapacity(n * self.codeStride()), 0);
         @memset(self.sketches.addManyAsSliceAssumeCapacity(n * self.sketchStride()), 0);
         _ = self.scalars.addManyAsSliceAssumeCapacity(n);
+        if (self.calibrated) _ = self.biases.addManyAsSliceAssumeCapacity(n);
     }
 
     /// Encode `vector` into the already-allocated slot `id`.
@@ -516,12 +516,20 @@ pub const FlatIndex = struct {
 
         // Encode into scratch, then pack. The quantizer emits one byte per
         // coordinate; storage wants them bit-packed.
-        var scalars = if (self.calibrated)
-            self.encodeCalibrated(vector, scratch, ws)
-        else if (self.storesSketch())
-            self.quantizer.encode(vector, scratch, sketch_slot, ws)
-        else
-            self.quantizer.encodeCodes(vector, scratch, ws);
+        switch (self.correction) {
+            .scalar => {
+                const code = self.encodeScalar(vector, scratch, ws);
+                self.scalars.items[id] = .{ .norm = @floatCast(code.norm), .gamma = @floatCast(code.factor) };
+                if (self.calibrated) self.biases.items[id] = @floatCast(code.bias);
+            },
+            .qjl_sketch => {
+                const scalars = if (self.storesSketch())
+                    self.quantizer.encode(vector, scratch, sketch_slot, ws)
+                else
+                    self.quantizer.encodeCodes(vector, scratch, ws);
+                self.scalars.items[id] = StoredScalars.from(scalars);
+            },
+        }
 
         switch (self.residency) {
             .compact => self.layout.pack(scratch, codes_slot),
@@ -535,56 +543,60 @@ pub const FlatIndex = struct {
                 @memset(codes_slot[scratch.len..], 0);
             },
         }
-
-        // Only for the uncalibrated path: `encodeCalibrated` already returns α, and
-        // running this over it treats that α as a residual norm and halves it.
-        if (self.correction == .scalar and !self.calibrated) {
-            // α = ⟨y, ỹ⟩ / ‖ỹ‖², stored in gamma's slot since the sketch is unused.
-            // ⟨y, ỹ⟩ = (‖y‖² + ‖ỹ‖² − ‖y−ỹ‖²)/2, and ‖y‖ = 1 after normalization.
-            const centroids = self.quantizer.mse.codebook.centroids;
-            var recon_sq: f64 = 0;
-            for (scratch, self.scales) |code, t| {
-                // r̃_j = t_j · c[code_j], so the scale enters here too.
-                const c: f64 = @as(f64, centroids[code]) * t;
-                recon_sq += c * c;
-            }
-            const residual_sq: f64 = @as(f64, scalars.gamma) * scalars.gamma;
-            // ⟨y,ỹ⟩ = (‖y‖² + ‖ỹ‖² − ‖y−ỹ‖²)/2, with ‖y‖ = 1 after normalization.
-            const dot = (1.0 + recon_sq - residual_sq) * 0.5;
-            scalars.gamma = if (recon_sq > 0) @floatCast(dot / recon_sq) else 1.0;
-        }
-
-        self.scalars.items[id] = StoredScalars.from(scalars);
     }
 
-    /// Rotate, rescale by the fitted per-coordinate scales, and encode.
+    /// Encode one vector for the `.scalar` correction.
     ///
-    /// `gamma` comes back as the residual norm in the rotated basis, matching what
-    /// `Prod.encode` returns, so the α computation downstream is unchanged.
-    fn encodeCalibrated(self: *const FlatIndex, vector: []const f32, codes: []u8, ws: *prod_mod.Workspace) prod_mod.Scalars {
+    /// With y = R·x/‖x‖ and the centre c (zero unless calibrated), the residual
+    /// r = y − c is quantized as a unit vector, u = r/‖r‖, giving codes whose
+    /// reconstruction is ũ. Then
+    ///
+    ///     ⟨p, y⟩ = ⟨p, c⟩ + ⟨c, r⟩ + ⟨p − c, r⟩
+    ///            ≈ ⟨p, c⟩ + ⟨c, r⟩ + f·⟨p − c, ũ⟩          f = ‖r‖² / ⟨r, ũ⟩
+    ///            = f·⟨p, ũ⟩ + b + ⟨p, c⟩                   b = ⟨c, r⟩ − f·⟨c, ũ⟩
+    ///
+    /// The first two terms of the split are exact: one per query, one per vector. Only
+    /// ⟨p − c, r⟩ is estimated, and f makes that estimate exact when p − c points
+    /// along r. For a query of any length the split uses p/‖p‖, so the score scales
+    /// b by ‖q‖ (`queryTerms`).
+    ///
+    /// Uncalibrated, c = 0 and b = 0, and y is quantized as it stands rather than
+    /// renormalized, so the codes are exactly the quantizer's.
+    fn encodeScalar(self: *const FlatIndex, vector: []const f32, codes: []u8, ws: *prod_mod.Workspace) ScalarCode {
         const norm = self.quantizer.mse.encodeRotated(vector, ws.rotated, ws.staging);
-
-        // z = (y + shift) · scale, quantized against the shared codebook.
-        for (ws.staging, ws.rotated, self.shifts, self.scales) |*z, y, sh, sc| {
-            z.* = (y + sh) * sc;
+        const residual = if (self.calibrated) ws.residual else ws.rotated;
+        var rr: f64 = 0;
+        if (self.calibrated) {
+            for (ws.residual, ws.rotated, self.centre) |*r, y, c| r.* = y - c;
         }
-        self.quantizer.mse.codebook.encodeSlice(ws.staging, codes);
+        for (residual) |r| rr += @as(f64, r) * r;
 
-        // α is a least squares fit of the rotated vector against its reconstruction
-        // in the *original* basis, x̂_j = c_j/scale_j − shift_j. Fitting in the
-        // shifted basis instead — y+shift against c/scale — makes α a near-tautology:
-        // both sides then contain the shift, which dominates, so α ≈ 1 no matter how
-        // coarse the codes are and the correction silently does nothing.
-        const centroids = self.quantizer.mse.codebook.centroids;
-        var recon_sq: f64 = 0;
-        var dot: f64 = 0;
-        for (codes, ws.rotated, self.shifts, self.scales) |code, y, sh, sc| {
-            const x_hat = @as(f64, centroids[code]) / sc - sh;
-            recon_sq += x_hat * x_hat;
-            dot += @as(f64, y) * x_hat;
+        if (self.calibrated) {
+            // Quantized as a unit vector, which is what the codebook is built for.
+            const inv: f32 = if (rr > 0) @floatCast(1 / @sqrt(rr)) else 0;
+            for (ws.staging, residual) |*u, r| u.* = r * inv;
+            self.quantizer.mse.codebook.encodeSlice(ws.staging, codes);
+        } else {
+            self.quantizer.mse.codebook.encodeSlice(residual, codes);
         }
-        const alpha = if (recon_sq > 0) dot / recon_sq else 1.0;
-        return .{ .norm = norm, .gamma = @floatCast(alpha) };
+
+        const levels = self.quantizer.mse.codebook.centroids;
+        var ru: f64 = 0;
+        var cr: f64 = 0;
+        var cu: f64 = 0;
+        for (codes, residual, self.centre) |code, r, c| {
+            const u: f64 = levels[code];
+            ru += r * u;
+            cr += @as(f64, c) * r;
+            cu += @as(f64, c) * u;
+        }
+        // ⟨r, ũ⟩ > 0 for any nonzero r: each coordinate's nearest level has its sign.
+        const factor: f64 = if (rr > 0 and ru > 0) rr / ru else 0;
+        return .{
+            .norm = norm,
+            .factor = @floatCast(factor),
+            .bias = @floatCast(cr - factor * cu),
+        };
     }
 
     /// Append `n` vectors from a row-major buffer.
@@ -839,26 +851,8 @@ pub const FlatIndex = struct {
             }
         }
 
-        var shift_terms: [max_batch]f32 = @splat(0);
-        if (self.calibrated) {
-            for (0..n) |i| {
-                var acc: f64 = 0;
-                for (searcher.query_states[i].rotated, self.shifts) |p, sh| {
-                    acc += @as(f64, p) * sh;
-                }
-                shift_terms[i] = @floatCast(-acc);
-            }
-        }
-
-        if (self.calibrated) {
-            for (0..n) |i| {
-                for (searcher.query_states[i].rotated, self.scales) |*p, sc| p.* /= sc;
-            }
-        }
         for (0..n) |i| {
-            if (self.vectorized()) {
-                searcher.scan_queries[i].load(searcher.query_states[i].rotated);
-            }
+            if (use_simd) searcher.scan_queries[i].load(searcher.query_states[i].rotated);
         }
 
         var collectors: [max_batch]topk.TopK = undefined;
@@ -876,7 +870,7 @@ pub const FlatIndex = struct {
 
         const query_norms = blk: {
             var norms: [max_batch]f32 = undefined;
-            if (self.metric != .inner_product) {
+            if (self.metric != .inner_product or self.calibrated) {
                 for (0..n) |i| norms[i] = euclideanNorm(queries[i * d ..][0..d]);
             } else {
                 @memset(norms[0..n], 0);
@@ -886,10 +880,14 @@ pub const FlatIndex = struct {
         // The per-query half of `scalarScore`, laid out as lanes for the epilogue.
         var query_factor: [max_batch]f32 = undefined;
         var query_offset: [max_batch]f32 = undefined;
+        var query_bias: [max_batch]f32 = @splat(0);
+        var query_centre: [max_batch]f32 = @splat(0);
         for (0..n) |i| {
-            const terms = queryTerms(self.metric, query_norms[i]);
+            const terms = self.queryTermsFor(query_norms[i], searcher.query_states[i].rotated);
             query_factor[i] = terms.factor;
             query_offset[i] = terms.offset;
+            query_bias[i] = terms.bias;
+            query_centre[i] = terms.centre;
         }
 
         const stride = self.codeStride();
@@ -907,7 +905,7 @@ pub const FlatIndex = struct {
         // all three are fixed for the whole index.
         //
         // Every metric qualifies: under the scalar correction each one is an affine map
-        // of the shifted MSE term with per-vector and per-query coefficients
+        // of the scanned term with per-vector and per-query coefficients
         // (`scalarScore`), so cosine and L2 reject a lane group as cheaply as inner
         // product does. They used to take the per-pair path, and measured about half
         // inner product's throughput for it.
@@ -994,6 +992,7 @@ pub const FlatIndex = struct {
                 const sketch_slot = self.sketches.items[v * sketch_len ..][0..sketch_len];
                 const norm: f32 = scalars.norm;
                 const gamma: f32 = scalars.gamma;
+                const bias: f32 = if (self.calibrated) self.biases.items[v] else 0;
 
                 // Split on the correction outside the query loop rather than
                 // switching per pair: it is fixed for the whole index.
@@ -1009,49 +1008,68 @@ pub const FlatIndex = struct {
                     // `searchBatch`'s 133, and the gap is the per-pair scalar work
                     // rather than the top-k structure.
                     const block = mse_block[u * max_batch ..][0..n];
-                    const vt = vectorTerms(self.metric, norm, gamma);
+                    const vt = vectorTerms(self.metric, norm, gamma, bias);
                     const av: Lane = @splat(vt.factor);
                     const bv: Lane = @splat(vt.offset);
+                    const biv: Lane = @splat(vt.bias);
+                    const cv: Lane = @splat(vt.centre);
 
                     var i: usize = 0;
-                    // Inner product's query coefficients are 1 and 0, so its lanes skip
-                    // loading them; specialized at compile time, it is the loop it was
-                    // before cosine and L2 joined (which cost it 3.5% unspecialized).
-                    switch (self.metric == .inner_product) {
-                        inline else => |plain| while (i + lanes <= n) : (i += lanes) {
-                            const m: Lane = block[i..][0..lanes].*;
-                            const sh: Lane = shift_terms[i..][0..lanes].*;
-                            const th: Lane = thresholds[i..][0..lanes].*;
-                            // `scalarScore`, lane by lane and in the same order, so the
-                            // result is bit-identical to the scalar paths. For inner
-                            // product (f·1)·t + (0+0) is f·t exactly.
-                            const sc = if (plain) av * (sh + m) else blk: {
-                                const qf: Lane = query_factor[i..][0..lanes].*;
-                                const qc: Lane = query_offset[i..][0..lanes].*;
-                                break :blk (av * qf) * (sh + m) + (bv + qc);
-                            };
-                            // Visit only the lanes that actually passed. Descending into
-                            // all `lanes` on any hit costs eight unpredictable branches to
-                            // service what is almost always a single accept, and hits get
-                            // steadily more frequent as k rises and thresholds fall — which
-                            // is where the cost of retrieval depth lives.
-                            var mask: LaneMask = @bitCast(sc > th);
-                            if (mask == 0) continue;
-                            const each: [lanes]f32 = sc;
-                            while (mask != 0) {
-                                const j = @ctz(mask);
-                                mask &= mask - 1;
-                                const q = i + j;
-                                hot[q][hot_len[q]] = .{ .id = @intCast(v), .score = each[j] };
-                                hot_len[q] += 1;
-                                if (hot_len[q] == hot_slots) {
-                                    flushHot(&collectors[q], &hot[q], &hot_len[q], &thresholds[q]);
+                    // Inner product's query factor and offset are 1 and 0, so its lanes
+                    // skip loading them, and an uncalibrated index has no centre terms;
+                    // specialized at compile time, the plainest case is the loop it was
+                    // before the other metrics joined (which cost it 3.5% unspecialized).
+                    const plain_now = self.metric == .inner_product;
+                    switch (plain_now) {
+                        inline else => |plain| switch (self.calibrated) {
+                            inline else => |centred| while (i + lanes <= n) : (i += lanes) {
+                                const m: Lane = block[i..][0..lanes].*;
+                                const th: Lane = thresholds[i..][0..lanes].*;
+                                // `scalarScore`, lane by lane and in the same order, so
+                                // the result is bit-identical to the scalar paths. For
+                                // inner product (f·1)·t + (0+0) is f·t exactly.
+                                const scaled = if (plain) av * m else blk: {
+                                    const qf: Lane = query_factor[i..][0..lanes].*;
+                                    break :blk (av * qf) * m;
+                                };
+                                const shared = if (centred) blk: {
+                                    const qb: Lane = query_bias[i..][0..lanes].*;
+                                    const qc: Lane = query_centre[i..][0..lanes].*;
+                                    break :blk scaled + (biv * qb + cv * qc);
+                                } else scaled;
+                                const sc = if (plain) shared else blk: {
+                                    const qo: Lane = query_offset[i..][0..lanes].*;
+                                    break :blk shared + (bv + qo);
+                                };
+                                // Visit only the lanes that actually passed. Descending
+                                // into all `lanes` on any hit costs eight unpredictable
+                                // branches to service what is almost always a single
+                                // accept, and hits get steadily more frequent as k rises
+                                // and thresholds fall — which is where the cost of
+                                // retrieval depth lives.
+                                var mask: LaneMask = @bitCast(sc > th);
+                                if (mask == 0) continue;
+                                const each: [lanes]f32 = sc;
+                                while (mask != 0) {
+                                    const j = @ctz(mask);
+                                    mask &= mask - 1;
+                                    const q = i + j;
+                                    hot[q][hot_len[q]] = .{ .id = @intCast(v), .score = each[j] };
+                                    hot_len[q] += 1;
+                                    if (hot_len[q] == hot_slots) {
+                                        flushHot(&collectors[q], &hot[q], &hot_len[q], &thresholds[q]);
+                                    }
                                 }
-                            }
+                            },
                         },
                     }
                     while (i < n) : (i += 1) {
-                        const sc = scalarScore(vt, .{ .factor = query_factor[i], .offset = query_offset[i] }, shift_terms[i] + block[i]);
+                        const sc = self.scalarScoreFor(vt, .{
+                            .factor = query_factor[i],
+                            .offset = query_offset[i],
+                            .bias = query_bias[i],
+                            .centre = query_centre[i],
+                        }, block[i]);
                         if (sc > thresholds[i]) {
                             collectors[i].offer(sc, @intCast(v));
                             thresholds[i] = collectors[i].threshold();
@@ -1061,9 +1079,14 @@ pub const FlatIndex = struct {
                     // Heaps not yet full: everything is admitted, so there is nothing
                     // to reject early and the scalar path is the whole job.
                     const block = mse_block[u * max_batch ..][0..n];
-                    const vt = vectorTerms(self.metric, norm, gamma);
+                    const vt = vectorTerms(self.metric, norm, gamma, bias);
                     for (0..n) |i| {
-                        const sc = scalarScore(vt, .{ .factor = query_factor[i], .offset = query_offset[i] }, shift_terms[i] + block[i]);
+                        const sc = self.scalarScoreFor(vt, .{
+                            .factor = query_factor[i],
+                            .offset = query_offset[i],
+                            .bias = query_bias[i],
+                            .centre = query_centre[i],
+                        }, block[i]);
                         collectors[i].offer(sc, @intCast(v));
                         thresholds[i] = collectors[i].threshold();
                     }
@@ -1074,10 +1097,15 @@ pub const FlatIndex = struct {
                         scan.scoreExact(self.layout, centroids, searcher.query_states[i].rotated, code_slot);
 
                     const sc = switch (self.correction) {
-                        .scalar => scalarScore(
-                            vectorTerms(self.metric, norm, gamma),
-                            .{ .factor = query_factor[i], .offset = query_offset[i] },
-                            shift_terms[i] + mse_term,
+                        .scalar => self.scalarScoreFor(
+                            vectorTerms(self.metric, norm, gamma, bias),
+                            .{
+                                .factor = query_factor[i],
+                                .offset = query_offset[i],
+                                .bias = query_bias[i],
+                                .centre = query_centre[i],
+                            },
+                            mse_term,
                         ),
                         .qjl_sketch => blk: {
                             const sketch_term = if (!self.use_sketch)
@@ -1272,9 +1300,14 @@ pub const FlatIndex = struct {
                 block[u] = self.mseTermAt(v0 + u, prepared, searcher);
             }
 
-            for (0..take) |u| {
-                const i = v0 + u;
-                collector.offer(self.finishScore(i, block[u], prepared, searcher), @intCast(i));
+            // Specialized on calibration at compile time: an uncalibrated index has no
+            // bias to load or centre terms to add, and testing for them per vector
+            // cost this loop 10–15% at d=128, where a vector is only a few SDOTs.
+            switch (self.calibrated) {
+                inline else => |centred| for (0..take) |u| {
+                    const i = v0 + u;
+                    collector.offer(self.finishScore(centred, i, block[u], prepared, searcher), @intCast(i));
+                },
             }
         }
 
@@ -1296,12 +1329,15 @@ pub const FlatIndex = struct {
         std.debug.assert(ids.len == out.len);
         for (ids) |id| if (id >= self.count()) return error.IdOutOfRange;
         const prepared = self.prepareSingle(query, searcher);
-        for (ids, out) |id, *o| o.* = self.finishScore(id, self.mseTermAt(id, prepared, searcher), prepared, searcher);
+        switch (self.calibrated) {
+            inline else => |centred| for (ids, out) |id, *o| {
+                o.* = self.finishScore(centred, id, self.mseTermAt(id, prepared, searcher), prepared, searcher);
+            },
+        }
     }
 
     /// Per-query state shared by `search` and `scoreIds`, beyond what `searcher` holds.
     const Prepared = struct {
-        shift_term: f32,
         use_simd: bool,
         query_norm: f32,
         query_terms: QueryTerms,
@@ -1317,31 +1353,20 @@ pub const FlatIndex = struct {
         } else {
             self.quantizer.prepareQueryRotated(query, &searcher.query_state, &searcher.workspace);
         }
-        // ⟨p, ỹ⟩ = Σ (p_j/scale_j)·c[code_j] − ⟨p, shift⟩; the second term is the
-        // same for every vector and cannot reorder them, but is included so scores
-        // are real inner-product estimates.
-        var shift_term: f32 = 0;
-        if (self.calibrated) {
-            var acc: f64 = 0;
-            for (searcher.query_state.rotated, self.shifts) |p, sh| acc += @as(f64, p) * sh;
-            shift_term = @floatCast(-acc);
-            for (searcher.query_state.rotated, self.scales) |*p, sc| p.* /= sc;
-        }
         const use_simd = self.vectorized();
         if (use_simd) {
             searcher.scan_query.load(searcher.query_state.rotated);
             if (self.storesSketch()) searcher.sketch_query.load(searcher.query_state.sketched);
         }
 
-        const query_norm = if (self.metric == .cosine or self.metric == .l2)
+        const query_norm = if (self.metric != .inner_product or self.calibrated)
             euclideanNorm(query)
         else
             0;
         return .{
-            .shift_term = shift_term,
             .use_simd = use_simd,
             .query_norm = query_norm,
-            .query_terms = queryTerms(self.metric, query_norm),
+            .query_terms = self.queryTermsFor(query_norm, searcher.query_state.rotated),
         };
     }
 
@@ -1366,15 +1391,19 @@ pub const FlatIndex = struct {
     }
 
     /// The reported score of stored vector `i`, given its MSE term.
-    inline fn finishScore(self: *const FlatIndex, i: usize, mse_term: f32, prepared: Prepared, searcher: *const Searcher) f32 {
+    /// `centred` must equal `self.calibrated`; it is a parameter so callers can hoist
+    /// the test out of their loop.
+    inline fn finishScore(self: *const FlatIndex, comptime centred: bool, i: usize, mse_term: f32, prepared: Prepared, searcher: *const Searcher) f32 {
+        std.debug.assert(centred == self.calibrated);
         const scalars = self.scalars.items[i];
         const norm: f32 = scalars.norm;
         const gamma: f32 = scalars.gamma;
         return switch (self.correction) {
             .scalar => scalarScore(
-                vectorTerms(self.metric, norm, gamma),
+                centred,
+                vectorTerms(self.metric, norm, gamma, if (centred) self.biases.items[i] else 0),
                 prepared.query_terms,
-                prepared.shift_term + mse_term,
+                mse_term,
             ),
             .qjl_sketch => blk: {
                 const sketch_len = self.sketchStride();
@@ -1389,6 +1418,24 @@ pub const FlatIndex = struct {
                 break :blk self.score(estimate, norm, prepared.query_norm);
             },
         };
+    }
+
+    /// The per-query coefficients of `scalarScore` for a query of norm `query_norm`
+    /// whose rotation is `rotated`. The centre's share, ⟨p, c⟩, is one dot product
+    /// per query, and only a calibrated index has one.
+    fn queryTermsFor(self: *const FlatIndex, query_norm: f32, rotated: []const f32) QueryTerms {
+        var centre_dot: f32 = 0;
+        if (self.calibrated) {
+            var acc: f64 = 0;
+            for (rotated, self.centre) |p, c| acc += @as(f64, p) * c;
+            centre_dot = @floatCast(acc);
+        }
+        return queryTerms(self.metric, query_norm, centre_dot);
+    }
+
+    /// `scalarScore`, with the centre terms included only when the index has them.
+    inline fn scalarScoreFor(self: *const FlatIndex, v: VectorTerms, q: QueryTerms, t: f32) f32 {
+        return if (self.calibrated) scalarScore(true, v, q, t) else scalarScore(false, v, q, t);
     }
 
     /// Map an inner-product estimate onto the metric, always larger-is-better. The
@@ -1438,52 +1485,66 @@ pub fn centroidNorm(allocator: Allocator, sample: []const f32, dim: usize) Alloc
 }
 
 /// Per-vector coefficients of `scalarScore`.
-const VectorTerms = struct { factor: f32, offset: f32 };
+const VectorTerms = struct { factor: f32, offset: f32, bias: f32, centre: f32 };
 /// Per-query coefficients of `scalarScore`.
-const QueryTerms = struct { factor: f32, offset: f32 };
+const QueryTerms = struct { factor: f32, offset: f32, bias: f32, centre: f32 };
 
-/// The `.scalar`-correction score for any metric, as one affine map of the shifted
-/// MSE term `t = shift + ⟨p, ỹ⟩`:
+/// The `.scalar`-correction score for any metric, given the scanned term t = ⟨p, ũ⟩:
 ///
-///     score = (v.factor · q.factor) · t + (v.offset + q.offset)
+///     score = (v.factor·q.factor)·t + (v.bias·q.bias + v.centre·q.centre)
+///             + (v.offset + q.offset)
 ///
-/// With the estimate `e = norm·γ·t` of ⟨q, x⟩:
+/// The estimate of ⟨q, x/‖x‖⟩ is e = f·t + ‖q‖·b + ⟨p, c⟩ (`encodeScalar`), and
+/// with n = ‖x‖:
 ///
-///     inner product   e                       = (norm·γ)·t
-///     cosine          e / (norm·‖q‖)          = (γ · 1/‖q‖)·t
-///     l2              −(‖q‖² + norm² − 2e)    = (2·norm·γ)·t − norm² − ‖q‖²
+///     inner product   n·e                   factor n·f, bias n·b, centre n
+///     cosine          e / ‖q‖               factor f/‖q‖, bias b, centre ⟨p,c⟩/‖q‖
+///     l2              −(‖q‖² + n² − 2n·e)   factor 2n·f, bias 2n·b, centre 2n,
+///                                           offset −n² − ‖q‖²
 ///
-/// Splitting the coefficients by who owns them is what lets the batch epilogue score
-/// a whole lane group of queries against one vector with a multiply and an add, for
-/// every metric rather than inner product alone. Every path that scores `.scalar`
-/// calls this, or evaluates it lane-wise in this exact order, so batched and
-/// single-query scores stay bit-identical.
+/// with each coefficient split between the vector and the query that own it, and the
+/// query side holding ‖q‖ (as `bias`) and ⟨p, c⟩ (as `centre`). Splitting them by owner
+/// is what lets the batch epilogue score a whole lane group of queries against one
+/// vector with a few multiplies and adds, for every metric rather than inner product
+/// alone. Every path that scores `.scalar` calls this, or evaluates it lane-wise in this
+/// exact order, so batched and single-query scores stay bit-identical.
+///
+/// Uncalibrated, b and c are zero, and `centred = false` drops their terms rather than
+/// adding zeros: the score is then the affine map it was before centring existed.
 ///
 /// A zero vector or zero query has no direction under cosine and scores −inf, as
-/// `score` does: its factor is zero and its offset −inf.
-inline fn scalarScore(v: VectorTerms, q: QueryTerms, t: f32) f32 {
-    return (v.factor * q.factor) * t + (v.offset + q.offset);
+/// `score` does: its factor and centre terms are zero and its offset −inf.
+inline fn scalarScore(comptime centred: bool, v: VectorTerms, q: QueryTerms, t: f32) f32 {
+    const scaled = (v.factor * q.factor) * t;
+    const shared = if (centred) scaled + (v.bias * q.bias + v.centre * q.centre) else scaled;
+    return shared + (v.offset + q.offset);
 }
 
-fn vectorTerms(metric: Metric, norm: f32, gamma: f32) VectorTerms {
+inline fn vectorTerms(metric: Metric, norm: f32, factor: f32, bias: f32) VectorTerms {
     return switch (metric) {
-        .inner_product => .{ .factor = norm * gamma, .offset = 0 },
+        .inner_product => .{ .factor = norm * factor, .offset = 0, .bias = norm * bias, .centre = norm },
         .cosine => if (norm > 0)
-            .{ .factor = gamma, .offset = 0 }
+            .{ .factor = factor, .offset = 0, .bias = bias, .centre = 1 }
         else
-            .{ .factor = 0, .offset = -std.math.inf(f32) },
-        .l2 => .{ .factor = 2 * norm * gamma, .offset = -(norm * norm) },
+            .{ .factor = 0, .offset = -std.math.inf(f32), .bias = 0, .centre = 0 },
+        .l2 => .{
+            .factor = 2 * norm * factor,
+            .offset = -(norm * norm),
+            .bias = 2 * norm * bias,
+            .centre = 2 * norm,
+        },
     };
 }
 
-fn queryTerms(metric: Metric, query_norm: f32) QueryTerms {
+/// `centre_dot` is ⟨p, c⟩, zero for an uncalibrated index.
+fn queryTerms(metric: Metric, query_norm: f32, centre_dot: f32) QueryTerms {
     return switch (metric) {
-        .inner_product => .{ .factor = 1, .offset = 0 },
+        .inner_product => .{ .factor = 1, .offset = 0, .bias = query_norm, .centre = centre_dot },
         .cosine => if (query_norm > 0)
-            .{ .factor = 1 / query_norm, .offset = 0 }
+            .{ .factor = 1 / query_norm, .offset = 0, .bias = 1, .centre = centre_dot / query_norm }
         else
-            .{ .factor = 0, .offset = -std.math.inf(f32) },
-        .l2 => .{ .factor = 1, .offset = -(query_norm * query_norm) },
+            .{ .factor = 0, .offset = -std.math.inf(f32), .bias = 0, .centre = 0 },
+        .l2 => .{ .factor = 1, .offset = -(query_norm * query_norm), .bias = query_norm, .centre = centre_dot },
     };
 }
 
@@ -2050,17 +2111,16 @@ test "scalar correction removes the estimator's bias" {
     try testing.expectApproxEqAbs(@as(f64, 1.0), cross / truth_sq, 0.05);
 }
 
-test "calibration fits per-coordinate scales and improves recall" {
-    // A random rotation randomizes the axes but does not whiten them, so after
-    // rotation coordinate j keeps variance πⱼᵀCπⱼ. On anisotropic data that leaves a
-    // wide spread and one shared codebook is badly matched at both ends.
+test "centring improves recall on an off-centre corpus" {
+    // Real embeddings sit well off the origin, so much of every vector is shared.
+    // Centring stores only the part that is not, and computes the shared part's share
+    // of each score exactly.
     const allocator = testing.allocator;
     const dim: u32 = 256;
     const n = 1200;
 
-    // Deliberately anisotropic: energy concentrated in a low-dimensional subspace,
-    // which is what real embeddings look like and what the uniform-sphere analysis
-    // does not cover.
+    // Off-centre and anisotropic: a common offset plus energy concentrated in a
+    // low-dimensional subspace, which is what real embeddings look like.
     const corpus = try allocator.alloc(f32, n * dim);
     defer allocator.free(corpus);
     var prng = std.Random.DefaultPrng.init(0xA15E);
@@ -2069,33 +2129,35 @@ test "calibration fits per-coordinate scales and improves recall" {
         const row = corpus[i * dim ..][0..dim];
         for (row, 0..) |*v, j| {
             const decay = 1.0 / (1.0 + @as(f32, @floatFromInt(j)) * 0.08);
-            v.* = random.floatNorm(f32) * decay;
+            v.* = random.floatNorm(f32) * decay + 0.15;
         }
         const len = euclideanNorm(row);
         for (row) |*v| v.* /= len;
     }
 
-    var plain = try FlatIndex.init(allocator, .{ .dim = dim, .bits = 5, .seed = 2 });
+    var plain = try FlatIndex.init(allocator, .{ .dim = dim, .bits = 3, .seed = 2 });
     defer plain.deinit();
     try plain.addBatch(corpus);
 
-    var fitted = try FlatIndex.init(allocator, .{ .dim = dim, .bits = 5, .seed = 2 });
+    var fitted = try FlatIndex.init(allocator, .{ .dim = dim, .bits = 3, .seed = 2 });
     defer fitted.deinit();
     try fitted.calibrate(corpus[0 .. 512 * dim]);
     try fitted.addBatch(corpus);
 
-    // The fit must actually find structure, or the comparison is vacuous.
-    var spread: f32 = 0;
-    for (fitted.scales) |t| spread = @max(spread, @abs(t - 1.0));
-    try testing.expect(spread > 0.1);
+    // The fit must actually find the offset, or the comparison is vacuous. The centre
+    // is a mean of unit directions, so its norm is the sample's centroid norm.
+    var sq: f64 = 0;
+    for (fitted.centre) |c| sq += @as(f64, c) * c;
+    const want = try centroidNorm(allocator, corpus[0 .. 512 * dim], dim);
+    try testing.expectApproxEqAbs(want, @as(f32, @floatCast(@sqrt(sq))), 1e-4);
+    try testing.expect(want > 0.5);
 
-    // Storage is unchanged: the scales are per index, not per vector.
-    try testing.expectEqual(plain.bytesPerVector(), fitted.bytesPerVector());
+    // Two bytes more per vector: the bias.
+    try testing.expectEqual(plain.bytesPerVector() + 2, fitted.bytesPerVector());
 
     const query = try allocator.alloc(f32, dim);
     defer allocator.free(query);
-    var hits_plain: usize = 0;
-    var hits_fitted: usize = 0;
+    var hits = [2]usize{ 0, 0 };
     const trials = 100;
 
     for ([_]*FlatIndex{ &plain, &fitted }, 0..) |index, which| {
@@ -2103,7 +2165,9 @@ test "calibration fits per-coordinate scales and improves recall" {
         defer searcher.deinit();
         var qprng = std.Random.DefaultPrng.init(31);
         for (0..trials) |_| {
-            randomUnit(query, qprng.random());
+            // Queries from the same distribution as the corpus.
+            const src = corpus[qprng.random().uintLessThan(usize, n) * dim ..][0..dim];
+            for (query, src) |*q, x| q.* = x + 0.05 * qprng.random().floatNorm(f32);
             var best: u32 = 0;
             var best_score: f64 = -std.math.inf(f64);
             for (0..n) |i| {
@@ -2116,13 +2180,13 @@ test "calibration fits per-coordinate scales and improves recall" {
             }
             for (index.search(query, &searcher)) |e| {
                 if (e.id == best) {
-                    if (which == 0) hits_plain += 1 else hits_fitted += 1;
+                    hits[which] += 1;
                     break;
                 }
             }
         }
     }
-    try testing.expect(hits_fitted >= hits_plain);
+    try testing.expect(hits[1] >= hits[0]);
 }
 
 test "calibrate refuses to run on a non-empty index" {
@@ -2140,7 +2204,7 @@ test "calibrate refuses to run on a non-empty index" {
 
 test "batched search agrees with single-query search" {
     // Same scores, same order, same ids. The batch path reorders the loops for
-    // locality; it must not change a result.
+    // locality and scores lane groups at a time; it must not change a result.
     const allocator = testing.allocator;
     const dim: u32 = 128;
     const n = 800;
@@ -2149,9 +2213,10 @@ test "batched search agrees with single-query search" {
     defer allocator.free(corpus);
     var prng = std.Random.DefaultPrng.init(0xBA7C);
     const random = prng.random();
-    for (0..n) |i| randomUnit(corpus[i * dim ..][0..dim], random);
+    // Off-centre, with varied norms, so every term of the score is live.
+    offCentreRows(corpus, dim, random);
 
-    for ([_]Metric{ .inner_product, .cosine, .l2 }) |metric| {
+    for ([_]Metric{ .inner_product, .cosine, .l2 }) |metric| for ([_]bool{ false, true }) |calibrate| {
         var index = try FlatIndex.init(allocator, .{
             .dim = dim,
             .bits = 5,
@@ -2159,6 +2224,7 @@ test "batched search agrees with single-query search" {
             .seed = 0x5B,
         });
         defer index.deinit();
+        if (calibrate) try index.calibrate(corpus);
         try index.addBatch(corpus);
 
         const batch = 12;
@@ -2182,7 +2248,7 @@ test "batched search agrees with single-query search" {
                 try testing.expectEqual(a.score, b.score);
             }
         }
-    }
+    };
 }
 
 test "batched search handles partial batches and calibration" {
@@ -2194,7 +2260,7 @@ test "batched search handles partial batches and calibration" {
     defer allocator.free(corpus);
     var prng = std.Random.DefaultPrng.init(5);
     const random = prng.random();
-    for (0..n) |i| randomUnit(corpus[i * dim ..][0..dim], random);
+    offCentreRows(corpus, dim, random);
 
     var index = try FlatIndex.init(allocator, .{ .dim = dim, .bits = 4, .seed = 1 });
     defer index.deinit();
@@ -2216,7 +2282,10 @@ test "batched search handles partial batches and calibration" {
         const grouped = index.searchBatch(queries[0 .. count * dim], &batched);
         for (0..count) |i| {
             const one = index.search(queries[i * dim ..][0..dim], &single);
-            for (one, grouped[i * k ..][0..k]) |a, b| try testing.expectEqual(a.id, b.id);
+            for (one, grouped[i * k ..][0..k]) |a, b| {
+                try testing.expectEqual(a.id, b.id);
+                try testing.expectEqual(a.score, b.score);
+            }
         }
     }
 }
@@ -2366,120 +2435,89 @@ test "expanded residency is refused above the table's bit-width" {
     }));
 }
 
-test "calibrated scores match an explicit reconstruction" {
-    // The estimator must equal ⟨p, ŷ⟩ for the reconstruction the encoder actually
-    // produced, ŷ_j = c[code_j]/scale_j − shift_j.
-    //
-    // This is the test that was missing. A stale post-encode block was overwriting
-    // the α returned by `encodeCalibrated`, treating it as a residual norm and
-    // halving it — scores came out ~21% low with a per-vector wobble, which looked
-    // like "calibration hurts recall" rather than like a bug. Comparing against an
-    // independent reconstruction finds it immediately.
-    const allocator = testing.allocator;
-    const dim: u32 = 128;
-    const n = 200;
-
-    const corpus = try allocator.alloc(f32, n * dim);
-    defer allocator.free(corpus);
-    var prng = std.Random.DefaultPrng.init(0xA1FA);
-    const random = prng.random();
-    // Skewed and anisotropic, so shift and scale both do real work.
-    for (0..n) |i| {
-        const row = corpus[i * dim ..][0..dim];
+/// Off-centre, anisotropic rows with norms spread over [0.5, 2.5): the case where the
+/// centre, the factor and the bias all do real work.
+fn offCentreRows(rows: []f32, dim: usize, random: std.Random) void {
+    for (0..rows.len / dim) |i| {
+        const row = rows[i * dim ..][0..dim];
         for (row, 0..) |*v, j| {
             const decay = 1.0 / (1.0 + @as(f32, @floatFromInt(j)) * 0.05);
             v.* = (random.floatNorm(f32) + 0.7) * decay;
         }
         const len = euclideanNorm(row);
-        for (row) |*v| v.* /= len;
+        const want = 0.5 + 2.0 * random.float(f32);
+        for (row) |*v| v.* *= want / len;
     }
+}
 
-    var index = try FlatIndex.init(allocator, .{
-        .dim = dim,
-        .bits = 5,
-        .seed = 0x33,
-        .exact_scan = true,
-    });
-    defer index.deinit();
-    try index.calibrate(corpus);
-    try index.addBatch(corpus);
+test "a stored vector's estimate against itself is its squared norm" {
+    // The defining property of the factor: the estimate is exact when the query points
+    // along the stored vector. Querying with x itself, the inner-product estimate must
+    // be ‖x‖², cosine 1, and L2 0, calibrated or not.
+    //
+    // This checks the whole score, the centre term, the bias and its ‖q‖ weighting
+    // included, against something no formula in the index supplies. A stale or
+    // misplaced term — the bias left unscaled by ‖q‖, say, or the least-squares factor
+    // in place of this one — misses by percent, not by rounding.
+    const allocator = testing.allocator;
+    const dim: u32 = 128;
+    const n = 64;
+    const corpus = try allocator.alloc(f32, n * dim);
+    defer allocator.free(corpus);
+    var prng = std.Random.DefaultPrng.init(0xA1FA);
+    offCentreRows(corpus, dim, prng.random());
 
-    var searcher = try FlatIndex.Searcher.init(allocator, index, n);
-    defer searcher.deinit();
+    for ([_]bool{ false, true }) |calibrate| {
+        for ([_]Metric{ .inner_product, .cosine, .l2 }) |metric| {
+            for ([_]bool{ true, false }) |exact| {
+                var index = try FlatIndex.init(allocator, .{
+                    .dim = dim,
+                    .bits = 3,
+                    .seed = 0x33,
+                    .metric = metric,
+                    .exact_scan = exact,
+                });
+                defer index.deinit();
+                if (calibrate) try index.calibrate(corpus);
+                try index.addBatch(corpus);
+                var searcher = try FlatIndex.Searcher.init(allocator, index, 1);
+                defer searcher.deinit();
 
-    const padded = index.quantizer.padded();
-    const staging = try allocator.alloc(f32, padded);
-    defer allocator.free(staging);
-    const y = try allocator.alloc(f32, padded);
-    defer allocator.free(y);
-    const z = try allocator.alloc(f32, padded);
-    defer allocator.free(z);
-    const codes = try allocator.alloc(u8, padded);
-    defer allocator.free(codes);
-    const centroids = index.quantizer.mse.codebook.centroids;
-
-    var state = try prod_mod.QueryState.init(allocator, index.quantizer);
-    defer state.deinit();
-    var ws = try prod_mod.Workspace.init(allocator, index.quantizer);
-    defer ws.deinit();
-
-    const query = try allocator.alloc(f32, dim);
-    defer allocator.free(query);
-
-    for (0..10) |_| {
-        randomUnit(query, random);
-        const results = index.search(query, &searcher);
-        index.quantizer.prepareQuery(query, &state, &ws);
-
-        for (results[0..8]) |e| {
-            const id: usize = e.id;
-            _ = index.quantizer.mse.encodeRotated(corpus[id * dim ..][0..dim], y, staging);
-            for (z, y, index.shifts, index.scales) |*zz, yy, sh, sc| zz.* = (yy + sh) * sc;
-            index.quantizer.mse.codebook.encodeSlice(z, codes);
-
-            var expected: f64 = 0;
-            for (codes, state.rotated, index.shifts, index.scales) |c, p, sh, sc| {
-                expected += @as(f64, p) * (@as(f64, centroids[c]) / sc - sh);
-            }
-            // α is a deliberate rescale, so allow for it rather than demanding
-            // equality — but it must be close to 1, not off by a factor.
-            const ratio = @as(f64, e.score) / expected;
-            if (!(ratio > 0.85 and ratio < 1.18)) {
-                std.debug.print("score {d:.5} expected {d:.5} ratio {d:.4}\n", .{ e.score, expected, ratio });
-                return error.EstimatorMismatch;
+                // Half-precision scalars bound the exact scan; the int8 query adds a
+                // little more.
+                const tolerance: f32 = if (exact) 4e-3 else 3e-2;
+                for (0..n) |i| {
+                    const x = corpus[i * dim ..][0..dim];
+                    const id = [1]u32{@intCast(i)};
+                    var got: [1]f32 = undefined;
+                    try index.scoreIds(x, &id, &got, &searcher);
+                    const sq = euclideanNorm(x) * euclideanNorm(x);
+                    switch (metric) {
+                        .inner_product => try testing.expectApproxEqRel(sq, got[0], tolerance),
+                        .cosine => try testing.expectApproxEqAbs(@as(f32, 1), got[0], tolerance),
+                        .l2 => try testing.expectApproxEqAbs(@as(f32, 0), got[0], 2 * tolerance * sq),
+                    }
+                }
             }
         }
     }
 }
 
-test "calibrated alpha is the least-squares fit in the pre-shift basis" {
-    // α must be ⟨y, x̂⟩/‖x̂‖² for x̂_j = c[code_j]/scale_j − shift_j — the same basis
-    // the estimator applies it in.
+test "the stored factor and bias are the ones the split defines" {
+    // f = ‖r‖²/⟨r, ũ⟩ and b = ⟨c, r⟩ − f·⟨c, ũ⟩, for r = y − c and ũ the reconstruction
+    // of r/‖r‖, recomputed here from the definitions in f64.
     //
-    // The score-vs-reconstruction test above cannot see this. Fitting α in the
-    // shifted basis instead (⟨y+shift, u⟩/‖u‖² for u = c/scale) leaves the score
-    // still *proportional* to ⟨p, x̂⟩, so that test passes with a ratio near 1 —
-    // but the constant is wrong and recall drops 12 points on anisotropic data.
-    // Only checking α against its definition catches it.
+    // The self-score test cannot tell every wrong definition apart: any factor that is
+    // exact along the vector passes it. Fitting f by least squares instead, ⟨r, ũ⟩/‖ũ‖²,
+    // is the earlier choice and fails it, but a sign slip in b that happens to cancel
+    // would not. Checking each scalar against its definition does.
     const allocator = testing.allocator;
     const dim: u32 = 96;
     const n = 128;
-
     const corpus = try allocator.alloc(f32, n * dim);
     defer allocator.free(corpus);
     var prng = std.Random.DefaultPrng.init(0xB2C3);
-    const random = prng.random();
-    // Off-centre and anisotropic, so the fitted shift is large: that is exactly the
-    // case where the two bases disagree.
-    for (0..n) |i| {
-        const row = corpus[i * dim ..][0..dim];
-        for (row, 0..) |*v, j| {
-            const decay = 1.0 / (1.0 + @as(f32, @floatFromInt(j)) * 0.04);
-            v.* = (random.floatNorm(f32) + 1.3) * decay;
-        }
-        const len = euclideanNorm(row);
-        for (row) |*v| v.* /= len;
-    }
+    offCentreRows(corpus, dim, prng.random());
 
     var index = try FlatIndex.init(allocator, .{ .dim = dim, .bits = 3, .seed = 0x77 });
     defer index.deinit();
@@ -2491,26 +2529,31 @@ test "calibrated alpha is the least-squares fit in the pre-shift basis" {
     defer allocator.free(staging);
     const y = try allocator.alloc(f32, padded);
     defer allocator.free(y);
-    const z = try allocator.alloc(f32, padded);
-    defer allocator.free(z);
+    const u = try allocator.alloc(f32, padded);
+    defer allocator.free(u);
     const codes = try allocator.alloc(u8, padded);
     defer allocator.free(codes);
-    const centroids = index.quantizer.mse.codebook.centroids;
+    const levels = index.quantizer.mse.codebook.centroids;
 
     for (0..n) |id| {
         _ = index.quantizer.mse.encodeRotated(corpus[id * dim ..][0..dim], y, staging);
-        for (z, y, index.shifts, index.scales) |*zz, yy, sh, sc| zz.* = (yy + sh) * sc;
-        index.quantizer.mse.codebook.encodeSlice(z, codes);
+        var rr: f64 = 0;
+        for (y, index.centre) |yy, c| rr += (@as(f64, yy) - c) * (@as(f64, yy) - c);
+        for (u, y, index.centre) |*uu, yy, c| uu.* = @floatCast((@as(f64, yy) - c) / @sqrt(rr));
+        index.quantizer.mse.codebook.encodeSlice(u, codes);
 
-        var dot: f64 = 0;
-        var recon_sq: f64 = 0;
-        for (codes, y, index.shifts, index.scales) |c, yy, sh, sc| {
-            const x_hat = @as(f64, centroids[c]) / sc - sh;
-            dot += @as(f64, yy) * x_hat;
-            recon_sq += x_hat * x_hat;
+        var ru: f64 = 0;
+        var cr: f64 = 0;
+        var cu: f64 = 0;
+        for (codes, y, index.centre) |code, yy, c| {
+            const r = @as(f64, yy) - c;
+            ru += r * levels[code];
+            cr += c * r;
+            cu += c * @as(f64, levels[code]);
         }
-        const want: f32 = @floatCast(dot / recon_sq);
-        try testing.expectApproxEqRel(want, index.scalars.items[id].gamma, 1e-3);
+        const f = rr / ru;
+        try testing.expectApproxEqRel(@as(f32, @floatCast(f)), @as(f32, index.scalars.items[id].gamma), 1e-3);
+        try testing.expectApproxEqAbs(@as(f32, @floatCast(cr - f * cu)), @as(f32, index.biases.items[id]), 1e-3);
     }
 }
 
@@ -2610,7 +2653,8 @@ test "resident storage is what bytesPerVector reports" {
     // that the reported figure did not include.
     var prng = std.Random.DefaultPrng.init(0x51DE);
     const random = prng.random();
-    for ([_]Correction{ .scalar, .qjl_sketch }) |correction| {
+    for ([_]Correction{ .scalar, .qjl_sketch }) |correction| for ([_]bool{ false, true }) |calibrate| {
+        if (calibrate and correction != .scalar) continue;
         for ([_]u6{ 3, 5 }) |bits| {
             var index = try FlatIndex.init(testing.allocator, .{
                 .dim = 256,
@@ -2619,17 +2663,23 @@ test "resident storage is what bytesPerVector reports" {
             });
             defer index.deinit();
             var v: [256]f32 = undefined;
+            if (calibrate) {
+                var sample: [2 * 256]f32 = undefined;
+                for (0..2) |i| randomUnit(sample[i * 256 ..][0..256], random);
+                try index.calibrate(&sample);
+            }
             for (0..20) |_| {
                 randomUnit(&v, random);
                 _ = try index.add(&v);
             }
             const n = index.count();
             const resident = index.codes.items.len + index.sketches.items.len +
-                index.scalars.items.len * @sizeOf(StoredScalars);
+                index.scalars.items.len * @sizeOf(StoredScalars) + index.biases.items.len * @sizeOf(f16);
             try testing.expectEqual(index.bytesPerVector() * n, resident);
             try testing.expectEqual(correction == .qjl_sketch, index.sketches.items.len > 0);
+            try testing.expectEqual(calibrate, index.biases.items.len > 0);
         }
-    }
+    };
 }
 
 test "parallel add produces exactly the bytes of a serial add" {
@@ -2670,6 +2720,7 @@ test "parallel add produces exactly the bytes of a serial add" {
             try testing.expectEqualSlices(u8, serial.codes.items, parallel.codes.items);
             try testing.expectEqualSlices(u8, serial.sketches.items, parallel.sketches.items);
             try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(serial.scalars.items), std.mem.sliceAsBytes(parallel.scalars.items));
+            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(serial.biases.items), std.mem.sliceAsBytes(parallel.biases.items));
         }
     }
 }

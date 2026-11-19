@@ -76,15 +76,18 @@ const char *zq_build_kernels(void);
 zq_status zq_index_create(const zq_config *config, zq_index **out);
 void      zq_index_free(zq_index *index);
 
-/* Fit per-coordinate shift and scale from a sample. Must precede any add.
+/* Fit the corpus centre from a sample: the mean of its unit-normalized rows. Must
+ * precede any add. Each vector is then stored relative to the centre and the centre's
+ * share of every score is computed exactly, for 2 more bytes per vector.
  *
- * Worth doing when the corpus centroid sits away from the origin: compute
- * ||mean(x/||x||)|| on a sample and expect a gain above roughly 0.3, and none below.
- * It is not free - on low-rank zero-mean data it can cost recall. */
+ * Worth doing when the corpus sits away from the origin: compute ||mean(x/||x||)|| on
+ * a sample. On real corpora at 0.65 and above it gained 9 to 22 points of recall@10 at
+ * bits 2 and 3, and 3 to 5 at bits 5; at 0.12 it gained about a point. A few hundred
+ * rows are enough. */
 zq_status zq_index_calibrate(zq_index *index, const float *rows, size_t n);
 
-/* Measure the sample's centroid norm and calibrate only if it is at least 0.3, where
- * calibration measured a gain; below it, it measured neutral or worse. Stores the norm
+/* Measure the sample's centroid norm and calibrate only if it is at least 0.3. Below
+ * that, calibration gained about a point, not worth its 2 bytes per vector. Stores the norm
  * in *centroid_norm and whether calibration was applied in *applied; either may be
  * NULL. Fails exactly as zq_index_calibrate would, whatever the measurement. The
  * sensible default when you do not know your data. */

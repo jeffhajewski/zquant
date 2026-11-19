@@ -131,16 +131,18 @@ filter or another index. An id outside the index raises `IndexError`.
 
 ## Calibration
 
-`index.calibrate(sample)` fits a per-coordinate shift and scale before any `add`. Whether
-it helps depends on how far the data's directions sit from the origin:
+`index.calibrate(sample)` fits the corpus centre before any `add`. Each vector is then
+stored relative to the centre, and the centre's share of every score is computed exactly
+rather than estimated. It costs 2 bytes per vector. Whether it helps depends on how far
+the data's directions sit from the origin:
 
 ```python
 u = x / np.linalg.norm(x, axis=1, keepdims=True)
 centroid = np.linalg.norm(u.mean(axis=0))     # above ~0.3: worth it
 ```
 
-Measured: +11 points of recall at centroid 0.65, and nothing at 0.12. It isn't free: on
-low-rank, zero-mean data it has cost several points.
+Measured at bits 2 and 3: 9 to 22 points more recall@10 on corpora at 0.65 and above,
+which is where real embeddings sit, and about a point at 0.12.
 
 If you don't know your data, let the library decide:
 
@@ -150,7 +152,7 @@ result.centroid_norm    # what it measured
 result.applied          # whether it calibrated (it does at 0.3 and above)
 ```
 
-Either way, calibration has to happen before the first `add`, and a few thousand rows of
+Either way, calibration has to happen before the first `add`, and a few hundred rows of
 sample is plenty.
 
 ## Saving and loading

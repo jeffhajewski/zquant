@@ -112,7 +112,8 @@ class Calibration(NamedTuple):
     """What `Index.calibrate(sample, auto=True)` measured and did."""
 
     #: ||mean(x / ||x||)|| over the sample: how far the data's directions sit from the
-    #: origin. Calibration measured a gain from about 0.3 up, and none below.
+    #: origin. Calibration paid 9 to 22 points at 0.65 and above, and about one at 0.12;
+    #: `auto` applies it from 0.3.
     centroid_norm: float
     #: Whether the index was calibrated.
     applied: bool
@@ -327,13 +328,14 @@ class Index:
             return _LIB.zq_index_bytes_per_vector(self._live())
 
     def calibrate(self, sample, auto: bool = False) -> Optional[Calibration]:
-        """Fit per-coordinate shift and scale from a sample. Must precede `add`.
+        """Fit the corpus centre from a sample. Must precede `add`.
 
-        Worth enabling when the corpus centroid sits away from the origin — compute
-        `np.linalg.norm(np.mean(x / np.linalg.norm(x, axis=1, keepdims=True), axis=0))`
-        and expect a real gain above about 0.3 and none below. It is not free: on
-        low-rank zero-mean data it has cost several points of recall. A few thousand rows
-        are enough; more did not measurably help.
+        Each vector is then stored relative to the centre, and the centre's share of
+        every score is computed exactly, for 2 more bytes per vector. Worth it when the
+        corpus sits away from the origin: compute
+        `np.linalg.norm(np.mean(x / np.linalg.norm(x, axis=1, keepdims=True), axis=0))`.
+        At 0.65 and above it gained 9 to 22 points of recall@10 at bits 2 and 3; at 0.12,
+        about a point. A few hundred rows are enough.
 
         `auto=True` lets the library make that call: it measures the sample's centroid
         norm and calibrates only if it is at least 0.3. It returns a `Calibration`

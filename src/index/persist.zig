@@ -29,11 +29,11 @@
 //!      44     4  code_stride        bytes of codes per vector
 //!      48     4  sketch_stride      bytes of sketch per vector
 //!      52     4  reserved, 0
-//!      56        shifts             padded × f32
-//!                scales             padded × f32
+//!      56        centre             padded × f32, zero unless calibrated
 //!                codes              count × code_stride
 //!                sketches           count × sketch_stride
 //!                scalars            count × (f16 norm, f16 gamma)
+//!                biases             count × f16, only if calibrated
 //!     end-4   4  CRC-32 (IEEE) of every byte before it
 //!
 //! The working dimension and strides are derivable from the parameters; they are
@@ -56,7 +56,12 @@ const FlatIndex = flat.FlatIndex;
 const rotation = @import("../math/rotation.zig");
 
 pub const magic = "ZQNT";
-pub const format_version: u32 = 1;
+
+/// 2: calibration is a centre and a per-vector bias rather than a per-coordinate shift
+///    and scale, and the per-vector scalar under `.scalar` is the factor that makes the
+///    estimate exact along the vector rather than a least-squares fit. Version 1 files
+///    are refused: their scalars mean something else.
+pub const format_version: u32 = 2;
 
 /// Bump whenever the golden hashes in tests/golden.zig change.
 ///
@@ -75,6 +80,7 @@ pub const max_dense_padded: u32 = 4096;
 const header_len = 56;
 const crc_len = 4;
 const scalar_len = 4;
+const bias_len = 2;
 
 pub const Error = error{
     /// Not a zquant index at all.
@@ -91,8 +97,8 @@ pub const Error = error{
 /// Exact size of `write`'s output.
 pub fn serializedSize(index: *const FlatIndex) usize {
     const padded: usize = index.quantizer.padded();
-    const per_vector = index.codeStride() + index.sketchStride() + scalar_len;
-    return header_len + 8 * padded + index.count() * per_vector + crc_len;
+    const per_vector = index.codeStride() + index.sketchStride() + scalar_len + index.biasStride();
+    return header_len + 4 * padded + index.count() * per_vector + crc_len;
 }
 
 /// Serialize `index` into `out`, which must hold `serializedSize(index)` bytes.
@@ -137,11 +143,7 @@ pub fn write(index: *const FlatIndex, out: []u8) Error!usize {
     put(u32, buf, 52, 0);
 
     var at: usize = header_len;
-    for (index.shifts) |v| {
-        put(u32, buf, at, @bitCast(v));
-        at += 4;
-    }
-    for (index.scales) |v| {
+    for (index.centre) |v| {
         put(u32, buf, at, @bitCast(v));
         at += 4;
     }
@@ -153,6 +155,10 @@ pub fn write(index: *const FlatIndex, out: []u8) Error!usize {
         put(u16, buf, at, @bitCast(s.norm));
         put(u16, buf, at + 2, @bitCast(s.gamma));
         at += scalar_len;
+    }
+    for (index.biases.items) |b| {
+        put(u16, buf, at, @bitCast(b));
+        at += bias_len;
     }
     put(u32, buf, at, std.hash.Crc32.hash(buf[0..at]));
     at += crc_len;
@@ -209,6 +215,8 @@ pub fn read(allocator: Allocator, bytes: []const u8) (Error || Allocator.Error)!
         .seed = get(u64, bytes, 24),
     };
     const calibrated = bytes[23] == 1;
+    // `calibrate` refuses the sketch correction, so no writer produces both.
+    if (calibrated and params.correction != .scalar) return error.Corrupt;
 
     // Everything about the layout is checked against the file before anything is
     // allocated, so the size of what a header asks for is bounded by the size of the
@@ -221,9 +229,9 @@ pub fn read(allocator: Allocator, bytes: []const u8) (Error || Allocator.Error)!
     const count = std.math.cast(usize, get(u64, bytes, 32)) orelse return error.Corrupt;
     // Ids are u32 throughout search.
     if (count > std.math.maxInt(u32)) return error.Corrupt;
-    const per_vector = code_stride + sketch_stride + scalar_len;
+    const per_vector = code_stride + sketch_stride + scalar_len + @as(usize, if (calibrated) bias_len else 0);
     const vectors_len = std.math.mul(usize, count, per_vector) catch return error.Corrupt;
-    const fixed = header_len + 8 * @as(usize, padded) + crc_len;
+    const fixed = header_len + 4 * @as(usize, padded) + crc_len;
     const expected = std.math.add(usize, fixed, vectors_len) catch return error.Corrupt;
     if (bytes.len != expected) return error.Corrupt;
 
@@ -237,19 +245,13 @@ pub fn read(allocator: Allocator, bytes: []const u8) (Error || Allocator.Error)!
         index.sketchStride() != sketch_stride) return error.Corrupt;
 
     var at: usize = header_len;
-    for (index.shifts) |*v| {
+    for (index.centre) |*v| {
         v.* = @bitCast(get(u32, bytes, at));
         at += 4;
     }
-    for (index.scales) |*v| {
-        v.* = @bitCast(get(u32, bytes, at));
-        at += 4;
-    }
-    for (index.shifts, index.scales) |sh, sc| {
-        if (!std.math.isFinite(sh) or !std.math.isFinite(sc)) return error.Corrupt;
-    }
-    if (!calibrated) {
-        for (index.shifts, index.scales) |sh, sc| if (sh != 0 or sc != 1) return error.Corrupt;
+    for (index.centre) |c| {
+        if (!std.math.isFinite(c)) return error.Corrupt;
+        if (!calibrated and c != 0) return error.Corrupt;
     }
     index.calibrated = calibrated;
 
@@ -265,6 +267,10 @@ pub fn read(allocator: Allocator, bytes: []const u8) (Error || Allocator.Error)!
         });
         at += scalar_len;
     }
+    if (calibrated) for (0..count) |_| {
+        index.biases.appendAssumeCapacity(@bitCast(get(u16, bytes, at)));
+        at += bias_len;
+    };
     std.debug.assert(at == bytes.len - crc_len);
     return index;
 }
@@ -325,8 +331,8 @@ test "a loaded index is the saved one: same bytes, same search results" {
         try testing.expectEqual(index.calibrated, loaded.calibrated);
         try testing.expectEqualSlices(u8, index.codes.items, loaded.codes.items);
         try testing.expectEqualSlices(u8, index.sketches.items, loaded.sketches.items);
-        try testing.expectEqualSlices(f32, index.scales, loaded.scales);
-        try testing.expectEqualSlices(f32, index.shifts, loaded.shifts);
+        try testing.expectEqualSlices(f32, index.centre, loaded.centre);
+        try testing.expectEqualSlices(f16, index.biases.items, loaded.biases.items);
 
         var a = try FlatIndex.Searcher.init(testing.allocator, index, 10);
         defer a.deinit();

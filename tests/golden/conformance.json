@@ -5,11 +5,11 @@
   "codec_hash": "sha256 of the zq_codec_encode codes for all rows, followed by the norms as little-endian float32",
   "encoding_version": 1,
   "index": [
-    { "dim": 64,  "bits": 4, "metric": "inner_product", "seed": "0x1",                "compact": true,  "calibrate": false, "rows": 16, "salt": 0, "sha256": "25ccde65052b3c31233f4eae4cea6386b0a9dbe752a2c48c2a520602c7c9e71b" },
-    { "dim": 100, "bits": 5, "metric": "cosine",        "seed": "0xffffffffffffffc5", "compact": true,  "calibrate": false, "rows": 12, "salt": 1, "sha256": "56adba444d132d2283d00afd14ca43ed8550765e64b4e297e1228e88df70094a" },
-    { "dim": 768, "bits": 3, "metric": "l2",            "seed": "0x2a",               "compact": true,  "calibrate": false, "rows": 8,  "salt": 2, "sha256": "547545b4ac032147be9698c822ecaaf658b599beb391c8de3a1995de1b7eaf7b" },
-    { "dim": 128, "bits": 4, "metric": "inner_product", "seed": "0x7",                "compact": false, "calibrate": false, "rows": 10, "salt": 3, "sha256": "e9aa75cc20db527a23fbdf9957a1b6ce726108b2b9e848b135f7c482aa642d1c" },
-    { "dim": 96,  "bits": 4, "metric": "inner_product", "seed": "0x9",                "compact": true,  "calibrate": true,  "rows": 64, "salt": 4, "sha256": "e7c0e88724b37fb456b19a8daeca2977222449f9c116a85a5782b9fd45ec9a89" }
+    { "dim": 64,  "bits": 4, "metric": "inner_product", "seed": "0x1",                "compact": true,  "calibrate": false, "rows": 16, "salt": 0, "sha256": "effdaec5b74cb09f649b71f68e09b0db5304d0b8560fb07a0a0948871b5cbfcb" },
+    { "dim": 100, "bits": 5, "metric": "cosine",        "seed": "0xffffffffffffffc5", "compact": true,  "calibrate": false, "rows": 12, "salt": 1, "sha256": "db52db0d78729dfb81b5aec19e71a4e8a0b113c08abe66c51e02e161bbfbc22d" },
+    { "dim": 768, "bits": 3, "metric": "l2",            "seed": "0x2a",               "compact": true,  "calibrate": false, "rows": 8,  "salt": 2, "sha256": "bdcd486bb4c4e8eb8fc87014ef67e68b0f3a3a2238a04aa7ba77a8239d44e275" },
+    { "dim": 128, "bits": 4, "metric": "inner_product", "seed": "0x7",                "compact": false, "calibrate": false, "rows": 10, "salt": 3, "sha256": "5d717a0f3186d4f73def7d64ede7ab511b5a4e84c7682510c59d4127633fbfe5" },
+    { "dim": 96,  "bits": 4, "metric": "inner_product", "seed": "0x9",                "compact": true,  "calibrate": true,  "rows": 64, "salt": 4, "sha256": "0ed0bfea5c1f1bd48ac3c9ff83e9c27da01d7f09b98bfb856a28a994aab4740f" }
   ],
   "codec": [
     { "dim": 64,  "bits": 4, "seed": "0x1",                "rows": 8, "salt": 5, "sha256": "1c4e6dce2842a3ceea6a05a7f067777ee73ff6ef3aad0c4e217811bb79065f27" },

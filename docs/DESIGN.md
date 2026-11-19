@@ -439,8 +439,10 @@ Versioned, little-endian, mmap-able, 64-byte aligned sections.
 aligned or mmap-able; loading copies. The CRC covers the whole file, not just the header,
 since loading is a single pass anyway. `codebook_id` became `encoding_version`, which pins
 the codes as a whole: rotation, codebook and packing. `tests/golden.zig` names it next to
-the hashes it covers. There are no external ids, because the index has none. The layout
-table is at the top of `persist.zig`.
+the hashes it covers. There are no external ids, because the index has none. Format version 2 stores
+the calibration centre (`dim_padded` floats) and, when calibrated, an f16 bias per vector;
+the codes themselves did not change, so `encoding_version` did not. The layout table is at
+the top of `persist.zig`.
 
 ```
 header:  magic "ZQNT" | format_version | dim | dim_padded | bits | objective
@@ -523,7 +525,7 @@ than by omission — each is either scheduled or explicitly declined:
 | `remove()` + compaction/`sync()` | P4 — tombstone + block compaction |
 | Stable external IDs (`IdMapIndex`) | P2 — optional `ids[]` section already in the format (§6) |
 | Filtered search (allowlist at query time) | P4 — bitmap predicate folded into the block scan, not a post-filter |
-| `calibrate()` | Investigate in P1. TurboQuant is data-oblivious by construction, so a calibration step implies a data-dependent refinement outside the paper. Understand what it buys before deciding. |
+| `calibrate()` | Investigate in P1. TurboQuant is data-oblivious by construction, so a calibration step implies a data-dependent refinement outside the paper. Understand what it buys before deciding. *As built:* it fits the corpus centre in the rotated basis. Each vector stores the residual's codes, an along-vector-exact factor and a 2-byte bias, and the centre's share of every score is computed exactly. It gains 9 to 22 points of R@10 at bits 2 and 3 on data well off the origin, and about a point near it. `docs/comparison.md` has the numbers. |
 
 ### 7.4 Cross-language conformance
 Fixed-seed golden vectors checked into `tests/golden/`: for a given `(seed, d, b, objective)` and a

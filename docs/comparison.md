@@ -21,10 +21,41 @@ fitted per-coordinate shift and scale anchored on the codebook's outermost centr
 and — the one that mattered most on SIFT — fitting the per-vector correction in the same
 basis the estimator applies it in.
 
-**At d=768 and 1536 on real embeddings** the low-byte picture reverses: PQ trails zquant at
-every budget, and the closest competitor is RaBitQ, 1.4–2.7 points ahead at 1–2 bits per
-dimension. An experiment suggests that lead comes from how RaBitQ assembles its scores,
-which zquant could adopt (see "Real embeddings at d=768 and 1536" below).
+**A fourth change replaced the second.** Calibration now fits the corpus centre and
+computes its share of every score exactly, and the per-vector scalar makes the estimate
+exact along the stored vector rather than fitting it by least squares. Both come from
+RaBitQ's estimator. The next section has the current numbers; the sections after it record
+how the comparison developed, and their zquant rows predate this change unless they say
+otherwise.
+
+## Current position
+
+zquant rows are from this release; the other systems' rows are from the latest matched runs
+(`data/baselines.csv` for SIFT), which nothing here changed. "+cal" now costs 2 B per vector more than
+before, for the bias the estimator stores.
+
+| corpus | B/vec | system | R@10 |
+|---|---|---|---|
+| SIFT10K, d=128 | 16 | **FAISS PQ** M=16 | **0.511** |
+| | 22 | zquant bits=2 +cal | 0.458 (was 0.357 at 20 B) |
+| | 24 | FAISS RaBitQ qb=5 | 0.356 |
+| | 36 | turbovec bits=2 +cal | 0.682 |
+| | 38 | **zquant** bits=3 +cal | **0.702** (was 0.691) |
+| | 54 | **zquant** bits=4 +cal | **0.837** (was 0.832) |
+| | 64 | FAISS PQ M=64 | 0.845 |
+| | 70 | **zquant** bits=5 +cal | **0.907** (was 0.907) |
+| nytimes-256 | 32 | **FAISS PQ** M=32 | **0.563** |
+| | 38 | zquant bits=2 +cal | 0.536 (was 0.532) |
+| | 64 | **FAISS PQ** M=64 | **0.752** |
+| | 68 | turbovec bits=2 +cal | 0.743 |
+| | 70 | zquant bits=3 +cal | 0.744 (was 0.737) |
+| | 102 | **zquant** bits=4 +cal | **0.858** (was 0.857) |
+| | 134 | **zquant** bits=5 +cal | **0.920** (was 0.916) |
+
+On SIFT the gap to PQ at the bottom fell from 15 points to 5, and zquant passes RaBitQ there
+by 10. nytimes barely moves, since its centroid sits near the origin (0.12) and centring has
+little to remove. At d=768 and 1536 zquant now matches or passes FAISS RaBitQ at every
+matched budget (see "Real embeddings at d=768 and 1536" below).
 
 ## nytimes-256 — real text embeddings, d=256
 
@@ -200,14 +231,14 @@ runs in production. The useful range is 1–4 bits per dimension, and zquant win
 there on both corpora.
 
 **Revisited: much of the limit was the estimator, not the codes.** The first bullet above
-compared the same estimator in f32 and in int8; it never tried a different estimator. A
-numpy copy of the encoder (`bench/py/ivf_lab.py`) tried two changes taken from RaBitQ. One
-computes the corpus mean's share of the score exactly. The other normalises the per-vector
-scalar so the score is exact along the stored vector. With both, SIFT at bits=2 rises from
-0.355 with today's library to 0.456 on the same 20 B, still short of PQ's 0.511 at 16 B.
-Encoding residuals against 256 k-means centroids instead of one mean, which is IVF, takes it
-to 0.661, though on a corpus this small the centroids add 13 B per vector. And at d=768–1536
-on real embeddings, PQ trails zquant at every budget (see the section below). See
+compared the same estimator in f32 and in int8; it never tried a different estimator. Two
+changes taken from RaBitQ, now in the library, do better. One computes the corpus mean's
+share of the score exactly. The other normalises the per-vector scalar so the score is
+exact along the stored vector. With both, SIFT at bits=2 rises from 0.357 to 0.458, at
+22 B against the old 20, still short of PQ's 0.511 at 16 B. In a numpy model, encoding
+residuals against 256 k-means centroids instead of one mean, which is IVF, takes it to
+0.661, though on a corpus this small the centroids add 13 B per vector. And at d=768–1536 on
+real embeddings, PQ trails zquant at every budget (see the section below). See
 `docs/notes.md`, "Partitioning and the low-bit gap".
 
 ## Real embeddings at d=768 and 1536
@@ -325,6 +356,10 @@ Two hypotheses were tested and **refuted**:
 
 ## Calibration: per-coordinate scales
 
+**Superseded.** Calibration now fits a centre instead (see "Current position"). This
+section describes the per-coordinate fit it replaced, which the centred estimator matched
+or beat on every corpus measured.
+
 A random rotation *randomizes* the axes but does not *whiten* them. After rotation
 coordinate j has variance πⱼᵀCπⱼ, which still tracks the spectrum of the data
 covariance C. On SIFT that leaves a **4.3× spread** across coordinates (cv 0.30), so a
@@ -338,6 +373,15 @@ It is opt-in: it is the one data-dependent step in an otherwise data-oblivious l
 It *hurts* at bits=2, where a single code bit is too coarse for a scale fit to help.
 
 ## Mean-centring: a measured negative
+
+**Since reversed.** The library now centres, and it gains 9 to 22 points at bits 2 and 3 on
+every corpus whose centroid norm is 0.65 or more. It differs from the attempts below in two
+ways: the mean's share of each score is computed exactly instead of passing through the
+quantizer, and the per-vector scalar is the along-vector-exact one rather than a
+least-squares fit. Which of the two the attempts below were missing was not isolated. In the
+numpy model, centring with the exact mean term but the least-squares scalar scored 0.569 on
+Cohere at bits=2 against 0.739 with both, so the scalar is at least a large part of it
+(`docs/notes.md`, "Partitioning and the low-bit gap").
 
 The signal is unambiguous. The codebook is symmetric about zero — correct for a vector
 uniform on the sphere, the worst case the paper analyses. Real embeddings share a strong
@@ -365,19 +409,14 @@ it was caught.
 
 ## Open leads
 
-- **The low-bit regime is the real weakness.** Below 40 B we trail PQ by 22 points. This
-  was thought structural, since PQ uses *vector* codebooks. It is not, or not mostly. An
-  estimator change measured in a numpy copy of the encoder closes about two thirds of it on
-  SIFT and matches or passes RaBitQ on real embeddings; IVF residuals add more. Not yet in
-  the library.
-  See `docs/notes.md`, "Partitioning and the low-bit gap".
-- **turbovec's calibration is more effective than ours at low bit-widths** — +8.1 points
-  at bits=2 against our −1.5. Whatever it fits, it is not just a per-coordinate scale.
-  Mean handling is the obvious suspect, and is exactly what we could not make work.
-- **Mean-centring** (above) — the largest identified but unrealized gain. It works in the
-  numpy copy of the encoder when the mean's share of the score is computed exactly and the
-  per-vector scalar is normalised along the vector rather than fitted by least squares
-  (`docs/notes.md`, "Partitioning and the low-bit gap").
+- **The low-bit regime is the remaining weakness, at d=128 and 256.** On SIFT, PQ leads by
+  5 points at the bottom (0.511 at 16 B against 0.458 at 22 B), down from 15 before the
+  estimator change. This was thought structural, since PQ uses *vector* codebooks. Mostly
+  it was not. In a numpy model, IVF residuals close the rest and pass PQ, before counting
+  the centroids' storage. See `docs/notes.md`, "Partitioning and the low-bit gap".
+- **turbovec's calibration was more effective than ours at low bit-widths** — +8.1 points
+  at bits=2 against our old −1.5. Ours now gains +12.0 there (0.338 uncalibrated, 0.458
+  calibrated), by handling the mean, which was the suspect.
 - **turbovec's bits=3 stores 68 B — the same as its bits=4** — so it pads 3-bit codes
   rather than packing them. Our bit-plane layout does not, and at 68 B we beat that
   configuration on RMS (0.01210 against 0.01370). The gap is specifically against their

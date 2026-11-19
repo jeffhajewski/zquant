@@ -23,9 +23,9 @@ that had quietly fallen back to Debug would be obvious rather than merely disapp
 
 Generates its own corpora, computes exact ground truth, and prints recall against storage
 and throughput. It runs two corpora that differ only in **centroid norm** — how far the
-corpus of unit directions sits from the origin — because that is what decides whether the
-per-coordinate calibration is worth anything: neutral at 0.005, **+11.6 points at bits=2**
-at 0.648. Real embeddings span that range (nytimes-256 is 0.12, SIFT is 0.65).
+corpus of unit directions sits from the origin — because that is what decides whether
+calibration is worth anything: neutral at 0.005, **+13 points at bits=2** at 0.648. Real
+embeddings span that range (nytimes-256 is 0.12, SIFT is 0.65, Cohere's is 0.85).
 
 For the competitive comparison against FAISS PQ, FAISS RaBitQ and turbovec, see
 [docs/comparison.md](docs/comparison.md); it needs real corpora and their dependencies.
@@ -55,12 +55,13 @@ binding:
 - **Save and load.** Versioned, checksummed, the same bytes on every platform. A loaded
   index searches and accepts new vectors exactly as the saved one did.
 - **Exact reranking.** Over-fetch candidates and rescore them against your full-precision
-  vectors. On fashion-mnist this takes R@10 at bits=3 from 0.724 to 0.984, for about 4% of
+  vectors. On fashion-mnist this takes R@10 at bits=3 from 0.761 to 0.991, for about 5% of
   throughput.
 - **Scores for ids you choose**, for ranking a candidate set from a filter or another
   index without scanning the corpus.
 - **Automatic calibration.** It measures how far off-centre the data is and calibrates
-  only where that has measured a gain.
+  only where that has measured a gain. Calibrating fits the corpus centre and costs 2 B per
+  vector; on data well off the origin it adds 9 to 22 points of R@10 at bits 2 and 3.
 - **Parallel encoding.** It produces the same bytes as serial encoding.
 - **Thread safety.** Many threads can search one index at once. Adding, closing and
   garbage collection are safe against searches in flight.
@@ -209,15 +210,15 @@ and FAISS both use all cores inside `search()`.
 | B/vec | system | R@10 | QPS |
 |---|---|---|---|
 | 16 | **FAISS PQ** M=16,nbits=8 | **0.511** | 90,509 |
-| 20 | zquant bits=2 +cal | 0.356 | 184,945 |
+| 22 | zquant bits=2 +cal | 0.458 | 178,923 |
 | 24 | FAISS RaBitQ qb=5 | 0.356 | 63,416 |
 | 32 | FAISS PQ M=32,nbits=8 | 0.648 | 59,826 |
-| 36 | **zquant** bits=3 +cal | **0.691** | **186,081** |
 | 36 | turbovec bits=2 +cal | 0.682 | 100,022 |
-| 52 | **zquant** bits=4 +cal | **0.832** | 131,320 |
+| 38 | **zquant** bits=3 +cal | **0.702** | **179,340** |
+| 54 | **zquant** bits=4 +cal | **0.837** | 129,551 |
 | 64 | FAISS PQ M=64,nbits=8 | 0.844 | 32,692 |
-| 68 | **zquant** bits=5 +cal | **0.907** | **194,024** |
 | 68 | turbovec bits=4 +cal | 0.904 | 106,105 |
+| 70 | **zquant** bits=5 +cal | **0.907** | **184,162** |
 
 ### nytimes-256 — 100,000 × 256, text embeddings
 
@@ -225,35 +226,37 @@ and FAISS both use all cores inside `search()`.
 |---|---|---|---|
 | 16 | **FAISS PQ** M=16,nbits=8 | **0.393** | 17,063 |
 | 32 | **FAISS PQ** M=32,nbits=8 | **0.563** | 10,427 |
-| 36 | zquant bits=2 +cal | 0.532 | 26,938 |
+| 38 | zquant bits=2 +cal | 0.536 | 25,532 |
 | 40 | FAISS RaBitQ qb=5 | 0.537 | 5,617 |
 | 64 | **FAISS PQ** M=64,nbits=8 | **0.752** | 5,043 |
 | 68 | turbovec bits=2 +cal | 0.743 | 21,691 |
-| 68 | zquant bits=3 +cal | 0.737 | 26,565 |
-| 100 | **zquant** bits=4 +cal | **0.857** | 13,040 |
-| 132 | **zquant** bits=5 +cal | **0.916** | **27,013** |
+| 70 | zquant bits=3 +cal | 0.744 | 28,308 |
+| 102 | **zquant** bits=4 +cal | **0.858** | 12,980 |
 | 132 | turbovec bits=4 +cal | 0.914 | 21,715 |
+| 134 | **zquant** bits=5 +cal | **0.920** | **26,719** |
 
 ### Reading these honestly
 
-**Against turbovec, recall is a tie and throughput is ours.** 0.907 against 0.904 at 68 B on
-SIFT; 0.916 against 0.914 at 132 B on nytimes; 0.737 against 0.743 at 68 B on nytimes, where
-*they* are ahead by 0.6 points. Storage is identical — their serialized form is the same size
-as our compact one. Our throughput is **1.2–1.9× theirs** across every matched pair (1.86× and
-1.83× on SIFT, 1.22× and 1.24× on nytimes). Their resident
-footprint is larger (270 B against our 132 B) because they dequantize to int8 in memory; our
-`expanded` mode at 260 B is what corresponds to their in-memory form.
+**Against turbovec, recall is level or slightly ahead, and throughput is ours.** 0.907
+against 0.904 on SIFT at 70 B and 68 B; 0.920 against 0.914 on nytimes at 134 B and 132 B;
+0.744 against 0.743 on nytimes at 70 B and 68 B. Calibrated, our index is 2 B per vector
+larger than theirs, for the bias the new estimator stores; uncalibrated, the sizes are
+identical. Our throughput is **1.2–1.8× theirs** across every matched pair (1.74× and 1.79×
+on SIFT, 1.23× and 1.31× on nytimes). Their resident footprint is larger (270 B against our
+134 B) because they dequantize to int8 in memory; our `expanded` mode at 262 B is what
+corresponds to their in-memory form.
 
 **Against FAISS PQ, the two systems win at opposite ends.** PQ has better recall per byte at
-low storage — decisively on SIFT (0.511 against 0.356 at 16–20 B, a 15-point gap) and modestly
-on nytimes (0.563 against 0.532 at 32–36 B). zquant wins the high-recall end on both
-corpora, and is **3–6× faster** throughout. This gap was long put down to PQ's learned
-codebooks. An experiment since suggests much of it is in how zquant assembles a score rather
-than in its codes: on SIFT, about two thirds of it
+the lowest budgets: on SIFT 0.511 at 16 B against our 0.458 at 22 B, and on nytimes 0.563 at
+32 B against 0.536 at 38 B, and on nytimes PQ at 64 B (0.752) still edges our 70 B (0.744).
+zquant wins from 38 B up on SIFT and from about 100 B up on nytimes, and is 1.5–6× faster
+than PQ at every pair in these tables. The SIFT gap was 15 points until this release and
+was long put down to PQ's learned codebooks. Most of it turned out to be how zquant assembled a score
+from its codes: a new estimator closed two thirds of it
 ([docs/notes.md](docs/notes.md), "Partitioning and the low-bit gap").
 
 **What we would not claim.** These are two corpora at d=128 and d=256, on one machine. At
-those dimensions the sub-25 B band belongs to PQ. Parallel throughput drifts with thermal
+those dimensions the lowest budgets still belong to PQ. Parallel throughput drifts with thermal
 state by up to 25% across consecutive runs, so treat the QPS column as approximate;
 single-thread figures are stable to about 5%.
 
@@ -264,16 +267,18 @@ Here PQ is no longer the system to beat. On one thread, against FAISS's plain `I
 
 | corpus | bits/dim | zquant +cal | FAISS PQ | FAISS RaBitQ | zquant QPS | RaBitQ QPS |
 |---|---|---|---|---|---|---|
-| Cohere, 100k × 768 | ~1 | 0.711 | 0.582 | **0.738** | 1,694 | 495 |
-| | ~2 | 0.847 | 0.753 | **0.861** | 1,722 | 432 |
-| | ~4 | **0.954** | 0.917 | 0.952 | 1,910 | 408 |
-| OpenAI ada-002, 50k × 1536 | ~1 | 0.769 | 0.669 | **0.786** | 1,837 | 805 |
-| | ~2 | 0.871 | 0.828 | **0.890** | 1,933 | 495 |
-| | ~4 | 0.960 | 0.944 | **0.962** | 2,070 | 511 |
+| Cohere, 100k × 768 | ~1 | **0.750** | 0.582 | 0.738 | 1,817 | 510 |
+| | ~2 | **0.868** | 0.753 | 0.861 | 1,900 | 434 |
+| | ~4 | **0.960** | 0.917 | 0.952 | 2,016 | 417 |
+| OpenAI ada-002, 50k × 1536 | ~1 | **0.791** | 0.669 | 0.786 | 1,868 | 838 |
+| | ~2 | **0.894** | 0.828 | 0.890 | 1,935 | 616 |
+| | ~4 | **0.967** | 0.944 | 0.962 | 2,072 | 568 |
 
-PQ trails at every budget, by 10–13 points at 1 bit per dimension. RaBitQ leads by 1.4–2.7
-points at 1–2 bits, using 4–16 B more per vector, and zquant searches 2.3–4.7× faster.
-[docs/comparison.md](docs/comparison.md) has the full table.
+PQ trails at every budget, by 12–17 points at 1 bit per dimension. zquant now edges RaBitQ
+at every budget, by 0.4 to 1.2 points, while storing 2–14 B less per vector and searching
+2.2–4.8× faster. Until this release RaBitQ led by 1.4–2.7 points at 1 and 2 bits; adopting
+its treatment of the corpus centre closed that. [docs/comparison.md](docs/comparison.md) has
+the full table.
 
 ### Larger corpora and higher dimensions
 
@@ -282,7 +287,10 @@ corpus with its published ground truth. The two higher-dimensional corpora are
 **synthetic**: unit vectors with a decaying spectrum and a small common offset, with exact
 ground truth, because the real corpora at d ≥ 768 in the previous section have only 50k–100k
 vectors. `+rr4` is `search_rerank` with 4× candidates. "1 thread" is one core searching
-queries in batches of 32, as the bindings do. Throughput is k=10, from C, on the M5.
+queries in batches of 32, as the bindings do. Throughput is k=10, from C, on the M5. This
+table predates the estimator change in this release and was not rerun; its recall is
+uncalibrated, which on the 100k nytimes sample barely moved (0.730 at bits=3, against 0.732
+before).
 
 | corpus | bits | B/vec | R@10 | R@10 +rr4 | QPS, 1 thread | QPS, 10 threads | add, 10 threads |
 |---|---|---|---|---|---|---|---|
@@ -320,10 +328,11 @@ orthogonal QJL sketch gives exact rather than asymptotic normalization plus ~2.7
 lower inner-product distortion. See [docs/DESIGN.md](docs/DESIGN.md) §1.2.
 
 See [docs/comparison.md](docs/comparison.md) for the measured comparison against FAISS PQ,
-FAISS RaBitQ, and turbovec. The tables above summarize it. At d=128 and 256, FAISS PQ has better
-recall per byte below about 32 B; from there up, zquant matches turbovec, beats PQ and RaBitQ,
-and is the fastest of the four. At d=768 and 1536, PQ trails at every budget, and FAISS RaBitQ
-leads by 1.4–2.7 points at 1–2 bits per dimension while searching 2.3–4.7× slower.
+FAISS RaBitQ, and turbovec. The tables above summarize it. At d=128 and 256, FAISS PQ has
+better recall per byte at the lowest budgets: below about 25 B on SIFT and below about
+100 B on nytimes. Above those, zquant matches or beats turbovec, beats PQ and RaBitQ, and is
+the fastest of the four. At d=768 and 1536, PQ trails at every budget, and zquant edges
+FAISS RaBitQ at every budget while searching 2.2–4.8× faster.
 
 ## Building
 

@@ -50,3 +50,17 @@ if [ "${1:-}" = "highdim" ]; then
     echo "$corpus: ready"
   done
 fi
+# Cohere multilingual-22-12 at 1M x 768 (~3.1 GB), for partitioned search, where corpus
+# size is what decides the gain. Only fetched by `tools/fetch_datasets.sh 1m`; then
+# `python bench/py/prepare.py cohere-768-1m`.
+if [ "${1:-}" = "1m" ]; then
+  mkdir -p data/cohere_medium_1m
+  for part in train test; do
+    if [ ! -f "data/cohere_medium_1m/$part.parquet" ]; then
+      echo "cohere_medium_1m/$part: downloading..."
+      curl -sSL --max-time 3600 -o "data/cohere_medium_1m/$part.parquet" \
+        "https://assets.zilliz.com/benchmark/cohere_medium_1m/$part.parquet"
+    fi
+  done
+  echo "cohere_medium_1m: ready"
+fi

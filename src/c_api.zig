@@ -55,8 +55,21 @@ pub const ZqConfig = extern struct {
 };
 
 const Index = struct {
+    /// Holds the vectors of an unpartitioned index. Once `zq_index_partition` has run it
+    /// stays empty and only describes the configuration; the vectors live in `ivf`.
     inner: zq.flat.FlatIndex,
+    ivf: ?zq.ivf.IvfIndex = null,
+
+    fn count(ix: *const Index) usize {
+        return if (ix.ivf) |*v| v.count() else ix.inner.count();
+    }
 };
+
+/// Lists a new searcher probes on a partitioned index, until `zq_searcher_set_probes`
+/// says otherwise: an eighth of them, and at least one.
+fn defaultProbes(lists: usize) usize {
+    return @max(1, lists / 8);
+}
 
 const Searcher = struct {
     /// The index this searcher's scratch was sized for. Query state depends on the
@@ -67,6 +80,10 @@ const Searcher = struct {
     parallel: ?zq.flat.FlatIndex.ParallelSearcher,
     /// Single-query state for `zq_score_ids`.
     scorer: zq.flat.FlatIndex.Searcher,
+    /// Set when the index was partitioned before this searcher was created. One made
+    /// before partitioning is refused by a partitioned index rather than used.
+    ivf_batch: ?zq.ivf.IvfIndex.Searcher,
+    ivf_parallel: ?zq.ivf.IvfIndex.ParallelSearcher,
     k: usize,
     capacity: usize,
 };
@@ -128,7 +145,7 @@ export fn zq_index_create(config: ?*const ZqConfig, out: ?**Index) c_int {
     const index = allocator.create(Index) catch return ZQ_ERR_ALLOC;
     errdefer allocator.destroy(index);
 
-    index.inner = zq.flat.FlatIndex.init(allocator, .{
+    index.* = .{ .inner = zq.flat.FlatIndex.init(allocator, .{
         .dim = cfg.dim,
         .bits = @intCast(cfg.bits),
         .metric = metric,
@@ -140,19 +157,22 @@ export fn zq_index_create(config: ?*const ZqConfig, out: ?**Index) c_int {
             error.OutOfMemory => ZQ_ERR_ALLOC,
             else => ZQ_ERR_UNSUPPORTED,
         };
-    };
+    } };
     slot.* = index;
     return ZQ_OK;
 }
 
 export fn zq_index_free(index: ?*Index) void {
     const ix = index orelse return;
+    if (ix.ivf) |*v| v.deinit();
     ix.inner.deinit();
     allocator.destroy(ix);
 }
 
 export fn zq_index_calibrate(index: ?*Index, rows: ?[*]const f32, n: usize) c_int {
     const ix = index orelse return ZQ_ERR_INVALID;
+    // A partitioned index centres every vector on its list already.
+    if (ix.ivf != null) return ZQ_ERR_STATE;
     const data = rows orelse return ZQ_ERR_INVALID;
     if (n == 0) return ZQ_ERR_INVALID;
     const sample = rowsOf(data, n, ix.inner.dim()) orelse return ZQ_ERR_INVALID;
@@ -175,6 +195,7 @@ export fn zq_index_calibrate_auto(
     applied: ?*c_int,
 ) c_int {
     const ix = index orelse return ZQ_ERR_INVALID;
+    if (ix.ivf != null) return ZQ_ERR_STATE;
     const data = rows orelse return ZQ_ERR_INVALID;
     if (n == 0) return ZQ_ERR_INVALID;
     const sample = rowsOf(data, n, ix.inner.dim()) orelse return ZQ_ERR_INVALID;
@@ -194,6 +215,7 @@ export fn zq_index_add(index: ?*Index, rows: ?[*]const f32, n: usize) c_int {
     const data = rows orelse return ZQ_ERR_INVALID;
     if (n == 0) return ZQ_OK;
     const vectors = rowsOf(data, n, ix.inner.dim()) orelse return ZQ_ERR_INVALID;
+    if (ix.ivf) |*v| return addPartitioned(v, vectors, 1);
     ix.inner.addBatch(vectors) catch |e| return switch (e) {
         error.OutOfMemory => ZQ_ERR_ALLOC,
         error.NonFiniteInput => ZQ_ERR_INVALID,
@@ -209,6 +231,7 @@ export fn zq_index_add_parallel(index: ?*Index, rows: ?[*]const f32, n: usize, t
     if (threads > ZQ_MAX_THREADS) return ZQ_ERR_INVALID;
     if (n == 0) return ZQ_OK;
     const vectors = rowsOf(data, n, ix.inner.dim()) orelse return ZQ_ERR_INVALID;
+    if (ix.ivf) |*v| return addPartitioned(v, vectors, @max(threads, 1));
     ix.inner.addBatchParallel(vectors, @max(threads, 1)) catch |e| return switch (e) {
         error.OutOfMemory => ZQ_ERR_ALLOC,
         error.NonFiniteInput => ZQ_ERR_INVALID,
@@ -216,14 +239,76 @@ export fn zq_index_add_parallel(index: ?*Index, rows: ?[*]const f32, n: usize, t
     return ZQ_OK;
 }
 
+fn addPartitioned(v: *zq.ivf.IvfIndex, vectors: []const f32, threads: usize) c_int {
+    v.addBatchParallel(vectors, threads) catch |e| return switch (e) {
+        error.OutOfMemory => ZQ_ERR_ALLOC,
+        error.NonFiniteInput, error.TooManyVectors => ZQ_ERR_INVALID,
+        error.NotTrained => ZQ_ERR_STATE,
+    };
+    return ZQ_OK;
+}
+
+/// Split an empty index into `lists` lists by k-means over `rows`, so that a search
+/// scans only the lists nearest each query. Once only, and before any add.
+export fn zq_index_partition(index: ?*Index, rows: ?[*]const f32, n: usize, lists: u32, threads: usize) c_int {
+    const ix = index orelse return ZQ_ERR_INVALID;
+    const data = rows orelse return ZQ_ERR_INVALID;
+    if (lists == 0 or lists > zq.ivf.max_lists) return ZQ_ERR_INVALID;
+    if (threads > ZQ_MAX_THREADS) return ZQ_ERR_INVALID;
+    if (ix.ivf != null or ix.inner.count() > 0 or ix.inner.calibrated) return ZQ_ERR_STATE;
+    const sample = rowsOf(data, n, ix.inner.dim()) orelse return ZQ_ERR_INVALID;
+    const p = ix.inner.params;
+    const expressible: zq.flat.Params = .{
+        .dim = p.dim,
+        .bits = p.bits,
+        .metric = p.metric,
+        .seed = p.seed,
+        .residency = p.residency,
+    };
+    if (!std.meta.eql(p, expressible)) return ZQ_ERR_UNSUPPORTED;
+
+    var v = zq.ivf.IvfIndex.init(allocator, .{
+        .dim = p.dim,
+        .bits = p.bits,
+        .lists = lists,
+        .metric = p.metric,
+        .seed = p.seed,
+        .residency = p.residency,
+    }) catch |e| return switch (e) {
+        error.OutOfMemory => ZQ_ERR_ALLOC,
+        error.BadListCount => ZQ_ERR_INVALID,
+        else => ZQ_ERR_UNSUPPORTED,
+    };
+    v.train(sample, @max(threads, 1)) catch |e| {
+        v.deinit();
+        return switch (e) {
+            error.OutOfMemory => ZQ_ERR_ALLOC,
+            error.IndexNotEmpty => ZQ_ERR_STATE,
+            error.EmptySample, error.NonFiniteInput, error.SampleTooLarge => ZQ_ERR_INVALID,
+        };
+    };
+    ix.ivf = v;
+    return ZQ_OK;
+}
+
+/// Lists in a partitioned index; 0 for one that is not.
+export fn zq_index_lists(index: ?*const Index) u32 {
+    const ix = index orelse return 0;
+    return if (ix.ivf) |*v| @intCast(v.listCount()) else 0;
+}
+
 /// Bytes `zq_index_serialize` writes for this index as it stands now.
 export fn zq_index_serialized_size(index: ?*const Index) usize {
     const ix = index orelse return 0;
+    if (ix.ivf != null) return 0;
     return zq.persist.serializedSize(&ix.inner);
 }
 
 export fn zq_index_serialize(index: ?*const Index, buf: ?[*]u8, len: usize, written: ?*usize) c_int {
     const ix = index orelse return ZQ_ERR_INVALID;
+    // Before the buffer check: zq_index_serialized_size says 0, so a caller may well
+    // pass NULL, and the answer should be why rather than that NULL is invalid.
+    if (ix.ivf != null) return ZQ_ERR_UNSUPPORTED;
     const out = buf orelse return ZQ_ERR_INVALID;
     const n = zq.persist.write(&ix.inner, out[0..len]) catch return ZQ_ERR_INVALID;
     if (written) |w| w.* = n;
@@ -235,25 +320,27 @@ export fn zq_index_deserialize(buf: ?[*]const u8, len: usize, out: ?**Index) c_i
     const data = buf orelse return ZQ_ERR_INVALID;
     const slot = out orelse return ZQ_ERR_INVALID;
     const index = allocator.create(Index) catch return ZQ_ERR_ALLOC;
-    index.inner = zq.persist.read(allocator, data[0..len]) catch |e| {
+    index.* = .{ .inner = zq.persist.read(allocator, data[0..len]) catch |e| {
         allocator.destroy(index);
         return switch (e) {
             error.OutOfMemory => ZQ_ERR_ALLOC,
             else => ZQ_ERR_FORMAT,
         };
-    };
+    } };
     slot.* = index;
     return ZQ_OK;
 }
 
 export fn zq_index_count(index: ?*const Index) usize {
     const ix = index orelse return 0;
-    return ix.inner.count();
+    return ix.count();
 }
 
+/// For a partitioned index this counts the codes, scalars and the 4-byte id each vector
+/// carries, but not the centroids, which are per index.
 export fn zq_index_bytes_per_vector(index: ?*const Index) usize {
     const ix = index orelse return 0;
-    return ix.inner.bytesPerVector();
+    return if (ix.ivf) |*v| v.bytesPerVector() else ix.inner.bytesPerVector();
 }
 
 export fn zq_index_dim(index: ?*const Index) u32 {
@@ -333,22 +420,51 @@ export fn zq_searcher_create(
     s.owner = ix;
     s.k = k;
     s.parallel = null;
+    s.ivf_batch = null;
+    s.ivf_parallel = null;
     s.capacity = batch;
     if (threads > 1) {
         s.parallel = zq.flat.FlatIndex.ParallelSearcher.init(allocator, ix.inner, threads, batch, k) catch {
-            s.scorer.deinit();
-            s.batch.deinit();
-            allocator.destroy(s);
+            zq_searcher_free(s);
             return ZQ_ERR_ALLOC;
         };
         s.capacity = threads * batch;
+    }
+    if (ix.ivf) |*v| {
+        const probes = defaultProbes(v.listCount());
+        s.ivf_batch = zq.ivf.IvfIndex.Searcher.init(allocator, v.*, batch, k, probes) catch {
+            zq_searcher_free(s);
+            return ZQ_ERR_ALLOC;
+        };
+        if (threads > 1) {
+            s.ivf_parallel = zq.ivf.IvfIndex.ParallelSearcher.init(allocator, v.*, threads, batch, k, probes) catch {
+                zq_searcher_free(s);
+                return ZQ_ERR_ALLOC;
+            };
+        }
     }
     slot.* = s;
     return ZQ_OK;
 }
 
+/// Lists each query scans on a partitioned index, clamped to 1..lists. More finds more
+/// of the true neighbours and costs proportionally more. A searcher starts at an eighth
+/// of the lists. `ZQ_ERR_STATE` for a searcher of an unpartitioned index.
+export fn zq_searcher_set_probes(searcher: ?*Searcher, probes: usize) c_int {
+    const s = searcher orelse return ZQ_ERR_INVALID;
+    if (probes == 0) return ZQ_ERR_INVALID;
+    // Only the searcher is touched: bindings let a searcher outlive its index.
+    if (s.ivf_batch) |*b| {
+        b.setProbes(probes) catch return ZQ_ERR_ALLOC;
+    } else return ZQ_ERR_STATE;
+    if (s.ivf_parallel) |*p| p.setProbes(probes) catch return ZQ_ERR_ALLOC;
+    return ZQ_OK;
+}
+
 export fn zq_searcher_free(searcher: ?*Searcher) void {
     const s = searcher orelse return;
+    if (s.ivf_parallel) |*p| p.deinit();
+    if (s.ivf_batch) |*b| b.deinit();
     if (s.parallel) |*p| p.deinit();
     s.scorer.deinit();
     s.batch.deinit();
@@ -363,24 +479,41 @@ export fn zq_searcher_capacity(searcher: ?*const Searcher) usize {
 
 /// Validate a search call and run it. Returns the searcher's results, `s.k` per query,
 /// of which the first `@min(s.k, count)` in each row are real.
-fn runSearch(ix: *Index, s: *Searcher, q: [*]const f32, nq: usize) error{ Invalid, Alloc }![]const zq.flat.Entry {
+fn runSearch(ix: *Index, s: *Searcher, q: [*]const f32, nq: usize) error{ Invalid, Alloc, State }![]const zq.flat.Entry {
     if (s.owner != ix) return error.Invalid;
     if (nq > s.capacity) return error.Invalid;
     const batch = rowsOf(q, nq, ix.inner.dim()) orelse return error.Invalid;
     // A NaN query scores NaN against everything and the collector's order is then
     // meaningless; refuse it rather than return confident garbage.
     if (!zq.flat.allFinite(batch)) return error.Invalid;
+    if (ix.ivf) |*v| {
+        const b = &(s.ivf_batch orelse return error.State);
+        return if (s.ivf_parallel) |*p|
+            v.searchBatchParallel(batch, p) catch return error.Alloc
+        else
+            v.searchBatch(batch, b);
+    }
     return if (s.parallel) |*p|
         ix.inner.searchBatchParallel(batch, p) catch return error.Alloc
     else
         ix.inner.searchBatch(batch, &s.batch);
 }
 
-fn statusOf(e: error{ Invalid, Alloc }) c_int {
+fn statusOf(e: error{ Invalid, Alloc, State }) c_int {
     return switch (e) {
         error.Invalid => ZQ_ERR_INVALID,
         error.Alloc => ZQ_ERR_ALLOC,
+        error.State => ZQ_ERR_STATE,
     };
+}
+
+/// How many of a result row's entries are real: a partitioned index pads the tail of a
+/// row whose probed lists held fewer than k vectors.
+fn realCount(row: []const zq.flat.Entry) usize {
+    for (row, 0..) |e, i| {
+        if (e.id == zq.ivf.no_id) return i;
+    }
+    return row.len;
 }
 
 /// Write `k` results per row, padding past `found` with id UINT32_MAX and score -inf.
@@ -416,7 +549,7 @@ export fn zq_search(
 
     const results = runSearch(ix, s, q, nq) catch |e| return statusOf(e);
     const k = s.k;
-    const found = @min(k, ix.inner.count());
+    const found = @min(k, ix.count());
     for (0..nq) |i| writeRow(results[i * k ..][0..found], k, ids + i * k, scores + i * k);
     return ZQ_OK;
 }
@@ -444,7 +577,7 @@ export fn zq_search_rerank(
     const ids = out_ids orelse return ZQ_ERR_INVALID;
     const scores = out_scores orelse return ZQ_ERR_INVALID;
     if (k == 0 or k > s.k) return ZQ_ERR_INVALID;
-    const count = ix.inner.count();
+    const count = ix.count();
     if (n_originals < count) return ZQ_ERR_INVALID;
     const d = ix.inner.dim();
     const corpus = rowsOf(orig, n_originals, d) orelse return ZQ_ERR_INVALID;
@@ -455,7 +588,8 @@ export fn zq_search_rerank(
     for (0..nq) |i| {
         // The searcher's result buffer is scratch until the next search, so reranking
         // in place is safe.
-        const row: []zq.flat.Entry = @constCast(results[i * s.k ..][0..found]);
+        const full: []zq.flat.Entry = @constCast(results[i * s.k ..][0..found]);
+        const row = full[0..realCount(full)];
         const best = zq.rerank.rerank(ix.inner.metric, q[i * d ..][0..d], corpus, d, row, k);
         writeRow(best, k, ids + i * k, scores + i * k);
     }
@@ -478,6 +612,8 @@ export fn zq_score_ids(
     const id_ptr = ids orelse return ZQ_ERR_INVALID;
     const scores = out_scores orelse return ZQ_ERR_INVALID;
     if (s.owner != ix) return ZQ_ERR_INVALID;
+    // A partitioned index has no id-to-slot map yet.
+    if (ix.ivf != null) return ZQ_ERR_UNSUPPORTED;
     if (n == 0) return ZQ_OK;
     const row = q[0..ix.inner.dim()];
     if (!zq.flat.allFinite(row)) return ZQ_ERR_INVALID;

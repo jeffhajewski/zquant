@@ -105,9 +105,13 @@ pub fn build(b: *std.Build) void {
     lib_step.dependOn(&b.addInstallArtifact(lib_shared, .{}).step);
     lib_step.dependOn(&install_pc.step);
 
+    // `zig build test -Dtest-filter=name` runs only the unit tests whose names contain
+    // `name`; give it more than once for several.
+    const test_filters = b.option([]const []const u8, "test-filter", "Run only unit tests whose names contain this") orelse &.{};
     const unit_tests = b.addTest(.{
         .name = "zquant-test",
         .root_module = zquant,
+        .filters = test_filters,
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
 

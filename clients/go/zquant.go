@@ -1,4 +1,5 @@
-// Package zquant provides a flat quantized vector index backed by TurboQuant.
+// Package zquant provides a quantized vector index backed by TurboQuant: flat, or
+// partitioned into lists that a search scans only the nearest of.
 //
 //	index, err := zquant.New(zquant.Config{Dim: 256, Bits: 5})
 //	defer index.Close()
@@ -7,10 +8,11 @@
 //
 // Vectors are float32, row-major, one per row.
 //
-// Beyond that: SearchRerank and ScoreIDs for exact reranking and scoring chosen ids,
-// AddParallel for multi-threaded encoding, Save, Load and MarshalBinary for
-// persistence, and Codec for encoding and decoding vectors without an index. Every
-// error is a *Error that errors.Is matches against one of the Err sentinels.
+// Beyond that: Partition for partitioned (IVF) search, SearchRerank and ScoreIDs for
+// exact reranking and scoring chosen ids, AddParallel for multi-threaded encoding, Save,
+// Load and MarshalBinary for persistence, and Codec for encoding and decoding vectors
+// without an index. Every error is a *Error that errors.Is matches against one of the
+// Err sentinels.
 package zquant
 
 /*
@@ -158,12 +160,12 @@ type Config struct {
 // being used with the index it was made for without holding a pointer back to it.
 var indexIDs atomic.Uint64
 
-// Index is a flat (exhaustive) quantized index. Every vector is scanned for every
+// Index is a quantized index. Flat (the default), every vector is scanned for every
 // query, so recall is bounded only by quantization and cost grows linearly with the
-// corpus.
+// corpus. Partition makes it scan only the lists nearest each query instead.
 //
 // Every method is safe to call from any goroutine. Searches run in parallel with each
-// other; Add and Calibrate wait for searches in flight and hold new ones off until they
+// other; Add, Calibrate and Partition wait for searches in flight and hold new ones off until they
 // finish, because the native library forbids a mutation overlapping any other call on
 // the same index. Close waits for every call in flight, and any call after it returns
 // an error wrapping ErrClosed.
@@ -407,6 +409,66 @@ func (ix *Index) AddParallel(vectors []float32, threads int) error {
 	st := C.zq_index_add_parallel(ix.handle, (*C.float)(&vectors[0]), C.size_t(n), C.size_t(threads))
 	runtime.KeepAlive(ix)
 	return check(st, "add")
+}
+
+// Partition splits the index into lists by k-means over a sample, using up to threads
+// threads (0 or 1: the calling goroutine). It must precede Add, and can be done once.
+//
+// Each vector added afterwards goes to the list whose centroid is nearest its direction
+// and is stored relative to that centroid. A search ranks the centroids against each
+// query and scans only the nearest few lists: an eighth of them unless a Searcher's
+// SetProbes says otherwise. Search uses that default; for another, make a Searcher with
+// NewSearcher, call SetProbes, and search with SearchWith. Storing vectors against
+// nearby centroids also makes their estimates more accurate, so recall rises even with
+// every list scanned.
+//
+// Around sqrt(n) lists suits a corpus of n vectors. The sample needs at least lists
+// rows; past 256 per list the rest are not used. Partitioning takes the place of
+// Calibrate. A partitioned index cannot yet be saved, and ScoreIDs is not available on
+// it (errors matching ErrUnsupported). Searchers made before partitioning cannot search
+// it (an error matching ErrState).
+func (ix *Index) Partition(sample []float32, lists, threads int) error {
+	n, err := ix.rows(sample, "sample")
+	if err != nil {
+		return err
+	}
+	if lists < 1 || lists > 1<<16 {
+		return invalid("lists %d is outside 1..%d", lists, 1<<16)
+	}
+	if threads < 0 || threads > MaxThreads {
+		return invalid("threads %d is outside 0..%d", threads, MaxThreads)
+	}
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	if ix.handle == nil {
+		return errIndexClosed
+	}
+	st := C.zq_index_partition(ix.handle, (*C.float)(&sample[0]), C.size_t(n), C.uint32_t(lists), C.size_t(threads))
+	runtime.KeepAlive(ix)
+	if err := check(st, "partition"); err != nil {
+		return err
+	}
+	// Cached searchers predate the lists, so they could not search the index now.
+	ix.cacheMu.Lock()
+	for _, s := range ix.cache {
+		s.Close()
+	}
+	ix.cache = map[[2]int]*Searcher{}
+	ix.cacheMu.Unlock()
+	return nil
+}
+
+// Lists reports the number of lists in a partitioned index, or 0 for a flat one or once
+// the index is closed.
+func (ix *Index) Lists() int {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	if ix.handle == nil {
+		return 0
+	}
+	n := int(C.zq_index_lists(ix.handle))
+	runtime.KeepAlive(ix)
+	return n
 }
 
 // CalibrateAuto measures the sample's centroid norm and calibrates only if it is at

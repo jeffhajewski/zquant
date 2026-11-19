@@ -75,8 +75,9 @@ never throws.
 
 ## What it is
 
-A **flat** index: every vector is scanned for every query. No graph, no partitioning, so
-recall is limited only by quantization and cost grows linearly with the corpus.
+By default a **flat** index: every vector is scanned for every query, so recall is limited
+only by quantization and cost grows linearly with the corpus. `partition` turns it into a
+partitioned (IVF) index that scans only the parts of the corpus nearest each query.
 
 Measured through this binding on 100k × 256 vectors at `bits=5`:
 
@@ -184,6 +185,33 @@ const { centroidNorm, applied } = index.calibrate(sample, { auto: true });
 
 It calibrates only when the norm is at least 0.3, and tells you the norm and whether it
 went ahead.
+
+## Partitioning
+
+`index.partition(sample, { lists })` splits the index into lists by k-means, before any
+`add`. Each vector goes to the list whose centroid is nearest its direction and is stored
+relative to that centroid. A search ranks the centroids against each query and scans only
+the nearest few lists:
+
+```ts
+index.partition(sample, { lists: 1000, threads: 8 }); // about sqrt(n) lists
+index.add(vectors, { threads: 8 });
+const result = index.search(queries, { k: 10, probes: 64 });
+index.probes = 64; // or set it once
+```
+
+`probes` defaults to an eighth of the lists. More finds more of the true neighbours and
+costs proportionally more time.
+Storing each vector against a nearby centroid also makes its estimate more accurate than
+against the one corpus centre that calibration fits, so a partitioned index can beat a
+calibrated flat one on recall as well as speed. On 100k Cohere embeddings at bits 2,
+scanning 6% of the lists found R@10 0.775 at 11k queries a second on one core, against
+0.750 at 1.8k for the calibrated flat index.
+
+Partitioning takes the place of calibration, costs 4 more bytes per vector (for its id)
+plus `lists × dim × 4` bytes of centroids, and can be done once, before any vector is
+added. The sample needs at least `lists` rows; 256 per list is all it uses.
+A partitioned index cannot be saved yet, and `scoreIds` is not available on it.
 
 ## Saving and loading
 

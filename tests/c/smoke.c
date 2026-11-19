@@ -253,6 +253,46 @@ int main(void) {
     printf("self-retrieval: %d/%zu  top score %.4f\n", self_hits, nq, scores[0]);
     if (self_hits < (int)nq - 1) { printf("FAIL: self-retrieval too low\n"); return 1; }
 
+    /* Partitioning: every vector retrieves itself when every list is probed, a searcher
+     * made before partitioning is refused, and what a partitioned index cannot do yet
+     * says so. */
+    {
+        zq_index *pv = NULL;
+        zq_searcher *before = NULL, *after = NULL;
+        if (zq_index_create(&cfg, &pv) != ZQ_OK) { printf("FAIL create partitioned\n"); return 1; }
+        if (zq_index_lists(pv) != 0) { printf("FAIL: lists before partition\n"); return 1; }
+        if (zq_searcher_create(pv, 4, K, 1, &before) != ZQ_OK) { printf("FAIL searcher before\n"); return 1; }
+        if (zq_searcher_set_probes(before, 2) != ZQ_ERR_STATE) { printf("FAIL: probes on flat\n"); return 1; }
+        if (zq_index_partition(pv, base, N, 0, 1) != ZQ_ERR_INVALID) { printf("FAIL: 0 lists accepted\n"); return 1; }
+        if (zq_index_partition(pv, base, 3, 8, 1) != ZQ_ERR_INVALID) { printf("FAIL: tiny sample accepted\n"); return 1; }
+        st = zq_index_partition(pv, base, N, 16, 2);
+        if (st != ZQ_OK) { printf("FAIL partition: %s\n", zq_status_string(st)); return 1; }
+        if (zq_index_lists(pv) != 16) { printf("FAIL: lists after partition\n"); return 1; }
+        if (zq_index_partition(pv, base, N, 16, 1) != ZQ_ERR_STATE) { printf("FAIL: partitioned twice\n"); return 1; }
+        if (zq_index_calibrate(pv, base, N) != ZQ_ERR_STATE) { printf("FAIL: calibrated a partitioned index\n"); return 1; }
+        if (zq_index_add_parallel(pv, base, N, 3) != ZQ_OK) { printf("FAIL add partitioned\n"); return 1; }
+        if (zq_index_count(pv) != N) { printf("FAIL: partitioned count\n"); return 1; }
+
+        uint32_t pid[4 * K]; float psc[4 * K];
+        if (zq_search(pv, before, base, 1, pid, psc) != ZQ_ERR_STATE) { printf("FAIL: stale searcher accepted\n"); return 1; }
+        if (zq_searcher_create(pv, 4, K, 1, &after) != ZQ_OK) { printf("FAIL searcher after\n"); return 1; }
+        if (zq_searcher_set_probes(after, 0) != ZQ_ERR_INVALID) { printf("FAIL: 0 probes accepted\n"); return 1; }
+        if (zq_searcher_set_probes(after, 1000) != ZQ_OK) { printf("FAIL set probes\n"); return 1; }
+        for (int i = 0; i < 40; i += 4) {
+            if (zq_search(pv, after, base + (size_t)i * DIM, 4, pid, psc) != ZQ_OK) { printf("FAIL search partitioned\n"); return 1; }
+            for (int j = 0; j < 4; j++)
+                if (pid[j * K] != (uint32_t)(i + j)) { printf("FAIL: partitioned self-retrieval at %d\n", i + j); return 1; }
+        }
+        size_t written = 0;
+        if (zq_index_serialized_size(pv) != 0) { printf("FAIL: partitioned size\n"); return 1; }
+        if (zq_index_serialize(pv, NULL, 0, &written) != ZQ_ERR_UNSUPPORTED) { printf("FAIL: partitioned save\n"); return 1; }
+        uint32_t one = 0;
+        if (zq_score_ids(pv, after, base, &one, 1, psc) != ZQ_ERR_UNSUPPORTED) { printf("FAIL: partitioned score_ids\n"); return 1; }
+        zq_searcher_free(before);
+        zq_searcher_free(after);
+        zq_index_free(pv);
+    }
+
     /* Codec round-trip: the KV-cache path. Checks that decoding reconstructs the input
      * to within quantization error, and that the packed size is what the header says. */
     zq_codec_config ccfg = { .dim = DIM, .bits = 5, .seed = 7 };

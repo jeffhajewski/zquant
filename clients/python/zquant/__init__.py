@@ -195,7 +195,7 @@ def _free_searcher(handle: int) -> None:
 
 
 class Index:
-    """A flat (exhaustive) quantized index.
+    """A quantized index: flat (exhaustive) unless `partition` splits it into lists.
 
     Every vector is scanned for every query — there is no graph or partitioning — so
     recall is bounded only by quantization, and cost grows linearly with the corpus.
@@ -243,6 +243,7 @@ class Index:
             self._config = None
         self._rw = RWLock()
         self._pool = SearcherPool(_create_searcher, _free_searcher)
+        self._probes: Optional[int] = None
 
     def _live(self) -> int:
         """The native handle. Call with the lock held, read or write."""
@@ -358,6 +359,61 @@ class Index:
                 a, "calibrate", "sample")
         return Calibration(centroid_norm=float(norm.value), applied=bool(applied.value))
 
+    def partition(self, sample, lists: int, threads: int = 1) -> None:
+        """Split the index into `lists` lists by k-means over a sample. Must precede `add`.
+
+        Each vector added afterwards goes to the list whose centroid is nearest its
+        direction and is stored relative to that centroid. A search then scans only the
+        `probes` lists nearest each query, an eighth of them unless you say otherwise
+        (`probes` on `search`, or the `probes` property). Storing vectors against nearby
+        centroids also makes their estimates more accurate, so recall rises even with
+        every list scanned.
+
+        Around `sqrt(n)` lists suits a corpus of n vectors. The sample needs at least
+        `lists` rows; past 256 per list the rest are not used. Partitioning takes the
+        place of `calibrate`, and an index can be partitioned only once.
+
+        A partitioned index cannot yet be saved, and `score_ids` is not available on it.
+        """
+        lists = _int_arg(lists, "lists", 1, 1 << 16)
+        threads = _threads_arg(threads)
+        a = _as_rows(sample, self._dim, "sample")
+        with self._rw.write():
+            h = self._live()
+            _check_rows(_LIB.zq_index_partition(h, _ptr(a, ctypes.c_float), a.shape[0], lists,
+                                                threads), a, "partition", "sample")
+            # Searchers made before partitioning have no lists to probe.
+            self._pool.free_all()
+
+    @property
+    def lists(self) -> int:
+        """Lists in a partitioned index, or 0 for a flat one."""
+        with self._rw.read():
+            return int(_LIB.zq_index_lists(self._live()))
+
+    @property
+    def probes(self) -> Optional[int]:
+        """Lists each query scans on a partitioned index, when `search` is not given
+        `probes`. None means an eighth of the lists."""
+        return self._probes
+
+    @probes.setter
+    def probes(self, value: Optional[int]) -> None:
+        self._probes = None if value is None else _int_arg(value, "probes", 1, 1 << 16)
+
+    def _apply_probes(self, h: int, searcher: int, probes: Optional[int]) -> None:
+        """Set the searcher's probes for this call. Call with the read lock held."""
+        lists = int(_LIB.zq_index_lists(h))
+        if probes is not None:
+            probes = _int_arg(probes, "probes", 1, 1 << 16)
+            if lists == 0:
+                raise StateError("probes applies only to a partitioned index", ZQ_ERR_STATE)
+        if lists == 0:
+            return
+        if probes is None:
+            probes = self._probes if self._probes is not None else max(1, lists // 8)
+        _check(_LIB.zq_searcher_set_probes(searcher, probes), "search")
+
     def add(self, vectors, threads: int = 1) -> None:
         """Append vectors; the first gets id `len(index)` as it was before the call.
 
@@ -378,10 +434,13 @@ class Index:
                                                     threads)
             _check_rows(status, a, "add", "vectors")
 
-    def search(self, queries, k: int = 10, threads: int = 1):
+    def search(self, queries, k: int = 10, threads: int = 1, probes: Optional[int] = None):
         """Return `(ids, scores)`, each shape `(n_queries, k)`, best first.
 
-        Where the index holds fewer than `k` vectors the tail is `2**32-1` / `-inf`.
+        Where the index holds fewer than `k` vectors the tail is `2**32-1` / `-inf`, as
+        it is on a partitioned index where the lists scanned hold fewer than `k`.
+        `probes` sets how many lists each query scans on a partitioned index, for this
+        call only.
         `threads > 1` splits the batch across workers, which only pays for batches at
         least that large. Separate Python threads calling `search` at once also run in
         parallel, each on its own searcher.
@@ -398,6 +457,7 @@ class Index:
             if _LIB.zq_index_count(h) == 0:
                 raise StateError("search on an empty index", ZQ_ERR_STATE)
             with self._pool.borrow(h, k, threads) as searcher:
+                self._apply_probes(h, searcher, probes)
                 capacity = _LIB.zq_searcher_capacity(searcher)
                 # The native call takes at most `capacity` queries, so long inputs are
                 # chunked here rather than making that the caller's problem.
@@ -420,7 +480,7 @@ class Index:
         return ids, scores
 
     def search_rerank(self, queries, originals, k: int = 10, candidates: Optional[int] = None,
-                      threads: int = 1):
+                      threads: int = 1, probes: Optional[int] = None):
         """Search, then rescore the candidates exactly against the original vectors.
 
         Fetches `candidates` results per query from the quantized index (default
@@ -432,6 +492,7 @@ class Index:
         `originals` holds the vectors you added, row i being the one that got id i, and
         must cover every id in the index. Keeping them is the price: full precision
         costs `4 * dim` bytes per vector, against the index's `bytes_per_vector`.
+        `probes` is as for `search`.
         Pass float32 C-contiguous rows to avoid a copy on every call.
         """
         k = _int_arg(k, "k", 1, 1 << 32)
@@ -455,6 +516,7 @@ class Index:
                 raise ValueError(f"originals has {orig.shape[0]} rows, but the index holds "
                                  f"{count} vectors and every one needs its original")
             with self._pool.borrow(h, candidates, threads) as searcher:
+                self._apply_probes(h, searcher, probes)
                 capacity = _LIB.zq_searcher_capacity(searcher)
                 for start in range(0, nq, capacity):
                     n = min(capacity, nq - start)

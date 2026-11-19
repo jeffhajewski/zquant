@@ -27,6 +27,8 @@ pub const Purpose = enum(u32) {
     sketch_signs = 3,
     sketch_permutation = 4,
     dense_rotation = 5,
+    /// Which sample rows train an IVF index's lists, when it is given more than it uses.
+    ivf_training = 6,
     testing = 0xFFFF_FFFF,
 };
 

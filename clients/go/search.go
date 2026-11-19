@@ -69,6 +69,25 @@ func (ix *Index) newSearcherLocked(k, threads int) (*Searcher, error) {
 // K reports how many results per query the searcher returns.
 func (s *Searcher) K() int { return s.k }
 
+// SetProbes sets how many lists each query scans on a partitioned index, from then on.
+// Values above the number of lists scan them all. More probes find more of the true
+// neighbours and cost proportionally more time; a new searcher starts at an eighth of
+// the lists. On a searcher of an index that is not partitioned it returns an error
+// matching ErrState.
+func (s *Searcher) SetProbes(probes int) error {
+	if probes < 1 {
+		return invalid("probes %d must be at least 1", probes)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.handle == nil {
+		return errSearcherClosed
+	}
+	st := C.zq_searcher_set_probes(s.handle, C.size_t(probes))
+	runtime.KeepAlive(s)
+	return check(st, "set probes")
+}
+
 // Close releases the searcher, waiting for a search in flight on it to finish. It is
 // idempotent.
 func (s *Searcher) Close() error {

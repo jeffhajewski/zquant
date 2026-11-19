@@ -168,10 +168,13 @@ def bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     decl("zq_index_dim", [vp], ctypes.c_uint32)
     decl("zq_index_config", [vp, ctypes.POINTER(Config)])
     decl("zq_index_calibrated", [vp], ctypes.c_int)
+    decl("zq_index_partition", [vp, f32p, size, ctypes.c_uint32, size])
+    decl("zq_index_lists", [vp], ctypes.c_uint32)
 
     decl("zq_searcher_create", [vp, size, size, size, ctypes.POINTER(vp)])
     decl("zq_searcher_free", [vp], None)
     decl("zq_searcher_capacity", [vp], size)
+    decl("zq_searcher_set_probes", [vp, size])
     decl("zq_search", [vp, vp, f32p, size, u32p, f32p])
     decl("zq_search_rerank", [vp, vp, f32p, size, f32p, size, size, u32p, f32p])
     decl("zq_score_ids", [vp, vp, f32p, u32p, size, f32p])

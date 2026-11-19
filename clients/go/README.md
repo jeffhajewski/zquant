@@ -149,6 +149,37 @@ norm, applied, err := index.CalibrateAuto(sample)
 It calibrates only when the norm is at least 0.3, and tells you the norm and what it
 did. `Calibrate(sample)` calibrates unconditionally.
 
+## Partitioning
+
+`Partition(sample, lists, threads)` splits the index into lists by k-means, before any
+`Add`. Each vector goes to the list whose centroid is nearest its direction and is stored
+relative to that centroid. A search ranks the centroids against each query and scans only
+the nearest few lists:
+
+```go
+index.Partition(sample, 1000, 8) // about sqrt(n) lists
+index.AddParallel(vectors, 8)
+results, err := index.Search(queries, 10, 1) // probes an eighth of the lists
+
+s, _ := index.NewSearcher(10, 1)
+s.SetProbes(64) // or choose
+results, err = index.SearchWith(s, queries)
+```
+
+More probes find more of the true neighbours and cost proportionally more time.
+Storing each vector against a nearby centroid also makes its estimate more accurate than
+against the one corpus centre that calibration fits, so a partitioned index can beat a
+calibrated flat one on recall as well as speed. On 100k Cohere embeddings at bits 2,
+scanning 6% of the lists found R@10 0.775 at 11k queries a second on one core, against
+0.750 at 1.8k for the calibrated flat index.
+
+Partitioning takes the place of calibration, costs 4 more bytes per vector (for its id)
+plus `lists × dim × 4` bytes of centroids, and can be done once, before any vector is
+added. The sample needs at least `lists` rows; 256 per list is all it uses.
+A partitioned index cannot be saved yet, and `ScoreIDs` is not available on it (both
+return errors matching `ErrUnsupported`). Searchers made before `Partition` cannot search
+the partitioned index.
+
 ## Codec
 
 An index answers "which stored vectors best match this query?" Sometimes you want

@@ -248,12 +248,17 @@ function declare(lib: koffi.IKoffiLib) {
     indexDim: lib.func('uint32_t zq_index_dim(zq_index *index)'),
     indexConfig: lib.func('int zq_index_config(zq_index *index, _Out_ zq_config *out)'),
     indexCalibrated: lib.func('int zq_index_calibrated(zq_index *index)'),
+    indexPartition: lib.func(
+      'int zq_index_partition(zq_index *index, float *rows, size_t n, uint32_t lists, size_t threads)',
+    ),
+    indexLists: lib.func('uint32_t zq_index_lists(zq_index *index)'),
 
     searcherCreate: lib.func(
       'int zq_searcher_create(zq_index *index, size_t batch, size_t k, size_t threads, _Out_ zq_searcher **out)',
     ),
     searcherFree: lib.func('void zq_searcher_free(zq_searcher *searcher)'),
     searcherCapacity: lib.func('size_t zq_searcher_capacity(zq_searcher *searcher)'),
+    searcherSetProbes: lib.func('int zq_searcher_set_probes(zq_searcher *searcher, size_t probes)'),
 
     search: lib.func(
       'int zq_search(zq_index *index, zq_searcher *searcher, float *queries, size_t nq, _Out_ uint32_t *out_ids, _Out_ float *out_scores)',

@@ -74,10 +74,10 @@ If `kernels` says `scalar`, you're on the slow fallback.
 
 ## What it is
 
-A **flat** index: every query is compared against every vector. There's no graph or
-partitioning, so recall is limited only by quantization, and cost grows linearly with the
-corpus. That's the right shape up to a few million vectors, or whenever predictable
-recall matters more than sublinear search.
+By default a **flat** index: every query is compared against every vector, so recall is
+limited only by quantization, and cost grows linearly with the corpus. Call `partition`
+before adding and it becomes a partitioned (IVF) index instead, which scans only the
+parts of the corpus nearest each query (see [Partitioning](#partitioning)).
 
 `bits` is 2 to 6. Storage is roughly `dim * (bits-1) / 8` bytes per vector, and
 `index.bytes_per_vector` gives the exact figure. On 100k × 256 embeddings, `bits=5` gives
@@ -154,6 +154,34 @@ result.applied          # whether it calibrated (it does at 0.3 and above)
 
 Either way, calibration has to happen before the first `add`, and a few hundred rows of
 sample is plenty.
+
+## Partitioning
+
+`index.partition(sample, lists=n)` splits the index into `n` lists by k-means, before any
+`add`. Each vector goes to the list whose centroid is nearest its direction, and is
+stored relative to that centroid. A search ranks the centroids against each query and
+scans only the nearest few lists:
+
+```python
+index = zquant.Index(dim=768, bits=3)
+index.partition(sample, lists=1000, threads=8)   # about sqrt(n) lists
+index.add(vectors, threads=8)
+ids, scores = index.search(queries, k=10, probes=64)
+index.probes = 64                                  # or set it once
+```
+
+`probes` is how many lists each query scans, an eighth of them unless you say otherwise.
+More finds more of the true neighbours and costs proportionally more time. Storing each
+vector against a nearby centroid also makes its estimate more accurate than against the
+one corpus centre `calibrate` fits, so a partitioned index can beat a calibrated flat one
+on recall as well as speed. On 100k Cohere embeddings at `bits=2`, scanning 6% of the
+lists found R@10 0.775 at 11k queries a second on one core, against 0.750 at 1.8k for
+the calibrated flat index.
+
+Partitioning takes the place of calibration, costs 4 more bytes per vector (for its id)
+plus `lists * dim * 4` bytes of centroids, and can be done once. The sample needs at
+least `lists` rows; 256 per list is all it uses. A partitioned index cannot be saved yet,
+and `score_ids` is not available on it.
 
 ## Saving and loading
 

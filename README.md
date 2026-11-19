@@ -49,9 +49,13 @@ ids, scores = index.search_rerank(queries, vectors, k=10)   # exact top-k from 4
 index.save("vectors.zq")
 ```
 
-A flat (exhaustive) index and a standalone quantizer (`Codec`), with the same API in every
-binding:
+An index, flat or partitioned, and a standalone quantizer (`Codec`), with the same API in
+every binding:
 
+- **Partitioned search.** `partition` splits the index into k-means lists before you add
+  to it, and a search then scans only the lists nearest each query. On a million Cohere
+  embeddings it matches the flat index's recall at 2.7 to 12 times its speed, depending on
+  bit width, and scanning an eighth of the lists beats it outright at bits 2 and 3.
 - **Save and load.** Versioned, checksummed, the same bytes on every platform. A loaded
   index searches and accepts new vectors exactly as the saved one did.
 - **Exact reranking.** Over-fetch candidates and rescore them against your full-precision
@@ -280,6 +284,30 @@ at every budget, by 0.4 to 1.2 points, while storing 2–14 B less per vector an
 its treatment of the corpus centre closed that. [docs/comparison.md](docs/comparison.md) has
 the full table.
 
+### Partitioned search at a million vectors
+
+Cohere, 1M × 768, 1000 lists, one thread, k=10, through the Python client
+(`bench/py/partition.py`). Each cell is R@10, then queries per second:
+
+| | flat, calibrated | 3% of lists | 6% | 12.5% (default) | 25% |
+|---|---|---|---|---|---|
+| bits=2 | 0.779 / 187 | **0.780 / 2,205** | 0.795 / 1,340 | 0.803 / 866 | 0.807 / 525 |
+| bits=3 | 0.884 / 202 | 0.866 / 2,344 | **0.885 / 1,456** | 0.897 / 899 | 0.902 / 538 |
+| bits=5 | 0.966 / 206 | 0.919 / 2,396 | 0.946 / 1,441 | 0.960 / 867 | **0.967 / 557** |
+| FAISS IVF-RaBitQ, 1 bit | — | 0.765 / 1,245 | 0.779 / 636 | 0.786 / 319 | 0.787 / 163 |
+
+Bold marks the first setting to match the flat index: 12× its speed at bits=2, 7× at
+bits=3, 2.7× at bits=5. Recall goes up as well as speed because each vector is stored
+against a nearby centroid rather than the corpus centre, which makes its estimate more
+precise; scanning every list, bits=2 reaches 0.808. FAISS's IVF-RaBitQ, on the same number
+of lists, finds 1.5 to 2 points fewer at the same probes, at a third to a half of the
+speed.
+
+A partitioned index costs 4 B more per vector than a calibrated flat one, plus the
+centroids (3 MB here). Building it took 24 s on 8 threads, against 1.5 s for the flat
+index, mostly k-means. It cannot be saved yet. [docs/notes.md](docs/notes.md),
+"Partitioning, measured through the library", has the 100k and 50k corpora as well.
+
 ### Larger corpora and higher dimensions
 
 zquant alone, without the other systems (they were not rerun). nytimes is the full 290k
@@ -332,7 +360,8 @@ FAISS RaBitQ, and turbovec. The tables above summarize it. At d=128 and 256, FAI
 better recall per byte at the lowest budgets: below about 25 B on SIFT and below about
 100 B on nytimes. Above those, zquant matches or beats turbovec, beats PQ and RaBitQ, and is
 the fastest of the four. At d=768 and 1536, PQ trails at every budget, and zquant edges
-FAISS RaBitQ at every budget while searching 2.2–4.8× faster.
+FAISS RaBitQ at every budget while searching 2.2–4.8× faster. Partitioned, it finds more
+than FAISS's IVF-RaBitQ on the same lists, and faster.
 
 ## Building
 

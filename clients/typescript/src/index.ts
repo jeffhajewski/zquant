@@ -21,6 +21,7 @@ import {
   addSearcher,
   adoptCodec,
   adoptIndex,
+  dropSearchers,
   releaseCodec,
   releaseIndex,
 } from './handles.js';
@@ -161,6 +162,10 @@ function checkThreads(threads: unknown): number {
   return checkInt(threads, 'threads', 0, MAX_THREADS);
 }
 
+function checkProbes(probes: unknown): number {
+  return checkInt(probes, 'probes', 1, 65536);
+}
+
 function checkK(k: unknown, name = 'k'): number {
   if (typeof k !== 'number' || !Number.isInteger(k) || k < 1) {
     throw new RangeError(`${name} must be at least 1, got ${String(k)}`);
@@ -196,6 +201,18 @@ export interface AddOptions {
 export interface SearchOptions {
   k?: number;
   /** >1 splits the batch across workers; only pays for batches at least that large. */
+  threads?: number;
+  /**
+   * Lists each query scans on a partitioned index, for this call: 1..65536, clamped to
+   * the number of lists. Defaults to `index.probes`, or an eighth of the lists.
+   */
+  probes?: number;
+}
+
+export interface PartitionOptions {
+  /** Number of lists, 1..65536. Around sqrt(n) suits a corpus of n vectors. */
+  lists: number;
+  /** k-means on up to this many threads (0..1024). */
   threads?: number;
 }
 
@@ -249,10 +266,10 @@ let adopting: unknown = null;
 const BATCH = 32;
 
 /**
- * A flat (exhaustive) quantized index.
+ * A quantized index: flat (exhaustive) unless `partition` splits it into lists.
  *
- * Every vector is scanned for every query — no graph, no partitioning — so recall is
- * bounded only by quantization and cost grows linearly with the corpus.
+ * Flat, every vector is scanned for every query, so recall is bounded only by
+ * quantization and cost grows linearly with the corpus.
  *
  * Call `close()` when done. An index that is garbage collected without being closed is
  * freed then, but when that happens is up to the engine.
@@ -407,6 +424,65 @@ export class Index {
     return undefined;
   }
 
+  /**
+   * Split the index into lists by k-means over a sample. Must precede `add`, and can be
+   * done once.
+   *
+   * Each vector added afterwards goes to the list whose centroid is nearest its direction
+   * and is stored relative to that centroid. A search then scans only the lists nearest
+   * each query: `probes` of them, an eighth unless set. Storing vectors against nearby
+   * centroids also makes their estimates more accurate, so recall rises even with every
+   * list scanned. The sample needs at least `lists` rows; past 256 per list the rest are
+   * not used. Partitioning takes the place of `calibrate`. A partitioned index cannot yet
+   * be saved, and `scoreIds` is not available on it.
+   */
+  partition(sample: Vectors, options: PartitionOptions): void {
+    const h = this.#handle();
+    const lists = options.lists;
+    if (!Number.isInteger(lists) || lists < 1 || lists > 65536) {
+      throw new RangeError(`lists must be an integer in 1..65536, got ${lists}`);
+    }
+    const threads = checkThreads(options.threads ?? 1);
+    const a = asRows(sample, this.#dim, 'sample');
+    const n = a.length / this.#dim;
+    check(native().indexPartition(h, a, n, lists, threads), 'partition', NON_FINITE_HINT);
+    // Searchers made before partitioning have no lists to probe.
+    dropSearchers(this.#state);
+  }
+
+  /** Lists in a partitioned index, or 0 for a flat one. */
+  get lists(): number {
+    return Number(native().indexLists(this.#handle()));
+  }
+
+  #probes: number | undefined = undefined;
+
+  /**
+   * Lists each query scans on a partitioned index when `search` is not given `probes`.
+   * `undefined` means an eighth of the lists.
+   */
+  get probes(): number | undefined {
+    return this.#probes;
+  }
+
+  set probes(value: number | undefined) {
+    if (value !== undefined) checkProbes(value);
+    this.#probes = value;
+  }
+
+  #applyProbes(searcher: unknown, probes: number | undefined): void {
+    const lists = this.lists;
+    if (probes !== undefined) {
+      checkProbes(probes);
+      if (lists === 0) {
+        throw new ZquantError(Status.ERR_STATE, 'search', 'probes applies only to a partitioned index');
+      }
+    }
+    if (lists === 0) return;
+    const p = probes ?? this.#probes ?? Math.max(1, Math.floor(lists / 8));
+    check(native().searcherSetProbes(searcher, p), 'search');
+  }
+
   /** Append vectors. Ids are assigned in insertion order, starting at 0. */
   add(vectors: Vectors, options: AddOptions = {}): void {
     const h = this.#handle();
@@ -434,7 +510,8 @@ export class Index {
 
   /**
    * Returns `nq * k` ids and scores, query-major, best first. Where the index holds
-   * fewer than `k` vectors the tail is `0xFFFFFFFF` / `-Infinity`.
+   * fewer than `k` vectors the tail is `0xFFFFFFFF` / `-Infinity`, as it is on a
+   * partitioned index where the lists scanned hold fewer than `k`.
    */
   search(queries: Vectors, options: SearchOptions = {}): SearchResult {
     const h = this.#handle();
@@ -444,6 +521,7 @@ export class Index {
 
     const q = asRows(queries, this.#dim, 'queries');
     const searcher = this.#searcher(k, threads);
+    this.#applyProbes(searcher, options.probes);
     return this.#chunked(q, k, searcher, (chunk, n, ids, scores) =>
       check(native().search(h, searcher, chunk, n, ids, scores), 'search', NON_FINITE_HINT),
     );
@@ -475,6 +553,7 @@ export class Index {
       );
     }
     const searcher = this.#searcher(candidates, threads);
+    this.#applyProbes(searcher, options.probes);
     return this.#chunked(q, k, searcher, (chunk, n, ids, scores) =>
       check(
         native().searchRerank(h, searcher, chunk, n, orig, nOrig, k, ids, scores),

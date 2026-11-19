@@ -27,8 +27,13 @@ func (ix *Index) MarshalBinary() ([]byte, error) {
 	size := int(C.zq_index_serialized_size(ix.handle))
 	buf := make([]byte, size)
 	var written C.size_t
-	// size is never 0 for a live index: the header alone is several bytes.
-	st := C.zq_index_serialize(ix.handle, unsafe.Pointer(&buf[0]), C.size_t(size), &written)
+	// size is 0 only for an index that cannot be saved (a partitioned one), and the
+	// library says why when handed no buffer.
+	var ptr unsafe.Pointer
+	if size > 0 {
+		ptr = unsafe.Pointer(&buf[0])
+	}
+	st := C.zq_index_serialize(ix.handle, ptr, C.size_t(size), &written)
 	runtime.KeepAlive(ix)
 	if err := check(st, "serialize"); err != nil {
 		return nil, err

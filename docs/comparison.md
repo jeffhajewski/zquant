@@ -290,6 +290,31 @@ its per-vector normalisation, the copy reaches 0.739 on cohere and 0.796 on open
 That matches or passes RaBitQ, at 4 B less per vector. See `docs/notes.md`, "Partitioning and
 the low-bit gap". It is not in the library yet.
 
+## Partitioned search against FAISS IVF-RaBitQ
+
+Both systems partitioned into the same number of k-means lists (about √n), probing the
+same number per query, one thread, k=10 (`bench/py/partition.py`). zquant at bits=2
+(106 B) against FAISS at one bit (104 B). R10@10, then queries per second:
+
+| corpus | lists | probes | zquant | FAISS IVF-RaBitQ |
+|---|---|---|---|---|
+| Cohere, 1M × 768 | 1000 | 31 | **0.780 / 2,205** | 0.765 / 1,245 |
+| | | 125 | **0.803 / 866** | 0.786 / 319 |
+| | | all | **0.808 / 194** | 0.787 / 47 |
+| Cohere, 100k × 768 | 316 | 19 | **0.775 / 11,289** | 0.760 / 5,481 |
+| | | all | **0.792 / 1,787** | 0.774 / 397 |
+| OpenAI, 50k × 1536 | 224 | 3 | 0.664 / 22,380 | **0.666 / 28,024** |
+| | | 28 | **0.808 / 6,714** | 0.792 / 3,515 |
+| SIFT10K | 100 | 12 | **0.649 / 136,002** | 0.509 / 37,482 |
+
+zquant finds 1.5 to 2.1 points more on the embeddings, and 14 on SIFT, at 1.8 to 4.5
+times the speed. The exception is the fewest probes on OpenAI, where ranking the centroids
+is most of the work: there the two tie on recall and FAISS is faster. FAISS trains on the whole corpus; zquant on at most
+256 rows per list. FAISS's multi-bit IVF-RaBitQ was not part of these runs. The
+partitioned index's recall also beats the flat calibrated index's at every corpus here,
+since each vector is stored against a nearby centroid ([notes.md](notes.md),
+"Partitioning, measured through the library").
+
 ## The scalar correction
 
 MSE-optimal reconstruction shrinks ỹ, so ⟨p, ỹ⟩ underestimates ⟨p, y⟩. The paper corrects
@@ -409,11 +434,12 @@ it was caught.
 
 ## Open leads
 
-- **The low-bit regime is the remaining weakness, at d=128 and 256.** On SIFT, PQ leads by
-  5 points at the bottom (0.511 at 16 B against 0.458 at 22 B), down from 15 before the
-  estimator change. This was thought structural, since PQ uses *vector* codebooks. Mostly
-  it was not. In a numpy model, IVF residuals close the rest and pass PQ, before counting
-  the centroids' storage. See `docs/notes.md`, "Partitioning and the low-bit gap".
+- **The low-bit regime is the remaining weakness for a flat index, at d=128 and 256.** On
+  SIFT, PQ leads by 5 points at the bottom (0.511 at 16 B against 0.458 at 22 B), down from
+  15 before the estimator change. This was thought structural, since PQ uses *vector*
+  codebooks. Mostly it was not. Partitioned, zquant reaches 0.651 at 26 B, passing PQ's
+  16 B and tying its 32 B, though on a corpus this small the centroids add 5 B per vector.
+  See `docs/notes.md`, "Partitioning, measured through the library".
 - **turbovec's calibration was more effective than ours at low bit-widths** — +8.1 points
   at bits=2 against our old −1.5. Ours now gains +12.0 there (0.338 uncalibrated, 0.458
   calibrated), by handling the mean, which was the suspect.

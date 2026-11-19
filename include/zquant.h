@@ -5,7 +5,8 @@
  * cannot recover from a panic.
  *
  * Threading: an index is safe to search from multiple threads provided each thread owns
- * its own zq_searcher. Mutating calls (add, calibrate) are not concurrent-safe.
+ * its own zq_searcher. Mutating calls (add, calibrate, partition, and setting a
+ * searcher's probes) are not concurrent-safe.
  */
 #ifndef ZQUANT_H
 #define ZQUANT_H
@@ -94,6 +95,32 @@ zq_status zq_index_calibrate(zq_index *index, const float *rows, size_t n);
 zq_status zq_index_calibrate_auto(zq_index *index, const float *rows, size_t n,
                                   float *centroid_norm, int *applied);
 
+/* Partitioning: scan part of the corpus instead of all of it.
+ *
+ * zq_index_partition splits an empty index into `lists` lists by k-means over a
+ * sample, using up to `threads` threads. Each vector added afterwards goes to the
+ * list whose centroid is nearest its direction, and is stored relative to that
+ * centroid. A search ranks the centroids against each query and scans only the
+ * nearest few lists, `probes` of them, set per searcher with zq_searcher_set_probes.
+ *
+ * Storing each vector against a nearby centroid also makes its estimate more
+ * accurate, so recall rises even when every list is scanned. Partitioning takes the
+ * place of calibration; a partitioned index refuses zq_index_calibrate with
+ * ZQ_ERR_STATE, and an index already calibrated cannot be partitioned.
+ *
+ * A good number of lists is around the square root of the corpus size. The sample
+ * needs at least `lists` non-zero rows; beyond 256 rows per list, the extra are not
+ * used. Partitioning is allowed once, before any add (ZQ_ERR_STATE otherwise).
+ *
+ * Each vector costs 4 bytes more than in a calibrated flat index, for its id, which
+ * zq_index_bytes_per_vector includes; the centroids cost lists * dim * 4 bytes in all.
+ * A partitioned index cannot yet be saved (zq_index_serialize and zq_score_ids return
+ * ZQ_ERR_UNSUPPORTED, and zq_index_serialized_size returns 0). */
+zq_status zq_index_partition(zq_index *index, const float *rows, size_t n,
+                             uint32_t lists, size_t threads);
+/* The number of lists, or 0 for an index that is not partitioned. */
+uint32_t  zq_index_lists(const zq_index *index);
+
 /* Append n row-major vectors of dim floats each. A batch containing any NaN or
  * infinity is refused whole with ZQ_ERR_INVALID; nothing from it is added. Queries,
  * calibration samples and codec input are checked the same way. */
@@ -141,13 +168,21 @@ int       zq_index_calibrated(const zq_index *index);
  * product overflows are rejected with ZQ_ERR_INVALID. */
 zq_status zq_searcher_create(zq_index *index, size_t batch, size_t k,
                              size_t threads, zq_searcher **out);
+
+/* Lists each query scans on a partitioned index, clamped to 1..lists. More probes
+ * find more of the true neighbours and cost proportionally more time. A new searcher
+ * starts at an eighth of the lists. A searcher of an index that is not partitioned
+ * gives ZQ_ERR_STATE, as does searching a partitioned index with a searcher created
+ * before it was partitioned. */
+zq_status zq_searcher_set_probes(zq_searcher *searcher, size_t probes);
 void      zq_searcher_free(zq_searcher *searcher);
 size_t    zq_searcher_capacity(const zq_searcher *searcher);
 
 /* Writes nq*k ids and scores, query-major. Caller owns both buffers. The searcher must
  * have been created from this index; one from any other index is refused with
  * ZQ_ERR_INVALID.
- * Where the index holds fewer than k vectors the tail is UINT32_MAX / -inf. */
+ * Where the index holds fewer than k vectors the tail is UINT32_MAX / -inf, and on a
+ * partitioned index the same happens where the lists probed hold fewer than k. */
 zq_status zq_search(zq_index *index, zq_searcher *searcher,
                     const float *queries, size_t nq,
                     uint32_t *out_ids, float *out_scores);

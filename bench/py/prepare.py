@@ -76,7 +76,8 @@ def load_hdf5(name):
 
 # Real embeddings at d >= 768. VectorDBBench publishes them as parquet, one row per
 # vector with an `id` and an `emb` list column.
-PARQUET = {"cohere-768": "cohere_small_100k", "openai-1536": "openai_small_50k"}
+PARQUET = {"cohere-768": "cohere_small_100k", "openai-1536": "openai_small_50k",
+           "cohere-768-1m": "cohere_medium_1m"}
 
 
 def load_parquet(name):

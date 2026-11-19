@@ -184,9 +184,9 @@ pub const max_batch: usize = 128;
 /// Lane count for the batch epilogue's early-reject compare. Once the heaps fill,
 /// almost every candidate is rejected, so scoring a lane group and testing one mask
 /// replaces `lanes` scalar compares and branches.
-const lanes = 8;
-const Lane = @Vector(lanes, f32);
-const LaneMask = std.meta.Int(.unsigned, lanes);
+pub const lanes = 8;
+pub const Lane = @Vector(lanes, f32);
+pub const LaneMask = std.meta.Int(.unsigned, lanes);
 
 /// Accepted candidates are staged here per query and flushed into the collector in
 /// batches.
@@ -201,7 +201,7 @@ const LaneMask = std.meta.Int(.unsigned, lanes);
 /// A staging buffer of fixed width does not grow with k. `max_batch * hot_slots` is
 /// 8 KB whatever the depth, so it stays resident, and the cold heap is touched once
 /// per flush rather than once per accept.
-const hot_slots = 8;
+pub const hot_slots = 8;
 
 pub const FlatIndex = struct {
     /// What the index was created with. Kept so it can be saved and recreated
@@ -564,39 +564,8 @@ pub const FlatIndex = struct {
     /// renormalized, so the codes are exactly the quantizer's.
     fn encodeScalar(self: *const FlatIndex, vector: []const f32, codes: []u8, ws: *prod_mod.Workspace) ScalarCode {
         const norm = self.quantizer.mse.encodeRotated(vector, ws.rotated, ws.staging);
-        const residual = if (self.calibrated) ws.residual else ws.rotated;
-        var rr: f64 = 0;
-        if (self.calibrated) {
-            for (ws.residual, ws.rotated, self.centre) |*r, y, c| r.* = y - c;
-        }
-        for (residual) |r| rr += @as(f64, r) * r;
-
-        if (self.calibrated) {
-            // Quantized as a unit vector, which is what the codebook is built for.
-            const inv: f32 = if (rr > 0) @floatCast(1 / @sqrt(rr)) else 0;
-            for (ws.staging, residual) |*u, r| u.* = r * inv;
-            self.quantizer.mse.codebook.encodeSlice(ws.staging, codes);
-        } else {
-            self.quantizer.mse.codebook.encodeSlice(residual, codes);
-        }
-
-        const levels = self.quantizer.mse.codebook.centroids;
-        var ru: f64 = 0;
-        var cr: f64 = 0;
-        var cu: f64 = 0;
-        for (codes, residual, self.centre) |code, r, c| {
-            const u: f64 = levels[code];
-            ru += r * u;
-            cr += @as(f64, c) * r;
-            cu += @as(f64, c) * u;
-        }
-        // ⟨r, ũ⟩ > 0 for any nonzero r: each coordinate's nearest level has its sign.
-        const factor: f64 = if (rr > 0 and ru > 0) rr / ru else 0;
-        return .{
-            .norm = norm,
-            .factor = @floatCast(factor),
-            .bias = @floatCast(cr - factor * cu),
-        };
+        const res = encodeResidual(&self.quantizer, if (self.calibrated) self.centre else null, codes, ws);
+        return .{ .norm = norm, .factor = res.factor, .bias = res.bias };
     }
 
     /// Append `n` vectors from a row-major buffer.
@@ -1485,9 +1454,9 @@ pub fn centroidNorm(allocator: Allocator, sample: []const f32, dim: usize) Alloc
 }
 
 /// Per-vector coefficients of `scalarScore`.
-const VectorTerms = struct { factor: f32, offset: f32, bias: f32, centre: f32 };
+pub const VectorTerms = struct { factor: f32, offset: f32, bias: f32, centre: f32 };
 /// Per-query coefficients of `scalarScore`.
-const QueryTerms = struct { factor: f32, offset: f32, bias: f32, centre: f32 };
+pub const QueryTerms = struct { factor: f32, offset: f32, bias: f32, centre: f32 };
 
 /// The `.scalar`-correction score for any metric, given the scanned term t = ⟨p, ũ⟩:
 ///
@@ -1514,13 +1483,13 @@ const QueryTerms = struct { factor: f32, offset: f32, bias: f32, centre: f32 };
 ///
 /// A zero vector or zero query has no direction under cosine and scores −inf, as
 /// `score` does: its factor and centre terms are zero and its offset −inf.
-inline fn scalarScore(comptime centred: bool, v: VectorTerms, q: QueryTerms, t: f32) f32 {
+pub inline fn scalarScore(comptime centred: bool, v: VectorTerms, q: QueryTerms, t: f32) f32 {
     const scaled = (v.factor * q.factor) * t;
     const shared = if (centred) scaled + (v.bias * q.bias + v.centre * q.centre) else scaled;
     return shared + (v.offset + q.offset);
 }
 
-inline fn vectorTerms(metric: Metric, norm: f32, factor: f32, bias: f32) VectorTerms {
+pub inline fn vectorTerms(metric: Metric, norm: f32, factor: f32, bias: f32) VectorTerms {
     return switch (metric) {
         .inner_product => .{ .factor = norm * factor, .offset = 0, .bias = norm * bias, .centre = norm },
         .cosine => if (norm > 0)
@@ -1537,7 +1506,7 @@ inline fn vectorTerms(metric: Metric, norm: f32, factor: f32, bias: f32) VectorT
 }
 
 /// `centre_dot` is ⟨p, c⟩, zero for an uncalibrated index.
-fn queryTerms(metric: Metric, query_norm: f32, centre_dot: f32) QueryTerms {
+pub fn queryTerms(metric: Metric, query_norm: f32, centre_dot: f32) QueryTerms {
     return switch (metric) {
         .inner_product => .{ .factor = 1, .offset = 0, .bias = query_norm, .centre = centre_dot },
         .cosine => if (query_norm > 0)
@@ -1549,7 +1518,7 @@ fn queryTerms(metric: Metric, query_norm: f32, centre_dot: f32) QueryTerms {
 }
 
 /// Drain staged candidates into a collector and refresh its cached threshold.
-inline fn flushHot(
+pub inline fn flushHot(
     collector: *topk.TopK,
     staged: *[hot_slots]Entry,
     len: *usize,
@@ -1558,6 +1527,55 @@ inline fn flushHot(
     for (staged[0..len.*]) |e| collector.offer(e.score, e.id);
     len.* = 0;
     threshold.* = collector.threshold();
+}
+
+/// The per-vector half of a `.scalar` code: the factor f and the bias b.
+pub const Residual = struct { factor: f32, bias: f32 };
+
+/// Quantize the rotated direction y in `ws.rotated` against `centre` (see
+/// `FlatIndex.encodeScalar` for the split), writing one code per padded dimension to
+/// `codes`. With no centre, y is quantized as it stands and the bias is zero: the
+/// uncalibrated encoding, whose codes predate centring and must not change. With one,
+/// the residual is renormalized first, since the codebook is built for unit vectors.
+/// `IvfIndex` calls this with each vector's list centroid.
+pub fn encodeResidual(
+    quantizer: *const prod_mod.Prod,
+    centre: ?[]const f32,
+    codes: []u8,
+    ws: *prod_mod.Workspace,
+) Residual {
+    const residual = if (centre != null) ws.residual else ws.rotated;
+    if (centre) |c| {
+        for (ws.residual, ws.rotated, c) |*r, y, cv| r.* = y - cv;
+    }
+    var rr: f64 = 0;
+    for (residual) |r| rr += @as(f64, r) * r;
+
+    if (centre != null) {
+        const inv: f32 = if (rr > 0) @floatCast(1 / @sqrt(rr)) else 0;
+        for (ws.staging, residual) |*u, r| u.* = r * inv;
+        quantizer.mse.codebook.encodeSlice(ws.staging, codes);
+    } else {
+        quantizer.mse.codebook.encodeSlice(residual, codes);
+    }
+
+    const levels = quantizer.mse.codebook.centroids;
+    var ru: f64 = 0;
+    var cr: f64 = 0;
+    var cu: f64 = 0;
+    if (centre) |c| {
+        for (codes, residual, c) |code, r, cv| {
+            const u: f64 = levels[code];
+            ru += r * u;
+            cr += @as(f64, cv) * r;
+            cu += @as(f64, cv) * u;
+        }
+    } else {
+        for (codes, residual) |code, r| ru += r * @as(f64, levels[code]);
+    }
+    // ⟨r, ũ⟩ > 0 for any nonzero r: each coordinate's nearest level has its sign.
+    const factor: f64 = if (rr > 0 and ru > 0) rr / ru else 0;
+    return .{ .factor = @floatCast(factor), .bias = @floatCast(cr - factor * cu) };
 }
 
 /// Whether every value is finite. `v * 0` is zero for a finite `v` and NaN for an
@@ -1578,7 +1596,7 @@ pub fn allFinite(x: []const f32) bool {
     return @reduce(.Add, acc) + tail == 0;
 }
 
-fn euclideanNorm(x: []const f32) f32 {
+pub fn euclideanNorm(x: []const f32) f32 {
     var sum: f64 = 0;
     for (x) |v| sum += @as(f64, v) * v;
     return @floatCast(@sqrt(sum));

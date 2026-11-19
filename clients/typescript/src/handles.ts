@@ -64,6 +64,16 @@ export function addSearcher(state: IndexState, key: string, handle: unknown): vo
   live.searcher++;
 }
 
+/** Free an index's searchers but not the index, for when they no longer fit it. */
+export function dropSearchers(state: IndexState): void {
+  const n = native();
+  for (const h of state.searchers.values()) {
+    n.searcherFree(h);
+    live.searcher--;
+  }
+  state.searchers.clear();
+}
+
 /** Free an index and its searchers now. Safe to call more than once. */
 export function releaseIndex(state: IndexState): void {
   indexes.unregister(state);

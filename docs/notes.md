@@ -2258,6 +2258,7 @@ throughput depends on things the model does not have:
 2. **Then IVF, as a layer over that estimator.** It adds about as much recall again or more
    at bits=2 (cohere +5.5 points, SIFT +20), and that gain is measured here. Its speed gain
    needs a corpus of a million or more, where the coarse search is small beside the scan.
+   Done; "Partitioning, measured through the library" below has its speed as well.
 
 ### The estimator change, measured through the library
 
@@ -2315,3 +2316,87 @@ one-query path tested the calibration flag per vector. Specializing that path at
 time on whether the index is calibrated, as the batch path already was, brought it back to
 level with the old build.
 
+
+### Partitioning, measured through the library
+
+IVF is now in the library (`src/index/ivf.zig`), behind `zq_index_partition` and a probe
+count per searcher, and in all three bindings. It is the lab's design:
+- k-means over the rotated unit directions, on up to 256 sample rows per list;
+- each vector stored as a residual against its list's centroid, scored with the calibrated
+  flat index's estimator, the centroid standing in for the corpus centre;
+- centroids ranked by distance to the query's direction, and the nearest `probes` lists
+  scanned.
+
+A batch of queries is regrouped by list, so each list is read once for every query in
+the batch that probes it: through the 4×4 batch tile when four or more queries share a
+list, and through the one-query tiles otherwise. A one-list partitioned index scores as a
+calibrated flat index does, to f32 rounding of ⟨p, c⟩, and a test holds it to that.
+
+The numbers below are through the Python client (`bench/py/partition.py`), one thread,
+1000 queries, k=10, with about √n lists. FAISS's IndexIVFRaBitQ is built with the same
+number of lists, trains on the whole corpus, and runs on one thread too.
+
+**At a million vectors** (Cohere, 1M × 768, 1000 lists). Each cell is R10@10, then
+queries per second:
+
+| | flat +cal | 15 probes | 31 | 62 | 125 (default) | 250 | all 1000 |
+|---|---|---|---|---|---|---|---|
+| bits=2, 106 B | 0.779 / 187 | 0.753 / 3,855 | **0.780 / 2,205** | 0.795 / 1,340 | 0.803 / 866 | 0.807 / 525 | 0.808 / 194 |
+| bits=3, 202 B | 0.884 / 202 | 0.827 / 4,189 | 0.866 / 2,344 | **0.885 / 1,456** | 0.897 / 899 | 0.902 / 538 | 0.903 / 190 |
+| bits=5, 394 B | 0.966 / 206 | 0.870 / 4,231 | 0.919 / 2,396 | 0.946 / 1,441 | 0.960 / 867 | **0.967 / 557** | 0.970 / 215 |
+| FAISS IVF-RaBitQ 1-bit, 104 B | — | 0.742 / 2,530 | 0.765 / 1,245 | 0.779 / 636 | 0.786 / 319 | 0.787 / 163 | 0.787 / 47 |
+
+The bold cells are the first to match the flat index's recall: 12× its speed at bits=2,
+7× at bits=3 and 2.7× at bits=5. The default, an eighth of the lists, beats the flat
+index's recall at bits 2 and 3 by 2.4 and 1.3 points and trails it by 0.6 at bits=5,
+searching about 4.5× faster.
+
+**At 100k** (Cohere, 316 lists; OpenAI ada-002 at 50k × 1536, 224 lists):
+
+| | flat +cal | ~1.5% | ~3% | ~6% | ~12% (default) | ~25% | all |
+|---|---|---|---|---|---|---|---|
+| Cohere bits=2 | 0.750 / 1,790 | 0.687 / 26,952 | 0.747 / 17,436 | 0.775 / 11,289 | 0.787 / 7,271 | 0.791 / 4,584 | 0.792 / 1,787 |
+| Cohere bits=5 | 0.960 / 1,976 | 0.773 / 29,357 | 0.874 / 19,970 | 0.928 / 13,376 | 0.953 / 8,310 | 0.964 / 4,765 | 0.967 / 1,950 |
+| Cohere, FAISS 1-bit | — | 0.674 / 25,151 | 0.735 / 11,266 | 0.760 / 5,481 | 0.769 / 2,704 | 0.773 / 1,381 | 0.774 / 397 |
+| OpenAI bits=2 | 0.792 / 1,958 | 0.664 / 22,380 | 0.751 / 16,046 | 0.790 / 11,299 | 0.808 / 6,714 | 0.817 / 4,860 | 0.820 / 1,795 |
+| OpenAI bits=5 | 0.967 / 1,908 | 0.725 / 20,753 | 0.850 / 14,375 | 0.913 / 9,998 | 0.948 / 6,921 | 0.966 / 4,666 | 0.973 / 1,913 |
+| OpenAI, FAISS 1-bit | — | 0.666 / 28,024 | 0.744 / 13,335 | 0.776 / 6,994 | 0.792 / 3,515 | 0.799 / 1,601 | 0.801 / 455 |
+
+And SIFT10K at bits=2 (100 lists): flat +cal 0.458 at 63k QPS; partitioned 0.649 at 12
+probes and 136k QPS, 0.651 with all 100. FAISS IVF-RaBitQ at 1 bit peaks at 0.509.
+
+What this says:
+- **Partitioning lifts recall as well as speed.** With every list scanned the only change is
+  the finer centres, and recall rises 2.9 points at bits=2 on 1M Cohere, 4.2 on 100k
+  Cohere, 2.8 on OpenAI and 19 on SIFT. This is the lab's result again (0.794 on Cohere at
+  1024 lists, against 0.792 here at 316). SIFT at 26 B now passes FAISS PQ's 0.511 at 16 B
+  and ties its 0.648 at 32 B, though the centroids cost SIFT10K another 5 B per vector.
+- **The speed-up grows with the corpus.** At bits=2, scanning 6% of the lists beats the flat
+  index's recall at 100k, at 6× its speed; at 1M, 3% matches it, at 12×. Ranking the centroids is
+  a fixed cost per query (316 or 1000 dot products at d=768), so the fraction of the corpus
+  worth scanning falls as the corpus grows.
+- **Scanning everything costs nothing extra at d ≥ 768** (194 QPS against flat's 187 at 1M)
+  and about 12% at d=128 on SIFT10K, where lists of 100 vectors leave more per-list
+  overhead per code byte.
+- **Against FAISS IVF-RaBitQ at one bit,** on the same number of lists, single-threaded:
+  zquant's bits=2 is 1.3 to 1.8 points higher at 2 B more per vector, and 1.5 to 2.7 times
+  as fast at the same probe count. The exception is the fewest probes, where ranking the
+  centroids is most of the work: on OpenAI at 3 probes the two tie on recall and FAISS is
+  faster (28k QPS against 22k). FAISS's multi-bit IVF-RaBitQ was not in these runs; the
+  script now builds it too.
+- **More probes are not always better by a hair.** On a synthetic test corpus, 4 of 32 lists
+  found 198 of 400 true neighbours and all 32 found 197: a far list's vectors can be
+  overestimated into the top k. On the real corpora recall rose monotonically.
+
+**Build cost.** Partitioning 1M × 768 vectors into 1000 lists took 15.8 s on 8 threads
+(k-means over 256k sample rows, 10 iterations), and adding them 8.5 s, against 1.5 s to add
+them to a flat index. A first cut assigned every vector to its list twice, once to size the
+lists and once to encode, and took 29.5 s in all; keeping the first pass's choices fixed
+that. k-means is now the larger cost, and a register-blocked centroid product would cut it.
+
+**Storage.** A partitioned vector costs 4 B more than a calibrated flat one, for its id. The
+centroids cost lists × d × 4 bytes: 3 MB at 1M (3 B per vector) and 1 MB at 100k (10 B per
+vector).
+
+**Not done yet:** saving and loading a partitioned index, `score_ids` on one (it needs an
+id-to-slot map), and a faster k-means.

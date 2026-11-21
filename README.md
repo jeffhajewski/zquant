@@ -29,15 +29,15 @@ top ten.
 
 | index | memory | recall@10 | queries/s |
 |---|---|---|---|
-| bits=2, flat | 102 MB | 0.779 | 187 |
-| bits=2, 1000 lists, 31 searched | 111 MB | 0.780 | 2,205 |
-| bits=2, 1000 lists, 125 searched | 111 MB | 0.803 | 866 |
-| bits=3, 1000 lists, 125 searched | 207 MB | 0.897 | 899 |
-| bits=5, 1000 lists, 250 searched | 399 MB | 0.967 | 557 |
+| bits=2, flat | 102 MB | 0.779 | 382 |
+| bits=2, 1000 lists, 31 searched | 112 MB | 0.780 | 5,409 |
+| bits=2, 1000 lists, 125 searched | 112 MB | 0.803 | 1,850 |
+| bits=3, 1000 lists, 125 searched | 207 MB | 0.897 | 855 |
+| bits=5, 1000 lists, 250 searched | 399 MB | 0.967 | 563 |
 
 A flat index compares every query with every vector. A partitioned one splits the vectors
 into lists by k-means and searches only the lists nearest each query. Searching 31 of the
-1000 lists finds what the flat index finds, twelve times faster. Searching more finds
+1000 lists finds what the flat index finds, fourteen times faster. Searching more finds
 *more* than the flat index does, because each vector is stored relative to its own list's
 centre, which describes it better than the centre of the whole corpus.
 
@@ -103,36 +103,38 @@ second:
 
 | | 1 bit per dimension | 2 bits | 4 bits |
 |---|---|---|---|
-| zquant | **0.750** / 1,786 | **0.868** / 1,835 | **0.960** / 1,979 |
-| FAISS RaBitQ, fast-scan | 0.739 / 2,682 | 0.861 / 1,547 | 0.952 / 1,393 |
-| FAISS PQ, fast-scan | 0.540 / 3,832 | 0.719 / 1,992 | 0.895 / 1,025 |
-| FAISS PQ | 0.582 / 592 | 0.753 / 208 | 0.917 / 67 |
+| zquant | **0.749** / 3,210 | **0.868** / 1,803 | **0.960** / 1,834 |
+| FAISS RaBitQ, fast-scan | 0.739 / 2,502 | 0.861 / 1,467 | 0.952 / 1,160 |
+| FAISS PQ, fast-scan | 0.540 / 3,514 | 0.719 / 1,847 | 0.895 / 906 |
+| FAISS PQ | 0.582 / 510 | 0.753 / 177 | 0.917 / 61 |
 
-zquant finds the most at every width, in 2 to 14 bytes per vector less than RaBitQ. Its
-speed barely changes with the width, while FAISS's falls as the codes get longer. So at one
-bit per dimension both of FAISS's fast-scan indexes are faster than zquant. At two bits
-zquant is faster than RaBitQ's and a little slower than PQ's, which finds 15 points fewer.
-At four bits it's the fastest here. On OpenAI's 1536-dimensional embeddings the picture is
-the same, except that at one bit RaBitQ's fast-scan also finds slightly more (0.795
-against 0.791).
+zquant finds the most at every width, in 2 to 14 bytes per vector less than RaBitQ, and
+it's faster than RaBitQ's fast-scan index at every width. At one bit it scores sixteen
+vectors at a time by table lookup, as FAISS's fast-scan indexes do; only PQ's is faster
+there, by 9%, and it finds 21 points fewer. At two bits PQ's is a little faster again,
+finding 15 points fewer. At four bits zquant is the fastest here. On OpenAI's
+1536-dimensional embeddings the picture is the same, except that at one bit RaBitQ's
+fast-scan also finds slightly more (0.795 against 0.792).
 
 **Partitioned**, same corpus, 316 lists in both systems:
 
 | bits per dimension | lists searched | zquant | FAISS IVF-RaBitQ, fast-scan |
 |---|---|---|---|
-| 1 | 4 | **0.687** / 28,299 | 0.678 / 39,418 |
-| 1 | 39 | **0.787** / 7,750 | 0.772 / 4,259 |
-| 2 | 39 | **0.881** / 8,136 | 0.867 / 3,665 |
-| 4 | 39 | **0.953** / 8,417 | 0.943 / 3,556 |
+| 1 | 4 | **0.687 / 39,457** | 0.678 / 38,192 |
+| 1 | 39 | **0.786 / 13,383** | 0.772 / 4,144 |
+| 2 | 39 | **0.881 / 7,794** | 0.867 / 3,580 |
+| 4 | 39 | **0.953 / 7,818** | 0.943 / 3,416 |
 
-Searching 6% of the lists or more, zquant finds 0.5 to 1.5 points more and runs 1.4 to 2.9
-times as fast. At the fewest lists FAISS is faster. zquant regroups each batch of
-queries by list, so a list is read once for all the queries that want it.
+Searching 6% of the lists or more, zquant finds 0.7 to 1.4 points more and runs 1.8 to 3.2
+times as fast. At the fewest lists the two are level: 3% faster here, 2% slower on OpenAI.
+zquant regroups each batch of queries by list, so a list is read once for all the queries
+that want it.
 
 ### Where it falls short
 
-- **One bit per dimension is its slowest width relative to FAISS**, as above. A kernel for
-  packed 1-bit codes might close that, and doesn't exist yet.
+- **Against PQ's fast-scan index at one and two bits.** It's 2 to 31% faster than zquant
+  there, though it finds 11 to 32 points fewer. zquant's one-bit scan is now table lookup
+  like FAISS's; what's left is the work per candidate after the scan.
 - **Small dimensions at tiny budgets.** At d=128 and d=256, below about 25 B per vector on
   SIFT and 100 B on nytimes, FAISS's product quantization finds more.
 - **No graph index.** zquant scans codes, in full or by list. It hasn't been compared with

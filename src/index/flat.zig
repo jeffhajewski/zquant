@@ -42,6 +42,8 @@ const scan = @import("../simd/scan.zig");
 const tiles = @import("../simd/tiles.zig");
 const dispatch = @import("../simd/dispatch.zig");
 const sketch_kernel = @import("../simd/sketch.zig");
+const columns = @import("../simd/columns.zig");
+const Codes = @import("codes.zig").Codes;
 const topk = @import("topk.zig");
 const Density = @import("../math/density.zig").Density;
 const RotationKind = @import("../math/rotation.zig").Kind;
@@ -218,8 +220,9 @@ pub const FlatIndex = struct {
     use_sketch: bool,
     correction: Correction,
 
-    /// Packed codes, `layout.stride()` bytes per vector.
-    codes: std.ArrayList(u8),
+    /// Packed codes, `codeStride()` bytes per vector, one vector after another, or by
+    /// column for the one-bit kernels (`codes.zig`, `byColumn`).
+    codes: Codes,
     /// QJL sign bitmaps, `sketchStride()` bytes per vector — none at all unless the
     /// score reads them (see `storesSketch`).
     sketches: std.ArrayList(u8),
@@ -286,7 +289,7 @@ pub const FlatIndex = struct {
         errdefer allocator.free(centre);
         @memset(centre, 0.0);
 
-        return .{
+        var index: FlatIndex = .{
             .params = params,
             .quantizer = quantizer,
             .layout = packing.Layout.init(quantizer.padded(), quantizer.mse.bits),
@@ -302,7 +305,7 @@ pub const FlatIndex = struct {
             .exact_scan = params.exact_scan,
             .use_sketch = params.use_sketch,
             .correction = params.correction,
-            .codes = .empty,
+            .codes = undefined,
             .sketches = .empty,
             .scalars = .empty,
             .biases = .empty,
@@ -312,6 +315,16 @@ pub const FlatIndex = struct {
             .calibrated = false,
             .allocator = allocator,
         };
+        index.codes = Codes.init(index.codeStride(), index.byColumn());
+        return index;
+    }
+
+    /// Whether codes are stored by column and scored by the one-bit block kernels
+    /// (`simd/columns.zig`): one code bit, compact, on the vectorized path. Fixed when
+    /// the index is created, like everything it depends on.
+    pub fn byColumn(self: FlatIndex) bool {
+        return self.residency == .compact and self.layout.bits == 1 and
+            self.layout.kind() == .sequential and self.vectorized();
     }
 
     pub fn deinit(self: *FlatIndex) void {
@@ -470,7 +483,7 @@ pub const FlatIndex = struct {
     }
 
     pub fn reserve(self: *FlatIndex, additional: usize) !void {
-        try self.codes.ensureUnusedCapacity(self.allocator, additional * self.codeStride());
+        try self.codes.ensureUnusedCapacity(self.allocator, additional);
         try self.sketches.ensureUnusedCapacity(self.allocator, additional * self.sketchStride());
         try self.scalars.ensureUnusedCapacity(self.allocator, additional);
         if (self.calibrated) try self.biases.ensureUnusedCapacity(self.allocator, additional);
@@ -496,7 +509,7 @@ pub const FlatIndex = struct {
 
     /// Grow storage by `n` zeroed vectors. Capacity must already be reserved.
     fn growAssumeCapacity(self: *FlatIndex, n: usize) void {
-        @memset(self.codes.addManyAsSliceAssumeCapacity(n * self.codeStride()), 0);
+        self.codes.growAssumeCapacity(n);
         @memset(self.sketches.addManyAsSliceAssumeCapacity(n * self.sketchStride()), 0);
         _ = self.scalars.addManyAsSliceAssumeCapacity(n);
         if (self.calibrated) _ = self.biases.addManyAsSliceAssumeCapacity(n);
@@ -509,9 +522,7 @@ pub const FlatIndex = struct {
     /// with their own scratch and workspace can fill disjoint slots concurrently, and
     /// a vector's bytes do not depend on which thread encoded it.
     fn encodeAt(self: *const FlatIndex, id: usize, vector: []const f32, scratch: []u8, ws: *prod_mod.Workspace) void {
-        const stride = self.codeStride();
         const sketch_len = self.sketchStride();
-        const codes_slot = self.codes.items[id * stride ..][0..stride];
         const sketch_slot = self.sketches.items[id * sketch_len ..][0..sketch_len];
 
         // Encode into scratch, then pack. The quantizer emits one byte per
@@ -531,6 +542,8 @@ pub const FlatIndex = struct {
             },
         }
 
+        if (self.codes.by_column) return self.codes.setOneBit(id, scratch);
+        const codes_slot = self.codes.rowMut(id);
         switch (self.residency) {
             .compact => self.layout.pack(scratch, codes_slot),
             .expanded => {
@@ -869,7 +882,12 @@ pub const FlatIndex = struct {
         // tile*group SDOTs. See `scan.scoreExpandedTiled` for the accounting. The
         // tiles go through `dispatch`, which may run a copy of the kernels compiled for
         // a wider instruction set than this build's (AVX2 in an x86_64_v2 release).
-        const tile = tiles.batch_tile;
+        //
+        // One-bit codes stored by column are scored 16 vectors at a time instead, by
+        // table lookup (`simd/columns.zig`); the last block is stored whole, so it needs
+        // no partial path.
+        const by_column = self.codes.by_column;
+        const tile: usize = if (by_column) columns.block else tiles.batch_tile;
         // Everything the inner loop would otherwise re-test per (vector, query) pair:
         // all three are fixed for the whole index.
         //
@@ -881,7 +899,7 @@ pub const FlatIndex = struct {
         const fast_path = self.correction == .scalar and
             (self.residency == .expanded or use_simd);
         const compact_width = if (use_simd) scan.multiWidth(self.layout) else 1;
-        var mse_block: [tile * max_batch]f32 = undefined;
+        var mse_block: [columns.block * max_batch]f32 = undefined;
 
         const can_tile = self.residency == .expanded or (use_simd and scan.canTile(self.layout));
         const kernels = dispatch.active();
@@ -889,7 +907,7 @@ pub const FlatIndex = struct {
             .table = &searcher.table,
             .queries = searcher.scan_queries.ptr,
             .n = n,
-            .codes = self.codes.items.ptr,
+            .codes = self.codes.ptr(),
             .stride = stride,
             .padded = @intCast(padded),
             .bits = self.layout.bits,
@@ -904,7 +922,9 @@ pub const FlatIndex = struct {
         while (v0 < total) : (v0 += tile) {
             const take = @min(tile, total - v0);
 
-            if (can_tile and take == tile) {
+            if (by_column) {
+                dispatch.columnTile(kernels, &job, v0 / columns.block);
+            } else if (can_tile and take == tile) {
                 // Both amortizations at once: shared unpack and register-resident
                 // query chunks. Query tails are handled inside.
                 dispatch.batchTile(kernels, &job, v0);
@@ -913,7 +933,7 @@ pub const FlatIndex = struct {
                 for (0..n) |i| {
                     for (0..take) |u| {
                         mse_block[u * max_batch + i] = scan.scoreExpanded(
-                            @ptrCast(self.codes.items[(v0 + u) * stride ..][0..stride]),
+                            @ptrCast(self.codes.row(v0 + u)),
                             searcher.scan_queries[i],
                             self.table.scale,
                             padded,
@@ -923,7 +943,7 @@ pub const FlatIndex = struct {
             } else if (use_simd) {
                 // The unpack is query-independent, so the group shares it.
                 for (0..take) |u| {
-                    const slot = self.codes.items[(v0 + u) * stride ..][0..stride];
+                    const slot = self.codes.row(v0 + u);
                     var i: usize = 0;
                     while (i + compact_width <= n) : (i += compact_width) {
                         scan.scoreInt8Multi(
@@ -957,7 +977,8 @@ pub const FlatIndex = struct {
             for (0..take) |u| {
                 const v = v0 + u;
                 const scalars = self.scalars.items[v];
-                const code_slot = self.codes.items[v * stride ..][0..stride];
+                // Read only by the exact scan, which never stores by column.
+                const code_slot: []const u8 = if (by_column) &.{} else self.codes.row(v);
                 const sketch_slot = self.sketches.items[v * sketch_len ..][0..sketch_len];
                 const norm: f32 = scalars.norm;
                 const gamma: f32 = scalars.gamma;
@@ -1243,13 +1264,15 @@ pub const FlatIndex = struct {
         const queries: [1]scan.Query = .{searcher.scan_query};
         const can_tile = use_simd and
             (self.residency == .expanded or scan.canTile(self.layout));
+        // A whole number of one-bit column blocks, which are scored 16 at a time.
         var block: [tile * block_tiles]f32 = undefined;
+        comptime std.debug.assert(block.len % columns.block == 0);
         const kernels = dispatch.active();
         const job: tiles.Job = .{
             .table = &searcher.table,
             .queries = &queries,
             .n = 1,
-            .codes = self.codes.items.ptr,
+            .codes = self.codes.ptr(),
             .stride = stride,
             .padded = @intCast(padded),
             .bits = self.layout.bits,
@@ -1263,10 +1286,16 @@ pub const FlatIndex = struct {
         var v0: usize = 0;
         while (v0 < total) : (v0 += block.len) {
             const take = @min(block.len, total - v0);
-            const tiled = if (can_tile) take / tile * tile else 0;
-            if (tiled > 0) dispatch.singleTiles(kernels, &job, v0, tiled / tile);
-            for (tiled..take) |u| {
-                block[u] = self.mseTermAt(v0 + u, prepared, searcher);
+            if (self.codes.by_column) {
+                // The last block is stored whole, so it is scored whole.
+                const blocks = (take + columns.block - 1) / columns.block;
+                dispatch.columnSingle(kernels, &job, v0 / columns.block, blocks);
+            } else {
+                const tiled = if (can_tile) take / tile * tile else 0;
+                if (tiled > 0) dispatch.singleTiles(kernels, &job, v0, tiled / tile);
+                for (tiled..take) |u| {
+                    block[u] = self.mseTermAt(v0 + u, prepared, searcher);
+                }
             }
 
             // Specialized on calibration at compile time: an uncalibrated index has no
@@ -1342,9 +1371,9 @@ pub const FlatIndex = struct {
     /// ⟨p, ỹ_i⟩ for one stored vector, by the per-vector kernel. The tiled kernels in
     /// `search` compute the same integer dot products, so the results agree exactly.
     inline fn mseTermAt(self: *const FlatIndex, i: usize, prepared: Prepared, searcher: *const Searcher) f32 {
-        const stride = self.codeStride();
+        if (self.codes.by_column) return self.codes.oneBitTerm(i, searcher.scan_query, searcher.table);
         const padded = self.quantizer.padded();
-        const slot = self.codes.items[i * stride ..][0..stride];
+        const slot = self.codes.row(i);
         return switch (self.residency) {
             .expanded => scan.scoreExpanded(
                 @ptrCast(slot),
@@ -2691,7 +2720,11 @@ test "resident storage is what bytesPerVector reports" {
                 _ = try index.add(&v);
             }
             const n = index.count();
-            const resident = index.codes.items.len + index.sketches.items.len +
+            // One-bit codes stored by column also hold the last block's unused lanes.
+            const unused = index.codes.bytes.items.len - n * index.codes.stride;
+            try testing.expect(unused < columns.block * index.codes.stride);
+            try testing.expectEqual(index.codes.by_column or unused == 0, true);
+            const resident = index.codes.bytes.items.len - unused + index.sketches.items.len +
                 index.scalars.items.len * @sizeOf(StoredScalars) + index.biases.items.len * @sizeOf(f16);
             try testing.expectEqual(index.bytesPerVector() * n, resident);
             try testing.expectEqual(correction == .qjl_sketch, index.sketches.items.len > 0);
@@ -2735,7 +2768,7 @@ test "parallel add produces exactly the bytes of a serial add" {
             try parallel.addBatchParallel(data[100 * dim ..], threads);
 
             try testing.expectEqual(serial.count(), parallel.count());
-            try testing.expectEqualSlices(u8, serial.codes.items, parallel.codes.items);
+            try testing.expectEqualSlices(u8, serial.codes.bytes.items, parallel.codes.bytes.items);
             try testing.expectEqualSlices(u8, serial.sketches.items, parallel.sketches.items);
             try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(serial.scalars.items), std.mem.sliceAsBytes(parallel.scalars.items));
             try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(serial.biases.items), std.mem.sliceAsBytes(parallel.biases.items));
@@ -2831,4 +2864,89 @@ test "calibrateAuto calibrates an off-centre corpus and leaves a centred one alo
     var sketch = try FlatIndex.init(testing.allocator, .{ .dim = dim, .bits = 4, .correction = .qjl_sketch });
     defer sketch.deinit();
     try testing.expectError(error.CalibrationNeedsScalarCorrection, sketch.calibrateAuto(data));
+}
+
+test "one-bit codes stored by column score alike on every path, and close to exact" {
+    // bits=2 is one code bit: stored by column and scored by table lookup
+    // (`simd/columns.zig`). Search, batched search, scoreIds and a reloaded copy must
+    // report the same bits, with a last block only partly used; and the tables' rounding
+    // must stay small against the exact f32 scan of the same codes.
+    const allocator = testing.allocator;
+    const persist = @import("persist.zig");
+    var prng = std.Random.DefaultPrng.init(0x1B17);
+    const random = prng.random();
+    for ([_]u32{ 256, 384 }) |dim| {
+        const n = 16 * 6 + 7;
+        const corpus = try allocator.alloc(f32, n * dim);
+        defer allocator.free(corpus);
+        offCentreRows(corpus, dim, random);
+
+        for ([_]Metric{ .inner_product, .cosine, .l2 }) |metric| for ([_]bool{ false, true }) |calibrate| {
+            const params: Params = .{ .dim = dim, .bits = 2, .metric = metric, .seed = 0xC1 };
+            var index = try FlatIndex.init(allocator, params);
+            defer index.deinit();
+            try testing.expect(index.byColumn());
+            var exact = try FlatIndex.init(allocator, p: {
+                var e = params;
+                e.exact_scan = true;
+                break :p e;
+            });
+            defer exact.deinit();
+            try testing.expect(!exact.byColumn());
+            if (calibrate) {
+                try index.calibrate(corpus);
+                try exact.calibrate(corpus);
+            }
+            try index.addBatch(corpus);
+            try exact.addBatch(corpus);
+
+            const k = 9;
+            const batch = 6; // a group of four and a tail of two
+            var single = try FlatIndex.Searcher.init(allocator, index, k);
+            defer single.deinit();
+            var exact_single = try FlatIndex.Searcher.init(allocator, exact, k);
+            defer exact_single.deinit();
+            var batched = try FlatIndex.BatchSearcher.init(allocator, index, batch, k);
+            defer batched.deinit();
+
+            const buf = try allocator.alloc(u8, persist.serializedSize(&index));
+            defer allocator.free(buf);
+            _ = try persist.write(&index, buf);
+            var loaded = try persist.read(allocator, buf);
+            defer loaded.deinit();
+            try testing.expectEqualSlices(u8, index.codes.bytes.items, loaded.codes.bytes.items);
+            var loaded_single = try FlatIndex.Searcher.init(allocator, loaded, k);
+            defer loaded_single.deinit();
+
+            const queries = try allocator.alloc(f32, batch * dim);
+            defer allocator.free(queries);
+            for (0..batch) |i| randomUnit(queries[i * dim ..][0..dim], random);
+            const grouped = index.searchBatch(queries, &batched);
+
+            var ids: [n]u32 = undefined;
+            for (&ids, 0..) |*id, i| id.* = @intCast(i);
+            var all: [n]f32 = undefined;
+            var all_exact: [n]f32 = undefined;
+            var worst: f32 = 0;
+            for (0..batch) |i| {
+                const q = queries[i * dim ..][0..dim];
+                const one = index.search(q, &single);
+                const many = grouped[i * k ..][0..k];
+                try index.scoreIds(q, &ids, &all, &single);
+                const again = loaded.search(q, &loaded_single);
+                for (one, many, again) |a, b, c| {
+                    try testing.expectEqual(a.id, b.id);
+                    try testing.expectEqual(a.score, b.score);
+                    try testing.expectEqual(a.id, c.id);
+                    try testing.expectEqual(a.score, c.score);
+                    try testing.expectEqual(a.score, all[a.id]);
+                }
+                try exact.scoreIds(q, &ids, &all_exact, &exact_single);
+                for (all, all_exact) |got, want| worst = @max(worst, @abs(got - want));
+            }
+            // The int8 kernels this replaced were off by as much; the codes themselves
+            // are off by about 0.1 at one bit.
+            try testing.expect(worst < 0.01);
+        };
+    }
 }

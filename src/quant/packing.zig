@@ -34,6 +34,11 @@
 //! Row-major is also simply less machinery: no transpose at insert, and sequential
 //! access per vector.
 //!
+//! One-bit codes are the exception. With two levels, a table over four dimensions has
+//! 16 entries, so FastScan's lookup fits there after all, and an index stores them by
+//! column (`index/codes.zig`, `simd/columns.zig`). The bytes are the ones `pack` gives;
+//! only where they sit differs.
+//!
 //! ## Nibble order and the query
 //!
 //! Because byte `i` holds dimensions `2i` and `2i+1`, masking the low nibbles of a

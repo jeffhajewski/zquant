@@ -24,11 +24,13 @@ pub const simd_dot = @import("simd/dot.zig");
 pub const simd_tiles = @import("simd/tiles.zig");
 pub const simd_dispatch = @import("simd/dispatch.zig");
 pub const simd_sketch = @import("simd/sketch.zig");
+pub const simd_columns = @import("simd/columns.zig");
 
 pub const topk = @import("index/topk.zig");
 pub const flat = @import("index/flat.zig");
 pub const ivf = @import("index/ivf.zig");
 pub const persist = @import("index/persist.zig");
+pub const codes = @import("index/codes.zig");
 pub const rerank = @import("index/rerank.zig");
 
 test {

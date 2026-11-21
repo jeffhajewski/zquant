@@ -83,6 +83,14 @@ pub inline fn singleTiles(kernels: ?*const tiles.Kernels, job: *const tiles.Job,
     if (kernels) |k| k.single_tiles(job, v0, count) else tiles.singleTiles(job, v0, count);
 }
 
+pub inline fn columnTile(kernels: ?*const tiles.Kernels, job: *const tiles.Job, b: usize) void {
+    if (kernels) |k| k.column_tile(job, b) else tiles.columnTile(job, b);
+}
+
+pub inline fn columnSingle(kernels: ?*const tiles.Kernels, job: *const tiles.Job, b0: usize, blocks: usize) void {
+    if (kernels) |k| k.column_single(job, b0, blocks) else tiles.columnSingle(job, b0, blocks);
+}
+
 test "every level this CPU can run scores exactly as the library's own kernels" {
     // The levels are separate compilations reached through `Job`, so this checks the
     // seam as well as the kernels: a mistake in either shows up as a difference, and
@@ -153,6 +161,22 @@ test "every level this CPU can run scores exactly as the library's own kernels" 
             job.out = &theirs;
             level.kernels.single_tiles(&job, 0, 2);
             try testing.expectEqualSlices(f32, own[0..vectors], theirs[0..vectors]);
+
+            // The one-bit column kernels read the same bytes as one block of 16.
+            if (maybe_bits == 1) {
+                job.n = n;
+                job.out = &own;
+                tiles.columnTile(&job, 0);
+                job.out = &theirs;
+                level.kernels.column_tile(&job, 0);
+                try testing.expectEqualSlices(f32, own[0 .. 16 * n], theirs[0 .. 16 * n]);
+                job.n = 1;
+                job.out = &own;
+                tiles.columnSingle(&job, 0, 1);
+                job.out = &theirs;
+                level.kernels.column_single(&job, 0, 1);
+                try testing.expectEqualSlices(f32, own[0..16], theirs[0..16]);
+            }
         }
     }
     if (runnable == 0) return error.SkipZigTest;

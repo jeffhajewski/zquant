@@ -161,8 +161,10 @@ pub fn write(index: *const FlatIndex, out: []u8) Error!usize {
         put(u32, buf, at, @bitCast(v));
         at += 4;
     }
-    @memcpy(buf[at..][0..index.codes.items.len], index.codes.items);
-    at += index.codes.items.len;
+    // One vector after another, however the index holds them (`codes.zig`).
+    const code_len = index.codes.len * index.codes.stride;
+    index.codes.writeRows(buf[at..][0..code_len]);
+    at += code_len;
     @memcpy(buf[at..][0..index.sketches.items.len], index.sketches.items);
     at += index.sketches.items.len;
     for (index.scalars.items) |s| {
@@ -332,7 +334,7 @@ pub fn read(allocator: Allocator, bytes: []const u8) (Error || Allocator.Error)!
     index.calibrated = calibrated;
 
     try index.reserve(count);
-    index.codes.appendSliceAssumeCapacity(bytes[at..][0 .. count * code_stride]);
+    index.codes.appendRowsAssumeCapacity(bytes[at..][0 .. count * code_stride]);
     at += count * code_stride;
     index.sketches.appendSliceAssumeCapacity(bytes[at..][0 .. count * sketch_stride]);
     at += count * sketch_stride;
@@ -402,8 +404,9 @@ pub fn writePartitioned(index: *const IvfIndex, out: []u8) (Error || error{NotTr
         at += size_len;
     }
     for (index.lists) |l| {
-        @memcpy(buf[at..][0..l.codes.items.len], l.codes.items);
-        at += l.codes.items.len;
+        const code_len = l.codes.len * l.codes.stride;
+        l.codes.writeRows(buf[at..][0..code_len]);
+        at += code_len;
     }
     for (index.lists) |l| for (l.scalars.items) |s| {
         put(u16, buf, at, @bitCast(s.norm));
@@ -476,7 +479,7 @@ pub fn readPartitioned(allocator: Allocator, bytes: []const u8) (Error || Alloca
 
     for (index.lists, 0..) |*l, i| {
         const len = listLen(sizes, i);
-        try l.codes.ensureTotalCapacityPrecise(allocator, len * stride);
+        try l.codes.ensureTotalCapacityPrecise(allocator, len);
         try l.scalars.ensureTotalCapacityPrecise(allocator, len);
         try l.biases.ensureTotalCapacityPrecise(allocator, len);
         try l.ids.ensureTotalCapacityPrecise(allocator, len);
@@ -488,7 +491,7 @@ pub fn readPartitioned(allocator: Allocator, bytes: []const u8) (Error || Alloca
     at = sizes_at + lists * size_len;
     for (index.lists, 0..) |*l, i| {
         const len = listLen(sizes, i);
-        l.codes.appendSliceAssumeCapacity(bytes[at..][0 .. len * stride]);
+        l.codes.appendRowsAssumeCapacity(bytes[at..][0 .. len * stride]);
         at += len * stride;
     }
     for (index.lists, 0..) |*l, i| for (0..listLen(sizes, i)) |_| {
@@ -575,7 +578,7 @@ test "a loaded index is the saved one: same bytes, same search results" {
 
         try testing.expectEqual(index.count(), loaded.count());
         try testing.expectEqual(index.calibrated, loaded.calibrated);
-        try testing.expectEqualSlices(u8, index.codes.items, loaded.codes.items);
+        try testing.expectEqualSlices(u8, index.codes.bytes.items, loaded.codes.bytes.items);
         try testing.expectEqualSlices(u8, index.sketches.items, loaded.sketches.items);
         try testing.expectEqualSlices(f32, index.centre, loaded.centre);
         try testing.expectEqualSlices(f16, index.biases.items, loaded.biases.items);
@@ -594,7 +597,7 @@ test "a loaded index is the saved one: same bytes, same search results" {
         // to the original.
         _ = try index.add(data[0..dim]);
         _ = try loaded.add(data[0..dim]);
-        try testing.expectEqualSlices(u8, index.codes.items, loaded.codes.items);
+        try testing.expectEqualSlices(u8, index.codes.bytes.items, loaded.codes.bytes.items);
     }
 }
 

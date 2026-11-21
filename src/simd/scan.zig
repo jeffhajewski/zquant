@@ -7,6 +7,9 @@
 //! table sits in one SIMD register for the whole scan and the work is a dot product
 //! reducing along dimensions.
 //!
+//! An index scores one-bit codes with `columns.zig` instead, sixteen vectors at a time.
+//! These kernels still serve every other width, and the expanded residency at every width.
+//!
 //! ## Table lookup
 //!
 //! `simd/shuffle.zig` owns the one-instruction byte-table lookup this kernel is built
@@ -33,12 +36,17 @@ const Layout = packing.Layout;
 const bitmask = @import("bitmask.zig");
 const shuffle = @import("shuffle.zig");
 const dot = @import("dot.zig");
+const columns = @import("columns.zig");
 
 /// The 16 centroids, quantized to int8. Query-independent, built once per index.
 pub const Table = struct {
     values: @Vector(16, i8),
     /// centroid ≈ values[k] * scale
     scale: f32,
+    /// A two-level codebook's levels exactly, as `low` and `low + step`, for the one-bit
+    /// kernels (`columns.zig`); zero otherwise.
+    low: f32 = 0,
+    step: f32 = 0,
 
     /// Build from a codebook of at most 16 levels.
     ///
@@ -56,6 +64,9 @@ pub const Table = struct {
         var values: [16]i8 = @splat(0);
         for (centroids, 0..) |c, k| {
             values[k] = @intFromFloat(@round(std.math.clamp(c / scale, -127.0, 127.0)));
+        }
+        if (centroids.len == 2) {
+            return .{ .values = values, .scale = scale, .low = centroids[0], .step = centroids[1] - centroids[0] };
         }
         return .{ .values = values, .scale = scale };
     }
@@ -87,6 +98,10 @@ pub const Query = struct {
     stride: usize,
     /// p_j ≈ data[(j % groups) * stride + j / groups] * scale
     scale: f32,
+    /// One-bit layouts only: the tables the column kernels look up (`columns.zig`),
+    /// `columns.lutLen` bytes, and what turns their sums back into ⟨p, b⟩.
+    lut: []u8 = &.{},
+    lut_terms: columns.LutTerms = .{ .scale = 0, .low = 0, .total = 0 },
     allocator: Allocator,
 
     /// `groups` follows the layout: a sequential layout interleaves the query by
@@ -110,17 +125,22 @@ pub const Query = struct {
             .bit_plane => 1,
         };
         std.debug.assert(dim % groups == 0);
+        const data = try allocator.alloc(i8, dim);
+        errdefer allocator.free(data);
+        const one_bit = layout.kind() == .sequential and layout.bits == 1;
         return .{
-            .data = try allocator.alloc(i8, dim),
+            .data = data,
             .groups = groups,
             .stride = dim / groups,
             .scale = 1.0,
+            .lut = if (one_bit) try allocator.alloc(u8, columns.lutLen(layout.stride())) else &.{},
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *Query) void {
         self.allocator.free(self.data);
+        if (self.lut.len > 0) self.allocator.free(self.lut);
         self.* = undefined;
     }
 
@@ -141,6 +161,12 @@ pub const Query = struct {
                 dst.* = @intFromFloat(@round(std.math.clamp(v, -127.0, 127.0)));
             }
         }
+        if (self.lut.len > 0) self.lut_terms = columns.buildLut(rotated, self.lut);
+    }
+
+    /// For the one-bit kernels: this query's sums to ⟨p, ũ⟩ under `table`'s levels.
+    pub fn affine(self: Query, table: Table) columns.Affine {
+        return columns.Affine.init(self.lut_terms, table.low, table.step);
     }
 };
 

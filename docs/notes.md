@@ -2508,3 +2508,94 @@ an optimized test binary, which reaches libm, disagreed on 4,618), so no stored 
 fixture hash changed and `encoding_version` stays at 1. The optimized library no longer
 imports `exp`, `log`, `sin` or `cos`, and a test pins a hash of about 145,000 outputs, so a
 platform that computes any of them differently fails in CI.
+
+## A one-bit kernel: codes by column, scored by table lookup
+
+One bit per dimension was zquant's slowest width against FAISS. The row-major kernels cost
+about the same per dimension at every width, so at one bit, where FAISS's fast-scan indexes
+are cheapest, both of them were faster: RaBitQ's fast-scan 1.5 times, PQ's twice. This is
+the kernel the README said might close that.
+
+The row-major argument (`src/quant/packing.zig`, DESIGN.md §4.2) is that a scalar codebook
+needs only one 16-entry table for the whole scan. At one bit the same arithmetic points the
+other way: with two levels, a table over *four* dimensions has 16 entries too,
+`T_g[m] = Σ_t p_{4g+t} · bit_t(m)`, and one lookup then scores four dimensions of sixteen
+vectors, provided the sixteen vectors' codes for those dimensions sit in one register. That
+is FAISS's fast-scan. The row-major kernel instead spends about 1.75 vector instructions per
+vector-query pair per 16 dimensions unpacking bits to int8 centroids and `sdot`-ing them.
+
+`bench/fastscan_bench.zig` measured the candidates on one M5 core, 100k random one-bit
+codes at d=768, 32 queries (M scores/s, best of 7; the ranges are two runs):
+
+| kernel | batch | one query |
+|---|---|---|
+| row-major 4x4 tile (what shipped) | 183–197 | 79–92 (8-vector tile) |
+| FAISS's layout: 32 vectors, nibbles interleaved | 393–421 | 290–343 |
+| stored row-major, transposed at search time | 308–353 | 145–191 |
+| 16 vectors by byte column | 415–426 | 331–347 |
+| the same, through the library's `columnTile` / `columnSingle` | 383 | 324 |
+
+Transposing at search time would have left storage alone, but one query pays for the whole
+transpose, which halves the single-query gain. A plain byte-column layout, byte k of
+sixteen vectors together, is as fast as FAISS's nibble interleave and simpler: vector v's
+byte k is at `(v/16)·16·stride + 16k + v%16`, and each byte's two nibbles take two tables.
+So one-bit codes are now stored that way (`src/index/codes.zig`) and scored by
+`src/simd/columns.zig`, whose entry points also turn the sums into scores and store them
+where the search loop reads them, which costs the last 9%: 1.95 times the old tile's
+throughput with a batch and 3.7 times for one query. Held at 128 queries, where the tables (3 KB a query at d=768) no
+longer fit L1, the kernel still ran at 426.
+
+**The table.** Per four-dimension group the sixteen sums are shifted to start at zero (an
+entry is then a sum of |p| over the dimensions whose bit agrees with p's sign) and rounded
+to u8 with one scale per query, the widest group's Σ|p| over 255, so sums accumulate in u16
+lanes for up to 128 bytes of codes before folding into u32. Its rounding costs what the
+int8 query did: rms error 0.0077 against 0.0076 on unit-scale dot products, far below the
+one-bit codes' own error. Recall at one bit moved from 0.750 to 0.749 on Cohere, and IVF
+recall within 0.001 at every probe count.
+
+Every path takes the same integer sums and the same affine map back to ⟨p, ũ⟩: batched and
+single search, partitioned lists read by many queries or few, `score_ids` (which sums one
+vector's lookups byte by byte), and the AVX2 copy of the kernels that x86 releases choose at
+run time. So they agree to the bit, as they did before, and tests check it at one bit.
+
+**Through the library**, Cohere 100k × 768, the Python client, one thread, best of three:
+
+| | before | after |
+|---|---|---|
+| flat, 1000 queries in a batch | 1,764 QPS | 3,274 QPS |
+| flat, one query at a time | 766 | 1,942 |
+| flat, two bits (unchanged path) | 1,880 | 1,871 |
+| 316 lists, 4 probes | 28,945 | 38,162 |
+| 316 lists, 19 probes | 11,687 | 20,448 |
+| 316 lists, 39 probes | 7,492 | 13,529 |
+
+**Against FAISS**, both comparisons rerun whole (`bench/py/highdim.py`,
+`bench/py/partition.py`; the tables in the README and comparison.md are from these runs).
+Flat at one bit on Cohere, zquant finds 0.749 at 3,210 QPS, RaBitQ's fast-scan index 0.739
+at 2,502 and PQ's 0.540 at 3,514, so only PQ's is still faster, by 9%. Partitioned into 316
+lists, zquant at 4 probes now edges FAISS's fast-scan IVF-RaBitQ (39,457 QPS against
+38,192, where it trailed 28,299 to 39,418), and at 39 probes it's 3.2 times as fast (13,383
+against 4,144). Everything in this run was about 7% slower than in the last, FAISS and
+zquant's unchanged paths alike (four bits flat: 1,834 QPS against 1,979), so compare within
+a run.
+
+At a million vectors (Cohere 1M, 1000 lists, `bench/py/partition.py`) one bit goes from
+187 to 382 QPS flat, from 2,205 to 5,409 at 31 probes and from 866 to 1,850 at 125, with
+the same recall; the "before" numbers are the last run's. FAISS's fast-scan IVF-RaBitQ,
+not run at a million before, finds 0.770 at 3,455 QPS at 31 probes, where zquant finds
+0.780. The million-vector partitioned index now takes 112 MB rather than 111, the unused
+lanes of its 1000 lists' last blocks.
+
+The batch gains 1.86× against the kernel's 1.95× because the per-pair work after the scan,
+turning sums into scores and testing them against each query's threshold, costs what it
+did. FAISS filters on the integer sums before converting any; that is the next thing to try.
+
+**What it costs.** A block holds 16 vectors whole, so an index, or each of its lists, holds
+up to 15 vectors' worth of unused codes at its end, 7.5 on average. For a flat index that is
+nothing much; split into lists it is about 2% at 100k vectors in 316 lists at d=768 and
+0.7% at a million in 1,000. `bytes_per_vector` does not count it. Files are unchanged, since codes are written and read one vector after another
+whatever the arrangement, and no fixture hash moved. Scores at one bit move slightly,
+being rounded differently.
+
+Two bits could go the same way, two dimensions to a nibble, but a lookup then covers half
+as much and the batch gain shrinks to perhaps 1.15× (one query, perhaps 1.9×). Not done.

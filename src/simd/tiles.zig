@@ -15,6 +15,7 @@ const scan = @import("scan.zig");
 const dot = @import("dot.zig");
 const shuffle = @import("shuffle.zig");
 const packing = @import("../quant/packing.zig");
+const columns = @import("columns.zig");
 
 /// The batch tile: vectors x queries scored together. bench/tile_bench.zig measured
 /// seven shapes on x86_64 (Zen 3 and Zen 5) and arm64 (Apple M5, Neoverse N2), and no
@@ -112,6 +113,48 @@ pub fn singleTiles(job: *const Job, v0: usize, tiles: usize) void {
     }
 }
 
+/// Queries per pass of the one-bit block kernel: four, or two on x86 without AVX, whose
+/// 16 registers cannot hold four queries' accumulators (see `split_one_bit`).
+const column_group = if (split_one_bit) 2 else 4;
+
+/// Scores the 16 vectors of one-bit column block `b` (`index/codes.zig`) against all
+/// `job.n` queries, into `out[u * out_stride + i]` for lane `u`. `job.codes` is the
+/// first block and `job.stride` a vector's bytes.
+pub fn columnTile(job: *const Job, b: usize) void {
+    const queries = queriesOf(job);
+    const table: *const scan.Table = @ptrCast(@alignCast(job.table));
+    const blk = job.codes + b * columns.block * job.stride;
+    const os = job.out_stride;
+    var i: usize = 0;
+    while (i + column_group <= job.n) : (i += column_group) {
+        columnQueries(column_group, queries[i..][0..column_group], table.*, blk, job.stride, job.out + i, os);
+    }
+    while (i < job.n) : (i += 1) {
+        columnQueries(1, queries[i..][0..1], table.*, blk, job.stride, job.out + i, os);
+    }
+}
+
+/// Scores `blocks` one-bit column blocks from block `b0` against query 0, into
+/// `out[0 ..]`, 16 to a block (`out_stride` is not used).
+pub fn columnSingle(job: *const Job, b0: usize, blocks: usize) void {
+    const query = queriesOf(job)[0..1];
+    const table: *const scan.Table = @ptrCast(@alignCast(job.table));
+    for (0..blocks) |t| {
+        const blk = job.codes + (b0 + t) * columns.block * job.stride;
+        columnQueries(1, query, table.*, blk, job.stride, job.out + t * columns.block, 1);
+    }
+}
+
+inline fn columnQueries(comptime Q: usize, queries: *const [Q]scan.Query, table: scan.Table, blk: [*]const u8, stride: usize, out: [*]f32, os: usize) void {
+    var luts: [Q][*]const u8 = undefined;
+    inline for (0..Q) |q| luts[q] = queries[q].lut.ptr;
+    const sums = columns.blockSums(Q, blk, stride, luts);
+    inline for (0..Q) |q| {
+        const mse: [columns.block]f32 = queries[q].affine(table).applyVec(sums[q]);
+        for (0..columns.block) |u| out[u * os + q] = mse[u];
+    }
+}
+
 fn queriesOf(job: *const Job) []const scan.Query {
     const many: [*]const scan.Query = @ptrCast(@alignCast(job.queries));
     return many[0..job.n];
@@ -130,6 +173,8 @@ pub const Kernels = extern struct {
     description: [*:0]const u8,
     batch_tile: *const fn (job: *const Job, v0: usize) callconv(.c) void,
     single_tiles: *const fn (job: *const Job, v0: usize, tiles: usize) callconv(.c) void,
+    column_tile: *const fn (job: *const Job, b: usize) callconv(.c) void,
+    column_single: *const fn (job: *const Job, b0: usize, blocks: usize) callconv(.c) void,
 };
 
 fn batchTileC(job: *const Job, v0: usize) callconv(.c) void {
@@ -146,7 +191,17 @@ pub const kernels: Kernels = .{
     .description = description,
     .batch_tile = &batchTileC,
     .single_tiles = &singleTilesC,
+    .column_tile = &columnTileC,
+    .column_single = &columnSingleC,
 };
+
+fn columnTileC(job: *const Job, b: usize) callconv(.c) void {
+    columnTile(job, b);
+}
+
+fn columnSingleC(job: *const Job, b0: usize, blocks: usize) callconv(.c) void {
+    columnSingle(job, b0, blocks);
+}
 
 /// What this compilation's kernels are. The prefix is the marker CI greps release
 /// binaries for; `wide=` names the 256-bit kernels where they are compiled in.

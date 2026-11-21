@@ -45,6 +45,8 @@ const packing = @import("../quant/packing.zig");
 const scan = @import("../simd/scan.zig");
 const tiles = @import("../simd/tiles.zig");
 const dispatch = @import("../simd/dispatch.zig");
+const columns = @import("../simd/columns.zig");
+const Codes = @import("codes.zig").Codes;
 const topk = @import("topk.zig");
 const rng = @import("../math/rng.zig");
 const RotationKind = @import("../math/rotation.zig").Kind;
@@ -99,7 +101,8 @@ pub const IvfIndex = struct {
     allocator: Allocator,
 
     pub const List = struct {
-        codes: std.ArrayList(u8) = .empty,
+        /// One vector after another, or by column at one bit; see `IvfIndex.byColumn`.
+        codes: Codes,
         scalars: std.ArrayList(StoredScalars) = .empty,
         biases: std.ArrayList(f16) = .empty,
         ids: std.ArrayList(u32) = .empty,
@@ -139,9 +142,8 @@ pub const IvfIndex = struct {
         errdefer allocator.free(centroid_sq);
         @memset(centroid_sq, 0);
         const lists = try allocator.alloc(List, params.lists);
-        for (lists) |*l| l.* = .{};
 
-        return .{
+        var index: IvfIndex = .{
             .params = params,
             .quantizer = quantizer,
             .layout = packing.Layout.init(quantizer.padded(), quantizer.mse.bits),
@@ -157,6 +159,15 @@ pub const IvfIndex = struct {
             .total = 0,
             .allocator = allocator,
         };
+        for (lists) |*l| l.* = .{ .codes = Codes.init(index.codeStride(), index.byColumn()) };
+        return index;
+    }
+
+    /// Whether lists store codes by column, for the one-bit block kernels; the same rule
+    /// as `FlatIndex.byColumn`.
+    pub fn byColumn(self: IvfIndex) bool {
+        return self.params.residency == .compact and self.layout.bits == 1 and
+            self.layout.kind() == .sequential and self.vectorized();
     }
 
     pub fn deinit(self: *IvfIndex) void {
@@ -338,7 +349,7 @@ pub const IvfIndex = struct {
         for (assigned) |l| per_list[l] += 1;
         for (self.lists, per_list) |*l, extra| {
             if (extra == 0) continue;
-            try l.codes.ensureUnusedCapacity(a, extra * stride);
+            try l.codes.ensureUnusedCapacity(a, extra);
             try l.scalars.ensureUnusedCapacity(a, extra);
             try l.biases.ensureUnusedCapacity(a, extra);
             try l.ids.ensureUnusedCapacity(a, extra);
@@ -353,7 +364,7 @@ pub const IvfIndex = struct {
             self.runEncode(vectors[start * d ..][0 .. take * d], out, encoders, .encode);
             for (0..take) |v| {
                 const l = &self.lists[assigned[start + v]];
-                l.codes.appendSliceAssumeCapacity(staged.codes[v * stride ..][0..stride]);
+                l.codes.appendAssumeCapacity(staged.codes[v * stride ..][0..stride]);
                 l.scalars.appendAssumeCapacity(staged.scalars[v]);
                 l.biases.appendAssumeCapacity(staged.biases[v]);
                 l.ids.appendAssumeCapacity(@intCast(self.total + start + v));
@@ -788,7 +799,6 @@ pub const IvfIndex = struct {
         const use_simd = self.vectorized();
         if (use_simd) searcher.scan_queries[0].load(state.rotated);
         const norm = flat.euclideanNorm(query);
-        const stride = self.codeStride();
         const levels = self.quantizer.mse.codebook.centroids;
 
         // ⟨p, c_l⟩ for every list in one pass once there are enough ids to need most of
@@ -805,7 +815,7 @@ pub const IvfIndex = struct {
             const mse = if (use_simd)
                 self.mseTerm(list, at.slot, searcher.scan_queries[0], searcher)
             else
-                scan.scoreExact(self.layout, levels, state.rotated, list.codes.items[at.slot * stride ..][0..stride]);
+                scan.scoreExact(self.layout, levels, state.rotated, list.codes.row(at.slot));
             o.* = flat.scalarScore(true, self.vectorTermsAt(list, at.slot), terms, mse);
         }
     }
@@ -815,7 +825,7 @@ pub const IvfIndex = struct {
             .table = &searcher.table,
             .queries = undefined,
             .n = undefined,
-            .codes = list.codes.items.ptr,
+            .codes = list.codes.ptr(),
             .stride = self.codeStride(),
             .padded = @intCast(self.padded()),
             .bits = self.layout.bits,
@@ -832,8 +842,8 @@ pub const IvfIndex = struct {
 
     /// ⟨p, ũ⟩ for vector `v` of `list` against one query, by the one-pair kernels.
     fn mseTerm(self: *const IvfIndex, list: *const List, v: usize, query: scan.Query, searcher: *const Searcher) f32 {
-        const stride = self.codeStride();
-        const slot = list.codes.items[v * stride ..][0..stride];
+        if (list.codes.by_column) return list.codes.oneBitTerm(v, query, searcher.table);
+        const slot = list.codes.row(v);
         return switch (self.params.residency) {
             .expanded => scan.scoreExpanded(@ptrCast(slot), query, self.table.scale, @intCast(self.padded())),
             .compact => scan.scoreInt8(self.layout, searcher.table, query, slot, @intCast(self.padded())),
@@ -855,13 +865,14 @@ pub const IvfIndex = struct {
         searcher: *const Searcher,
         kernels: ?*const tiles.Kernels,
     ) void {
-        const tile = tiles.batch_tile;
+        // 16 vectors at a time for one-bit column blocks, as in `FlatIndex.searchBatch`.
+        const by_column = list.codes.by_column;
+        const tile: usize = if (by_column) columns.block else tiles.batch_tile;
         const lanes = flat.lanes;
         const Lane = flat.Lane;
         const m = group.m;
         const p: u32 = @intCast(self.padded());
-        const stride = self.codeStride();
-        var mse_block: [tile * flat.max_batch]f32 = undefined;
+        var mse_block: [columns.block * flat.max_batch]f32 = undefined;
         var jb = self.job(list, searcher);
         jb.queries = &group.queries;
         jb.n = m;
@@ -875,7 +886,9 @@ pub const IvfIndex = struct {
         var v0: usize = 0;
         while (v0 < total) : (v0 += tile) {
             const take = @min(tile, total - v0);
-            if (can_tile and take == tile) {
+            if (by_column) {
+                dispatch.columnTile(kernels, &jb, v0 / columns.block);
+            } else if (can_tile and take == tile) {
                 dispatch.batchTile(kernels, &jb, v0);
             } else if (self.params.residency == .expanded) {
                 for (0..take) |u| for (0..m) |j| {
@@ -883,7 +896,7 @@ pub const IvfIndex = struct {
                 };
             } else for (0..take) |u| {
                 // The unpack is query-independent, so the group shares it.
-                const slot = list.codes.items[(v0 + u) * stride ..][0..stride];
+                const slot = list.codes.row(v0 + u);
                 var j: usize = 0;
                 while (j + compact_width <= m) : (j += compact_width) {
                     scan.scoreInt8Multi(self.layout, searcher.table, group.queries[j..m], slot, p, mse_block[u * flat.max_batch + j ..]);
@@ -978,6 +991,7 @@ pub const IvfIndex = struct {
     ) void {
         const tile = tiles.single_tile;
         var block: [tile * 8]f32 = undefined;
+        comptime std.debug.assert(block.len % columns.block == 0);
         var jb = self.job(list, searcher);
         jb.queries = &group.queries[j];
         jb.n = 1;
@@ -996,9 +1010,14 @@ pub const IvfIndex = struct {
         var v0: usize = 0;
         while (v0 < total) : (v0 += block.len) {
             const take = @min(block.len, total - v0);
-            const tiled = if (can_tile) take / tile * tile else 0;
-            if (tiled > 0) dispatch.singleTiles(kernels, &jb, v0, tiled / tile);
-            for (tiled..take) |u| block[u] = self.mseTerm(list, v0 + u, group.queries[j], searcher);
+            if (list.codes.by_column) {
+                // The list's last block is stored whole, so it is scored whole.
+                dispatch.columnSingle(kernels, &jb, v0 / columns.block, (take + columns.block - 1) / columns.block);
+            } else {
+                const tiled = if (can_tile) take / tile * tile else 0;
+                if (tiled > 0) dispatch.singleTiles(kernels, &jb, v0, tiled / tile);
+                for (tiled..take) |u| block[u] = self.mseTerm(list, v0 + u, group.queries[j], searcher);
+            }
             for (0..take) |u| {
                 const v = v0 + u;
                 const sc = flat.scalarScore(true, self.vectorTermsAt(list, v), terms, block[u]);
@@ -1013,14 +1032,13 @@ pub const IvfIndex = struct {
 
     /// Codebooks too wide for the int8 kernels: the exact f32 scan, pair by pair.
     fn scanListExact(self: *const IvfIndex, list: *const List, group: *Group, col: *Collect, searcher: *const Searcher) void {
-        const stride = self.codeStride();
         const levels = self.quantizer.mse.codebook.centroids;
         for (0..group.m) |j| {
             const q = group.owner[j];
             flat.flushHot(&col.collectors[q], &col.hot[q], &col.hot_len[q], &group.thresholds[j]);
         }
         for (0..list.len()) |v| {
-            const slot = list.codes.items[v * stride ..][0..stride];
+            const slot = list.codes.row(v);
             const vt = self.vectorTermsAt(list, v);
             for (0..group.m) |j| {
                 const q = group.owner[j];
@@ -1572,7 +1590,7 @@ test "training and adding give the same bytes on any thread count" {
     try testing.expectEqualSlices(f32, one.centroids, many.centroids);
     try testing.expectEqual(one.count(), many.count());
     for (one.lists, many.lists) |x, y| {
-        try testing.expectEqualSlices(u8, x.codes.items, y.codes.items);
+        try testing.expectEqualSlices(u8, x.codes.bytes.items, y.codes.bytes.items);
         try testing.expectEqualSlices(u32, x.ids.items, y.ids.items);
         try testing.expectEqualSlices(f16, x.biases.items, y.biases.items);
         for (x.scalars.items, y.scalars.items) |p, q| try testing.expect(std.meta.eql(p, q));
@@ -1650,4 +1668,63 @@ test "misuse is refused" {
     try ivf.addBatch(data);
     try testing.expectError(error.IndexNotEmpty, ivf.train(data, 1));
     try testing.expectError(error.BadListCount, IvfIndex.init(a, .{ .dim = dim, .bits = 3, .lists = 0 }));
+}
+
+test "one-bit lists stored by column: batched, single, by id and reloaded agree" {
+    // Lists hold one-bit codes by column, each with its own partly used last block. A
+    // list read by fewer than four queries takes the one-query path and the rest the
+    // batched one; both, scoreIds and a reloaded index must report the same bits.
+    const a = testing.allocator;
+    const persist = @import("persist.zig");
+    var prng = std.Random.DefaultPrng.init(0x1B1F);
+    const dim = 256;
+    const data = try clusteredRows(a, 1500, dim, 12, prng.random());
+    defer a.free(data);
+    const nq = 9;
+    const queries = try clusteredRows(a, nq, dim, 12, prng.random());
+    defer a.free(queries);
+
+    for ([_]Metric{ .inner_product, .cosine, .l2 }) |metric| {
+        var ivf = try IvfIndex.init(a, .{ .dim = dim, .bits = 2, .lists = 10, .metric = metric, .seed = 9 });
+        defer ivf.deinit();
+        try testing.expect(ivf.byColumn());
+        try ivf.train(data, 1);
+        try ivf.addBatch(data[0 .. 1000 * dim]);
+        try ivf.addBatch(data[1000 * dim ..]);
+
+        const buf = try a.alloc(u8, persist.serializedSizePartitioned(&ivf));
+        defer a.free(buf);
+        _ = try persist.writePartitioned(&ivf, buf);
+        var loaded = try persist.readPartitioned(a, buf);
+        defer loaded.deinit();
+
+        const k = 12;
+        for ([_]usize{ 1, 3, 10 }) |probes| {
+            var batch = try IvfIndex.Searcher.init(a, ivf, nq, k, probes);
+            defer batch.deinit();
+            var one = try IvfIndex.Searcher.init(a, ivf, 1, k, probes);
+            defer one.deinit();
+            var again = try IvfIndex.Searcher.init(a, loaded, 1, k, probes);
+            defer again.deinit();
+            const together = ivf.searchBatch(queries, &batch);
+            for (0..nq) |i| {
+                const q = queries[i * dim ..][0..dim];
+                var alone: [k]Entry = undefined;
+                const found = ivf.search(q, &one);
+                @memcpy(alone[0..found.len], found);
+                const reloaded = loaded.search(q, &again);
+                var ids: [k]u32 = undefined;
+                for (alone[0..found.len], 0..) |e, j| ids[j] = e.id;
+                var scores: [k]f32 = undefined;
+                try ivf.scoreIds(q, ids[0..found.len], scores[0..found.len], &one);
+                for (alone[0..found.len], together[i * k ..][0..found.len], reloaded, scores[0..found.len]) |x, y, z, w| {
+                    try testing.expectEqual(x.id, y.id);
+                    try testing.expectEqual(x.score, y.score);
+                    try testing.expectEqual(x.id, z.id);
+                    try testing.expectEqual(x.score, z.score);
+                    try testing.expectEqual(x.score, w);
+                }
+            }
+        }
+    }
 }

@@ -289,6 +289,15 @@ horizontal_add(acc)
 6 ops per 32 dimensions ≈ **0.19 ops/dimension**, ~192 ops/vector. The dimension-major form needs
 an int8→f32 widen per dimension and costs ~3× more.
 
+**Except at one bit.** With two levels, a table over four dimensions has only 16 entries,
+`T_g[m] = Σ_t p_{4g+t} · bit_t(m)`, which is as small as the scalar table is at four bits.
+So one-bit codes are stored by column after all, in blocks of 16 vectors with byte k of each
+together (`src/index/codes.zig`), and scored FAISS's way, one lookup per four dimensions of
+16 vectors (`src/simd/columns.zig`). On the M5 at d=768 that scores 1.95× as fast as the
+row-major tile with a batch and 3.7× for one query; docs/notes.md, "A one-bit kernel", has
+the measurements.
+Files still hold codes row-major.
+
 > **Correction (measured).** This section originally claimed the scan is "deliberately
 > memory-bound", inferred from ~21 GB/s of code traffic. That was never tested and is **wrong**.
 > Batching 32 queries so the corpus is read once per batch rather than once per query gives

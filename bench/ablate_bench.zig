@@ -90,7 +90,7 @@ pub fn main() !void {
                             .expanded => zq.simd_scan.scoreExpandedTiled(
                                 tile,
                                 group,
-                                @ptrCast(index.codes.items.ptr + v0 * stride),
+                                @ptrCast(index.codes.ptr() + v0 * stride),
                                 stride,
                                 searcher.scan_queries[i..],
                                 index.table.scale,
@@ -104,7 +104,7 @@ pub fn main() !void {
                                 index.layout,
                                 searcher.table,
                                 searcher.scan_queries[i..],
-                                index.codes.items.ptr + v0 * stride,
+                                index.codes.ptr() + v0 * stride,
                                 stride,
                                 padded,
                                 mse_block[i..],

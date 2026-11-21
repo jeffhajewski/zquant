@@ -424,9 +424,8 @@ func (ix *Index) AddParallel(vectors []float32, threads int) error {
 //
 // Around sqrt(n) lists suits a corpus of n vectors. The sample needs at least lists
 // rows; past 256 per list the rest are not used. Partitioning takes the place of
-// Calibrate. A partitioned index cannot yet be saved, and ScoreIDs is not available on
-// it (errors matching ErrUnsupported). Searchers made before partitioning cannot search
-// it (an error matching ErrState).
+// Calibrate. A partitioned index saves and loads with its lists. Searchers made before
+// partitioning cannot search it or score ids on it (an error matching ErrState).
 func (ix *Index) Partition(sample []float32, lists, threads int) error {
 	n, err := ix.rows(sample, "sample")
 	if err != nil {

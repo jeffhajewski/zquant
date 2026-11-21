@@ -1,4 +1,4 @@
-"""Partitioned indexes: training, probing, and what a partitioned index refuses."""
+"""Partitioned indexes: training, probing, saving, and what a partitioned index refuses."""
 import numpy as np
 import pytest
 
@@ -31,7 +31,7 @@ def test_partitioning_lifts_recall_and_probes_trade_it_for_speed():
         assert ivf.lists == 64 and flat.lists == 0
         ivf.add(x, threads=4)
         assert len(ivf) == 6000
-        assert ivf.bytes_per_vector == flat.bytes_per_vector + 4
+        assert ivf.bytes_per_vector == flat.bytes_per_vector + 6
         flat_recall = recall(flat.search(q, k=10)[0], exact)
         by_probes = [recall(ivf.search(q, k=10, probes=p)[0], exact) for p in (1, 8, 64)]
         assert by_probes[0] < by_probes[1]
@@ -95,11 +95,6 @@ def test_what_a_partitioned_index_refuses():
             ix.partition(x, lists=10)
         with pytest.raises(zquant.StateError):
             ix.calibrate(x)
-        ix.add(x)
-        with pytest.raises(zquant.UnsupportedError):
-            ix.to_bytes()
-        with pytest.raises(zquant.UnsupportedError):
-            ix.score_ids(x[0], [0, 1])
     with zquant.Index(dim=16, bits=3) as flat:
         flat.add(x)
         with pytest.raises(zquant.StateError):
@@ -115,3 +110,42 @@ def test_what_a_partitioned_index_refuses():
             few.partition(x[:3], lists=4)
         with pytest.raises(ValueError):
             few.partition(x, lists=0)
+
+
+def test_a_saved_partitioned_index_loads_partitioned(tmp_path):
+    x = clustered(3000, 32, seed=11)
+    q = clustered(20, 32, seed=12)
+    with zquant.Index(dim=32, bits=3, metric="cosine") as ix:
+        ix.partition(x, lists=24, threads=2)
+        ix.add(x[:2000])
+        ix.save(tmp_path / "ivf.zq")
+        with zquant.Index.load(tmp_path / "ivf.zq") as back:
+            assert back.lists == 24
+            assert len(back) == 2000
+            assert back.bytes_per_vector == ix.bytes_per_vector
+            assert (back.bits, back.metric) == (3, "cosine")
+            for probes in (1, 6, 24):
+                want = ix.search(q, k=10, probes=probes)
+                got = back.search(q, k=10, probes=probes)
+                np.testing.assert_array_equal(want[0], got[0])
+                np.testing.assert_array_equal(want[1], got[1])
+            # Both keep accepting vectors, into the same lists.
+            ix.add(x[2000:])
+            back.add(x[2000:], threads=3)
+            assert back.to_bytes() == ix.to_bytes()
+
+
+def test_score_ids_on_a_partitioned_index_matches_search():
+    x = clustered(2000, 24, seed=13)
+    q = clustered(5, 24, seed=14)
+    with zquant.Index(dim=24, bits=4) as ix:
+        ix.partition(x, lists=16)
+        ix.add(x)
+        ids, scores = ix.search(q, k=15, probes=3)
+        for i in range(len(q)):
+            np.testing.assert_array_equal(ix.score_ids(q[i], ids[i]), scores[i])
+        # Ids in lists the search never probed are scored too.
+        everything = ix.score_ids(q[0], np.arange(len(x)))
+        assert everything.shape == (len(x),) and np.isfinite(everything).all()
+        with pytest.raises(IndexError):
+            ix.score_ids(q[0], [len(x)])

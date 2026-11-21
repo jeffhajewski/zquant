@@ -197,8 +197,9 @@ def _free_searcher(handle: int) -> None:
 class Index:
     """A quantized index: flat (exhaustive) unless `partition` splits it into lists.
 
-    Every vector is scanned for every query — there is no graph or partitioning — so
-    recall is bounded only by quantization, and cost grows linearly with the corpus.
+    A flat index scans every vector for every query, so recall is bounded only by
+    quantization and cost grows linearly with the corpus. A partitioned one scans only
+    the lists nearest each query.
 
     `bits` is the total budget per coordinate, 2 to 6. Storage is about `dim*(bits-1)/8`
     bytes per vector plus a few for scalars; `bytes_per_vector` reports the exact figure.
@@ -371,9 +372,8 @@ class Index:
 
         Around `sqrt(n)` lists suits a corpus of n vectors. The sample needs at least
         `lists` rows; past 256 per list the rest are not used. Partitioning takes the
-        place of `calibrate`, and an index can be partitioned only once.
-
-        A partitioned index cannot yet be saved, and `score_ids` is not available on it.
+        place of `calibrate`, and an index can be partitioned only once. A partitioned
+        index saves and loads with its lists.
         """
         lists = _int_arg(lists, "lists", 1, 1 << 16)
         threads = _threads_arg(threads)
@@ -535,8 +535,9 @@ class Index:
 
         Returns float32 scores, `scores[j]` being the estimate `search` would report for
         `ids[j]`. For ranking a candidate set picked some other way - a metadata filter,
-        another index - without scanning the whole corpus. An id outside
-        `0..len(index)-1` raises IndexError.
+        another index - without scanning the whole corpus. On a partitioned index every
+        id is scored, whatever list it is in. An id outside `0..len(index)-1` raises
+        IndexError.
         """
         q = _as_rows(query, self._dim, "query")
         if q.shape[0] != 1:
@@ -565,9 +566,9 @@ class Index:
 
     # ── Saving and loading ─────────────────────────────────────────────────────────
     #
-    # The format holds the configuration, any calibration and the codes. It is
-    # versioned, checksummed and the same on every platform, so a file saved on one
-    # machine loads on another. Loading checks every field and the checksum, so
+    # The format holds the configuration, any calibration or list centroids, and the
+    # codes. It is versioned, checksummed and the same on every platform, so a file saved
+    # on one machine loads on another. Loading checks every field and the checksum, so
     # anything that is not an intact index raises FormatError rather than crashing.
 
     def _serialize(self) -> np.ndarray:

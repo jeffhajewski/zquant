@@ -1,7 +1,7 @@
 {
   "about": "Cross-language conformance vectors. Every binding builds these inputs, runs them through the C ABI, and must reproduce each sha256 exactly. The Zig suite (tests/golden.zig) checks them against the library itself. Inputs are integers over a power of two, so every language constructs bit-identical floats. Seeds are hex strings because some exceed 2^53, which a JSON number cannot carry exactly.",
   "input": "x[r][j] = ((r*7919 + j*104729 + salt) mod 2001 - 1000) / 1024, as float32, row-major, 0 <= r < rows, 0 <= j < dim",
-  "index_hash": "sha256 of zq_index_serialize output after zq_index_create(config), zq_index_calibrate(all rows) if calibrate, and zq_index_add(all rows)",
+  "index_hash": "sha256 of zq_index_serialize output after zq_index_create(config), then zq_index_calibrate(all rows) if calibrate, or zq_index_partition(all rows, lists) if lists is present and non-zero, then zq_index_add(all rows)",
   "codec_hash": "sha256 of the zq_codec_encode codes for all rows, followed by the norms as little-endian float32",
   "encoding_version": 1,
   "index": [
@@ -9,7 +9,10 @@
     { "dim": 100, "bits": 5, "metric": "cosine",        "seed": "0xffffffffffffffc5", "compact": true,  "calibrate": false, "rows": 12, "salt": 1, "sha256": "db52db0d78729dfb81b5aec19e71a4e8a0b113c08abe66c51e02e161bbfbc22d" },
     { "dim": 768, "bits": 3, "metric": "l2",            "seed": "0x2a",               "compact": true,  "calibrate": false, "rows": 8,  "salt": 2, "sha256": "bdcd486bb4c4e8eb8fc87014ef67e68b0f3a3a2238a04aa7ba77a8239d44e275" },
     { "dim": 128, "bits": 4, "metric": "inner_product", "seed": "0x7",                "compact": false, "calibrate": false, "rows": 10, "salt": 3, "sha256": "5d717a0f3186d4f73def7d64ede7ab511b5a4e84c7682510c59d4127633fbfe5" },
-    { "dim": 96,  "bits": 4, "metric": "inner_product", "seed": "0x9",                "compact": true,  "calibrate": true,  "rows": 64, "salt": 4, "sha256": "0ed0bfea5c1f1bd48ac3c9ff83e9c27da01d7f09b98bfb856a28a994aab4740f" }
+    { "dim": 96,  "bits": 4, "metric": "inner_product", "seed": "0x9",                "compact": true,  "calibrate": true,  "rows": 64, "salt": 4, "sha256": "0ed0bfea5c1f1bd48ac3c9ff83e9c27da01d7f09b98bfb856a28a994aab4740f" },
+    { "dim": 96,  "bits": 3, "metric": "inner_product", "seed": "0x11",               "compact": true,  "calibrate": false, "lists": 4, "rows": 64, "salt": 8,  "sha256": "f0760b1154ff409b3efcd95f225bf25c6f4de9e73f4dc8d66c6b0a209b93946d" },
+    { "dim": 768, "bits": 2, "metric": "cosine",        "seed": "0xffffffffffffffc5", "compact": true,  "calibrate": false, "lists": 3, "rows": 24, "salt": 9,  "sha256": "602b5fc41c608869641fcea2253c01b30bb77714da4c6cef75172c09e99bbbda" },
+    { "dim": 128, "bits": 5, "metric": "l2",            "seed": "0x2b",               "compact": false, "calibrate": false, "lists": 5, "rows": 40, "salt": 10, "sha256": "7fedfaa3a8bf54e4431a8c5c20a94cf324d8be5b8fa7fe6102c57adbe954fd24" }
   ],
   "codec": [
     { "dim": 64,  "bits": 4, "seed": "0x1",                "rows": 8, "salt": 5, "sha256": "1c4e6dce2842a3ceea6a05a7f067777ee73ff6ef3aad0c4e217811bb79065f27" },

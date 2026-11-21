@@ -31,6 +31,7 @@ type conformanceFixture struct {
 		Seed      string `json:"seed"`
 		Compact   bool   `json:"compact"`
 		Calibrate bool   `json:"calibrate"`
+		Lists     int    `json:"lists"`
 		Rows      int    `json:"rows"`
 		Salt      int    `json:"salt"`
 		SHA256    string `json:"sha256"`
@@ -113,6 +114,11 @@ func TestConformanceIndex(t *testing.T) {
 			x := fixtureInput(c.Rows, c.Dim, c.Salt)
 			if c.Calibrate {
 				if err := ix.Calibrate(x); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if c.Lists > 0 {
+				if err := ix.Partition(x, c.Lists, 1); err != nil {
 					t.Fatal(err)
 				}
 			}

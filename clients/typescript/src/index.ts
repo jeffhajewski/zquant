@@ -433,8 +433,8 @@ export class Index {
    * each query: `probes` of them, an eighth unless set. Storing vectors against nearby
    * centroids also makes their estimates more accurate, so recall rises even with every
    * list scanned. The sample needs at least `lists` rows; past 256 per list the rest are
-   * not used. Partitioning takes the place of `calibrate`. A partitioned index cannot yet
-   * be saved, and `scoreIds` is not available on it.
+   * not used. Partitioning takes the place of `calibrate`. A partitioned index saves and
+   * loads with its lists, and `scoreIds` scores any id on it.
    */
   partition(sample: Vectors, options: PartitionOptions): void {
     const h = this.#handle();
@@ -616,8 +616,8 @@ export class Index {
   }
 
   /**
-   * The index as bytes: configuration, calibration and codes, in a versioned,
-   * checksummed, little-endian format that is the same on every platform.
+   * The index as bytes: configuration, calibration or list centroids, and codes, in a
+   * versioned, checksummed, little-endian format that is the same on every platform.
    */
   serialize(): Buffer {
     const h = this.#handle();

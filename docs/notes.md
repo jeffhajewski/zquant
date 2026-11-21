@@ -2469,3 +2469,42 @@ faster.
 
 The README's "2.2–4.8× faster" claim is gone with the README rewrite that followed.
 
+
+## Saving partitioned indexes, and a codebook that depended on the platform's libm
+
+A partitioned index now saves and loads, and `score_ids` works on one. The file is the flat
+format with its reserved header word put to use: offset 52 holds the number of lists, 0 for
+a flat index, so every flat file is byte-for-byte what it was. A partitioned file follows
+the header with the centroids, each list's length, and then the codes, scalars, biases and
+ids list by list (the table is at the top of `src/index/persist.zig`). The reader checks
+that the lengths add up and that the ids are 0 to n−1, once each and rising within each
+list, since search and `score_ids` both depend on it.
+
+`score_ids` needed a way from an id to its slot. Each vector now records its list in a u16
+(65,536 is the most lists an index may have), and since a list holds its vectors in the
+order they were added, its ids rise and a binary search finds the slot. That is 2 bytes a
+vector, so a partitioned vector costs 6 B more than a calibrated flat one rather than 4:
+108 B at d=768, bits=2, and 111 MB for the million-vector index the README shows, up from
+109 MB. A full slot map would have been 4 B more; the binary search over a list of about a
+thousand ids costs ten comparisons.
+
+The conformance fixture gained three partitioned cases, which each binding replays, and one
+of them failed through Python straight away: the Python library's file differed from the
+Zig suite's in one byte, the low byte of one f16 bias. The cause predates partitioning.
+The codebook is solved at run time from `@exp`, `@log` and `std.math.lgamma`, and those
+compile to calls to `exp` and `log`. In the Zig test suite and a Debug build of the library
+those are compiler-rt's, but an optimized build of the C library, which links libc, called
+the platform's libm (`nm -u` on the macOS dylib listed `_exp` and `_log`). The two differ in
+the last bit for some inputs, and one of the sixteen levels of the bits=5 codebook at d=128
+came out one bit apart, which was enough to round one bias the other way. The flat fixture
+cases had simply never hit a case where that showed.
+
+That makes "the same bytes on every platform" false for released libraries, since glibc,
+Apple's libm and the Windows CRT need not agree either. The fix is `src/math/libm.zig`:
+compiler-rt's `exp` and `log` and the standard library's `lgamma`, copied into the
+repository so that nothing in the codebook solver calls libm. They match what builds without
+libc always computed (0 mismatches against compiler-rt over 215,000 inputs in a Debug test;
+an optimized test binary, which reaches libm, disagreed on 4,618), so no stored code or
+fixture hash changed and `encoding_version` stays at 1. The optimized library no longer
+imports `exp`, `log`, `sin` or `cos`, and a test pins a hash of about 145,000 outputs, so a
+platform that computes any of them differently fails in CI.

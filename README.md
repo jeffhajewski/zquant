@@ -30,10 +30,10 @@ top ten.
 | index | memory | recall@10 | queries/s |
 |---|---|---|---|
 | bits=2, flat | 102 MB | 0.779 | 187 |
-| bits=2, 1000 lists, 31 searched | 109 MB | 0.780 | 2,205 |
-| bits=2, 1000 lists, 125 searched | 109 MB | 0.803 | 866 |
-| bits=3, 1000 lists, 125 searched | 205 MB | 0.897 | 899 |
-| bits=5, 1000 lists, 250 searched | 397 MB | 0.967 | 557 |
+| bits=2, 1000 lists, 31 searched | 111 MB | 0.780 | 2,205 |
+| bits=2, 1000 lists, 125 searched | 111 MB | 0.803 | 866 |
+| bits=3, 1000 lists, 125 searched | 207 MB | 0.897 | 899 |
+| bits=5, 1000 lists, 250 searched | 399 MB | 0.967 | 557 |
 
 A flat index compares every query with every vector. A partitioned one splits the vectors
 into lists by k-means and searches only the lists nearest each query. Searching 31 of the
@@ -142,7 +142,6 @@ queries by list, so a list is read once for all the queries that want it.
   kernels were written for x86 and may do better there. The only x86 numbers are from a
   GitHub runner (AMD Zen 3), where the AVX2 kernels run 1.75 times as fast as the SSSE3
   ones.
-- **A partitioned index can't be saved yet**, and `score_ids` works only on flat indexes.
 - **KV caches.** TurboQuant was also proposed for compressing a transformer's key-value
   cache. Measured against KIVI there, zquant loses at the same memory, and badly on
   Qwen2.5, whose keys carry a bias. [docs/kv-cache.md](docs/kv-cache.md) has the details.

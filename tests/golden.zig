@@ -154,6 +154,9 @@ const IndexCase = struct {
     seed: []const u8,
     compact: bool,
     calibrate: bool,
+    /// Partition into this many lists, over all the rows, instead of calibrating; 0 for
+    /// a flat index.
+    lists: u32 = 0,
     rows: usize,
     salt: u64,
     sha256: []const u8,
@@ -203,20 +206,43 @@ test "conformance fixture: the library reproduces every hash the bindings replay
     for (fixture.index, 0..) |c, ci| {
         const input = try fixtureInput(allocator, c.rows, c.dim, c.salt);
         defer allocator.free(input);
-        // What zq_index_create builds from the corresponding zq_config.
-        var index = try zq.flat.FlatIndex.init(allocator, .{
-            .dim = c.dim,
-            .bits = c.bits,
-            .metric = std.meta.stringToEnum(zq.flat.Metric, c.metric) orelse return error.BadFixture,
-            .seed = try std.fmt.parseInt(u64, c.seed, 0),
-            .residency = if (c.compact) .compact else .expanded,
-        });
-        defer index.deinit();
-        if (c.calibrate) try index.calibrate(input);
-        try index.addBatch(input);
-        const buf = try allocator.alloc(u8, zq.persist.serializedSize(&index));
+        const metric = std.meta.stringToEnum(zq.flat.Metric, c.metric) orelse return error.BadFixture;
+        const seed = try std.fmt.parseInt(u64, c.seed, 0);
+        const residency: zq.flat.Residency = if (c.compact) .compact else .expanded;
+        const buf = if (c.lists > 0) blk: {
+            // What zq_index_partition and zq_index_add build.
+            if (c.calibrate) return error.BadFixture;
+            var index = try zq.ivf.IvfIndex.init(allocator, .{
+                .dim = c.dim,
+                .bits = c.bits,
+                .lists = c.lists,
+                .metric = metric,
+                .seed = seed,
+                .residency = residency,
+            });
+            defer index.deinit();
+            try index.train(input, 1);
+            try index.addBatch(input);
+            const out = try allocator.alloc(u8, zq.persist.serializedSizePartitioned(&index));
+            _ = try zq.persist.writePartitioned(&index, out);
+            break :blk out;
+        } else blk: {
+            // What zq_index_create builds from the corresponding zq_config.
+            var index = try zq.flat.FlatIndex.init(allocator, .{
+                .dim = c.dim,
+                .bits = c.bits,
+                .metric = metric,
+                .seed = seed,
+                .residency = residency,
+            });
+            defer index.deinit();
+            if (c.calibrate) try index.calibrate(input);
+            try index.addBatch(input);
+            const out = try allocator.alloc(u8, zq.persist.serializedSize(&index));
+            _ = try zq.persist.write(&index, out);
+            break :blk out;
+        };
         defer allocator.free(buf);
-        _ = try zq.persist.write(&index, buf);
         const got = hexDigest(&.{buf});
         if (!std.mem.eql(u8, &got, c.sha256)) {
             std.debug.print("index case {d}: sha256 {s}, fixture says \"{s}\"\n", .{ ci, got, c.sha256 });

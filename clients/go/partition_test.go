@@ -96,11 +96,51 @@ func TestPartition(t *testing.T) {
 			t.Fatal("Search does not probe an eighth of the lists")
 		}
 	}
-	if _, err := ix2.ScoreIDs(s, q[:d], []uint32{0}); !errors.Is(err, ErrUnsupported) {
-		t.Fatalf("ScoreIDs: got %v, want ErrUnsupported", err)
+
+	// ScoreIDs reports what a search did, for ids in any list.
+	ids, scores := five.At(0)
+	got, err := ix2.ScoreIDs(s, q[:d], ids)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := ix2.MarshalBinary(); !errors.Is(err, ErrUnsupported) {
-		t.Fatalf("save: got %v, want ErrUnsupported", err)
+	for j := range ids {
+		if got[j] != scores[j] {
+			t.Fatalf("id %d: ScoreIDs %v, search %v", ids[j], got[j], scores[j])
+		}
+	}
+	if _, err := ix2.ScoreIDs(early, q[:d], ids[:1]); !errors.Is(err, ErrState) {
+		t.Fatalf("ScoreIDs with a searcher from before partitioning: got %v, want ErrState", err)
+	}
+
+	// A saved partitioned index loads partitioned, and searches as the original does.
+	data, err := ix2.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	back, err := FromBytes(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer back.Close()
+	if back.Lists() != 40 || back.Len() != ix2.Len() || back.BytesPerVector() != ix2.BytesPerVector() {
+		t.Fatalf("loaded: %d lists, %d vectors, %d bytes each", back.Lists(), back.Len(), back.BytesPerVector())
+	}
+	bs, err := back.NewSearcher(k, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bs.Close()
+	if err := bs.SetProbes(5); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := back.SearchWith(bs, q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range five.IDs {
+		if five.IDs[i] != loaded.IDs[i] || five.Scores[i] != loaded.Scores[i] {
+			t.Fatal("the loaded index searches differently")
+		}
 	}
 	// A searcher may outlive its index; setting probes on it is still safe.
 	ix2.Close()

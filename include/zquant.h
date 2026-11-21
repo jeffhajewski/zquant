@@ -112,10 +112,10 @@ zq_status zq_index_calibrate_auto(zq_index *index, const float *rows, size_t n,
  * needs at least `lists` non-zero rows; beyond 256 rows per list, the extra are not
  * used. Partitioning is allowed once, before any add (ZQ_ERR_STATE otherwise).
  *
- * Each vector costs 4 bytes more than in a calibrated flat index, for its id, which
- * zq_index_bytes_per_vector includes; the centroids cost lists * dim * 4 bytes in all.
- * A partitioned index cannot yet be saved (zq_index_serialize and zq_score_ids return
- * ZQ_ERR_UNSUPPORTED, and zq_index_serialized_size returns 0). */
+ * Each vector costs 6 bytes more than in a calibrated flat index, 4 for its id and 2
+ * naming its list, which zq_index_bytes_per_vector includes; the centroids cost about
+ * lists * dim * 4 bytes in all. A partitioned index is saved, loaded and scored by id
+ * through the same calls as a flat one. */
 zq_status zq_index_partition(zq_index *index, const float *rows, size_t n,
                              uint32_t lists, size_t threads);
 /* The number of lists, or 0 for an index that is not partitioned. */
@@ -135,8 +135,9 @@ zq_status zq_index_add_parallel(zq_index *index, const float *rows, size_t n, si
 
 /* Saving and loading.
  *
- * The serialized form holds the configuration, any calibration and the codes, in a
- * versioned, checksummed, little-endian format that is the same on every platform.
+ * The serialized form holds the configuration, any calibration or list centroids, and
+ * the codes, in a versioned, checksummed, little-endian format that is the same on
+ * every platform. A partitioned index loads partitioned, with its lists.
  * Loading rebuilds the rest from the configuration, so a loaded index searches and
  * accepts new vectors exactly as the saved one did.
  *
@@ -201,7 +202,9 @@ zq_status zq_search_rerank(zq_index *index, zq_searcher *searcher,
 /* Score specific stored vectors against one query: scores[j] is the estimate search
  * would report for ids[j]. For ranking a candidate set chosen elsewhere (a metadata
  * filter, another index) without scanning the whole corpus. An id at or past
- * zq_index_count gives ZQ_ERR_INVALID. */
+ * zq_index_count gives ZQ_ERR_INVALID. On a partitioned index every id is scored,
+ * whichever lists it is in and whatever the probes, and a searcher created before
+ * partitioning gives ZQ_ERR_STATE. */
 zq_status zq_score_ids(zq_index *index, zq_searcher *searcher, const float *query,
                        const uint32_t *ids, size_t n, float *scores);
 

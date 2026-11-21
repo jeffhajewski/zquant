@@ -178,10 +178,11 @@ on recall as well as speed. On 100k Cohere embeddings at `bits=2`, scanning 6% o
 lists found R@10 0.775 at 11k queries a second on one core, against 0.750 at 1.8k for
 the calibrated flat index.
 
-Partitioning takes the place of calibration, costs 4 more bytes per vector (for its id)
-plus `lists * dim * 4` bytes of centroids, and can be done once. The sample needs at
-least `lists` rows; 256 per list is all it uses. A partitioned index cannot be saved yet,
-and `score_ids` is not available on it.
+Partitioning takes the place of calibration, costs 6 more bytes per vector (4 for its id
+and 2 naming its list) plus `lists * dim * 4` bytes of centroids, and can be done once.
+The sample needs at least `lists` rows; 256 per list is all it uses. A partitioned index
+saves and loads with its lists, and `score_ids` scores any id in it, whichever list it is
+in.
 
 ## Saving and loading
 

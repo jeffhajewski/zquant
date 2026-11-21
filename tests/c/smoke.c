@@ -254,8 +254,8 @@ int main(void) {
     if (self_hits < (int)nq - 1) { printf("FAIL: self-retrieval too low\n"); return 1; }
 
     /* Partitioning: every vector retrieves itself when every list is probed, a searcher
-     * made before partitioning is refused, and what a partitioned index cannot do yet
-     * says so. */
+     * made before partitioning is refused, score_ids agrees with search, and a saved
+     * index loads partitioned and searches as the original did. */
     {
         zq_index *pv = NULL;
         zq_searcher *before = NULL, *after = NULL;
@@ -283,11 +283,33 @@ int main(void) {
             for (int j = 0; j < 4; j++)
                 if (pid[j * K] != (uint32_t)(i + j)) { printf("FAIL: partitioned self-retrieval at %d\n", i + j); return 1; }
         }
-        size_t written = 0;
-        if (zq_index_serialized_size(pv) != 0) { printf("FAIL: partitioned size\n"); return 1; }
-        if (zq_index_serialize(pv, NULL, 0, &written) != ZQ_ERR_UNSUPPORTED) { printf("FAIL: partitioned save\n"); return 1; }
-        uint32_t one = 0;
-        if (zq_score_ids(pv, after, base, &one, 1, psc) != ZQ_ERR_UNSUPPORTED) { printf("FAIL: partitioned score_ids\n"); return 1; }
+        /* The last search's first row: score_ids gives the same scores for those ids. */
+        float again[K];
+        if (zq_score_ids(pv, after, base + (size_t)36 * DIM, pid, K, again) != ZQ_OK) { printf("FAIL partitioned score_ids\n"); return 1; }
+        if (memcmp(again, psc, sizeof again)) { printf("FAIL: partitioned score_ids disagrees with search\n"); return 1; }
+        if (zq_score_ids(pv, before, base, pid, 1, again) != ZQ_ERR_STATE) { printf("FAIL: stale searcher scored\n"); return 1; }
+
+        size_t size = zq_index_serialized_size(pv), written = 0;
+        unsigned char *buf = malloc(size);
+        if (!buf) { printf("FAIL alloc\n"); return 1; }
+        if (zq_index_serialize(pv, buf, size - 1, &written) != ZQ_ERR_INVALID) { printf("FAIL: short buffer accepted\n"); return 1; }
+        if (zq_index_serialize(pv, buf, size, &written) != ZQ_OK || written != size) { printf("FAIL partitioned save\n"); return 1; }
+        zq_index *back = NULL;
+        zq_searcher *bs = NULL;
+        if (zq_index_deserialize(buf, size, &back) != ZQ_OK) { printf("FAIL partitioned load\n"); return 1; }
+        if (zq_index_lists(back) != 16 || zq_index_count(back) != N) { printf("FAIL: loaded lists or count\n"); return 1; }
+        if (zq_index_bytes_per_vector(back) != zq_index_bytes_per_vector(pv)) { printf("FAIL: loaded bytes per vector\n"); return 1; }
+        if (zq_searcher_create(back, 4, K, 1, &bs) != ZQ_OK || zq_searcher_set_probes(bs, 3) != ZQ_OK) { printf("FAIL loaded searcher\n"); return 1; }
+        if (zq_searcher_set_probes(after, 3) != ZQ_OK) { printf("FAIL set probes\n"); return 1; }
+        uint32_t lid[4 * K]; float lsc[4 * K];
+        if (zq_search(pv, after, base, 4, pid, psc) != ZQ_OK || zq_search(back, bs, base, 4, lid, lsc) != ZQ_OK) { printf("FAIL search loaded\n"); return 1; }
+        if (memcmp(pid, lid, sizeof pid) || memcmp(psc, lsc, sizeof psc)) { printf("FAIL: loaded partitioned index searches differently\n"); return 1; }
+        buf[size / 2] ^= 1;
+        zq_index *broken = NULL;
+        if (zq_index_deserialize(buf, size, &broken) != ZQ_ERR_FORMAT) { printf("FAIL: damaged partitioned index accepted\n"); return 1; }
+        free(buf);
+        zq_searcher_free(bs);
+        zq_index_free(back);
         zq_searcher_free(before);
         zq_searcher_free(after);
         zq_index_free(pv);

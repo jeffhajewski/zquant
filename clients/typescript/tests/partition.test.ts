@@ -1,4 +1,4 @@
-/** Partitioned indexes: training, probing, and what a partitioned index refuses. */
+/** Partitioned indexes: training, probing, saving, and what a partitioned index refuses. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Index, Status, ZquantError } from '../src/index.js';
@@ -40,9 +40,6 @@ test('what a partitioned index refuses', () => {
     ix.partition(x, { lists: 8 });
     assert.throws(() => ix.partition(x, { lists: 8 }), isStatus(Status.ERR_STATE));
     assert.throws(() => ix.calibrate(x), isStatus(Status.ERR_STATE));
-    ix.add(x);
-    assert.throws(() => ix.serialize(), isStatus(Status.ERR_UNSUPPORTED));
-    assert.throws(() => ix.scoreIds(x.subarray(0, d), [0]), isStatus(Status.ERR_UNSUPPORTED));
   } finally {
     ix.close();
   }
@@ -52,5 +49,37 @@ test('what a partitioned index refuses', () => {
     assert.throws(() => flat.search(x.subarray(0, d), { probes: 2 }), isStatus(Status.ERR_STATE));
   } finally {
     flat.close();
+  }
+});
+
+test('a saved partitioned index loads partitioned, and scoreIds matches search', () => {
+  const d = 24;
+  const x = corpus(2000, d, 83, 0.3);
+  const q = corpus(6, d, 84, 0.3);
+  const ix = new Index({ dim: d, bits: 3, metric: 'cosine' });
+  try {
+    ix.partition(x, { lists: 16 });
+    ix.add(x.subarray(0, 1500 * d));
+    const back = Index.deserialize(ix.serialize());
+    try {
+      assert.equal(back.lists, 16);
+      assert.equal(back.size, 1500);
+      assert.equal(back.bytesPerVector, ix.bytesPerVector);
+      const want = ix.search(q, { k: 10, probes: 4 });
+      const got = back.search(q, { k: 10, probes: 4 });
+      assert.deepEqual(got.ids, want.ids);
+      assert.deepEqual(got.scores, want.scores);
+      // Both keep taking vectors, into the same lists.
+      ix.add(x.subarray(1500 * d));
+      back.add(x.subarray(1500 * d), { threads: 3 });
+      assert.deepEqual(back.serialize(), ix.serialize());
+    } finally {
+      back.close();
+    }
+    const found = ix.search(q.subarray(0, d), { k: 12, probes: 3 });
+    const scores = ix.scoreIds(q.subarray(0, d), found.ids);
+    assert.deepEqual(scores, found.scores);
+  } finally {
+    ix.close();
   }
 });

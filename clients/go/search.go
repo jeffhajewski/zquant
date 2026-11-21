@@ -258,7 +258,8 @@ func (ix *Index) SearchRerank(s *Searcher, queries, originals []float32, k int) 
 // ScoreIDs scores chosen stored vectors against one query: the result's j-th score is
 // the estimate a search would report for ids[j]. It is for ranking a candidate set
 // picked some other way, by a metadata filter or another index, without scanning the
-// whole corpus. An id at or past Len is an error matching ErrInvalid.
+// whole corpus. On a partitioned index every id is scored, whatever list it is in. An
+// id at or past Len is an error matching ErrInvalid.
 func (ix *Index) ScoreIDs(s *Searcher, query []float32, ids []uint32) ([]float32, error) {
 	if len(query) != ix.dim {
 		return nil, invalid("query length %d is not dim %d", len(query), ix.dim)

@@ -46,13 +46,16 @@ def test_large_seeds_are_exact():
 
 
 @pytest.mark.parametrize("case", GOLDEN["index"],
-                         ids=lambda c: f"d{c['dim']}-b{c['bits']}-{c['metric']}")
+                         ids=lambda c: f"d{c['dim']}-b{c['bits']}-{c['metric']}"
+                                       + (f"-l{c['lists']}" if c.get("lists") else ""))
 def test_index_case(case):
     x = fixture_rows(case["rows"], case["dim"], case["salt"])
     with zquant.Index(dim=case["dim"], bits=case["bits"], metric=case["metric"],
                       seed=seed_of(case), compact=case["compact"]) as ix:
         if case["calibrate"]:
             ix.calibrate(x)
+        if case.get("lists"):
+            ix.partition(x, lists=case["lists"])
         ix.add(x)
         assert hashlib.sha256(ix.to_bytes()).hexdigest() == case["sha256"]
 

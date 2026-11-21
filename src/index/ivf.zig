@@ -28,9 +28,13 @@
 //!
 //! ## Storage
 //!
-//! Per vector: the codes, the f16 norm, factor and bias of a calibrated flat index, and a
-//! u32 id, since lists hold vectors out of insertion order. Per index: the centroids,
-//! `lists × padded` floats.
+//! Per vector: the codes, the f16 norm, factor and bias of a calibrated flat index, a u32
+//! id, since lists hold vectors out of insertion order, and a u16 naming the vector's list,
+//! so `scoreIds` can find a vector by id. Per index: the centroids, `lists × padded`
+//! floats.
+//!
+//! A list holds its vectors in the order they were added, so its ids rise. Finding a
+//! vector by id is a lookup of its list and a binary search there.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -88,6 +92,8 @@ pub const IvfIndex = struct {
     /// ‖c‖² per list, for ranking centroids by distance.
     centroid_sq: []f32,
     lists: []List,
+    /// The list each vector went to, by id.
+    list_of: std.ArrayList(u16),
     trained: bool,
     total: usize,
     allocator: Allocator,
@@ -146,6 +152,7 @@ pub const IvfIndex = struct {
             .centroids = centroids,
             .centroid_sq = centroid_sq,
             .lists = lists,
+            .list_of = .empty,
             .trained = false,
             .total = 0,
             .allocator = allocator,
@@ -155,6 +162,7 @@ pub const IvfIndex = struct {
     pub fn deinit(self: *IvfIndex) void {
         for (self.lists) |*l| l.deinit(self.allocator);
         self.allocator.free(self.lists);
+        self.list_of.deinit(self.allocator);
         self.allocator.free(self.centroid_sq);
         self.allocator.free(self.centroids);
         self.quantizer.deinit();
@@ -189,10 +197,23 @@ pub const IvfIndex = struct {
         };
     }
 
-    /// Bytes stored per vector: codes, three f16 scalars and a u32 id. The centroids are
-    /// per index; `centroidBytes` reports them.
+    /// Bytes stored per vector: codes, three f16 scalars, a u32 id and a u16 list. The
+    /// centroids are per index; `centroidBytes` reports them.
     pub fn bytesPerVector(self: IvfIndex) usize {
-        return self.codeStride() + @sizeOf(StoredScalars) + @sizeOf(f16) + @sizeOf(u32);
+        return self.codeStride() + @sizeOf(StoredScalars) + @sizeOf(f16) + @sizeOf(u32) + @sizeOf(u16);
+    }
+
+    /// Where vector `id` is stored: its list, and its slot there.
+    pub fn locate(self: IvfIndex, id: u32) struct { list: usize, slot: usize } {
+        std.debug.assert(id < self.total);
+        const l = self.list_of.items[id];
+        const ids = self.lists[l].ids.items;
+        const slot = std.sort.binarySearch(u32, ids, id, struct {
+            fn order(want: u32, have: u32) std.math.Order {
+                return std.math.order(want, have);
+            }
+        }.order) orelse unreachable;
+        return .{ .list = l, .slot = slot };
     }
 
     pub fn centroidBytes(self: IvfIndex) usize {
@@ -247,7 +268,13 @@ pub const IvfIndex = struct {
         if (rows < k) return error.EmptySample;
 
         try kmeans(a, data[0 .. rows * p], p, k, threads, self.centroids);
-        for (0..k) |l| self.centroid_sq[l] = dotExact(self.centroid(l), self.centroid(l));
+        self.useCentroids();
+    }
+
+    /// Take `centroids` as written, by training or by a loader, and mark the index
+    /// trained.
+    pub fn useCentroids(self: *IvfIndex) void {
+        for (0..self.lists.len) |l| self.centroid_sq[l] = dotExact(self.centroid(l), self.centroid(l));
         self.trained = true;
     }
 
@@ -316,6 +343,7 @@ pub const IvfIndex = struct {
             try l.biases.ensureUnusedCapacity(a, extra);
             try l.ids.ensureUnusedCapacity(a, extra);
         }
+        try self.list_of.ensureUnusedCapacity(a, n);
 
         start = 0;
         while (start < n) : (start += chunk) {
@@ -329,6 +357,7 @@ pub const IvfIndex = struct {
                 l.scalars.appendAssumeCapacity(staged.scalars[v]);
                 l.biases.appendAssumeCapacity(staged.biases[v]);
                 l.ids.appendAssumeCapacity(@intCast(self.total + start + v));
+                self.list_of.appendAssumeCapacity(@intCast(assigned[start + v]));
             }
         }
         self.total += n;
@@ -739,6 +768,46 @@ pub const IvfIndex = struct {
     /// One query: a batch of one.
     pub fn search(self: *const IvfIndex, query: []const f32, searcher: *Searcher) []Entry {
         return self.searchBatch(query, searcher);
+    }
+
+    /// Score the stored vectors `ids` against one query: `out[j]` is the score a search
+    /// probing `ids[j]`'s list would report for it, bit for bit. For ranking candidates
+    /// chosen elsewhere, such as by a filter. Probes play no part: every id is scored.
+    pub fn scoreIds(
+        self: *const IvfIndex,
+        query: []const f32,
+        ids: []const u32,
+        out: []f32,
+        searcher: *Searcher,
+    ) error{IdOutOfRange}!void {
+        std.debug.assert(query.len == self.dim() and ids.len == out.len);
+        for (ids) |id| if (id >= self.total) return error.IdOutOfRange;
+        if (ids.len == 0) return;
+        const state = &searcher.query_states[0];
+        self.quantizer.prepareQueryRotated(query, state, &searcher.workspace);
+        const use_simd = self.vectorized();
+        if (use_simd) searcher.scan_queries[0].load(state.rotated);
+        const norm = flat.euclideanNorm(query);
+        const stride = self.codeStride();
+        const levels = self.quantizer.mse.codebook.centroids;
+
+        // ⟨p, c_l⟩ for every list in one pass once there are enough ids to need most of
+        // them, else one list at a time. Both give the bits a search uses.
+        const lists = self.lists.len;
+        const all_dots = ids.len >= lists / 4;
+        if (all_dots) centroidDots(state.rotated, self.padded(), self.centroids, lists, searcher.coarse[0..lists]);
+
+        for (ids, out) |id, *o| {
+            const at = self.locate(id);
+            const list = &self.lists[at.list];
+            const centre_dot = if (all_dots) searcher.coarse[at.list] else dotExact(state.rotated, self.centroid(at.list));
+            const terms = flat.queryTerms(self.params.metric, norm, centre_dot);
+            const mse = if (use_simd)
+                self.mseTerm(list, at.slot, searcher.scan_queries[0], searcher)
+            else
+                scan.scoreExact(self.layout, levels, state.rotated, list.codes.items[at.slot * stride ..][0..stride]);
+            o.* = flat.scalarScore(true, self.vectorTermsAt(list, at.slot), terms, mse);
+        }
     }
 
     fn job(self: *const IvfIndex, list: *const List, searcher: *const Searcher) tiles.Job {
@@ -1359,7 +1428,7 @@ test "one list scores as a calibrated flat index does" {
         // The k-means mean sums the same rows in another order; take the flat index's
         // centre exactly, so the codes, factors and biases are the same bytes.
         @memcpy(ivf.centroids, fl.centre);
-        ivf.centroid_sq[0] = dotExact(ivf.centroids, ivf.centroids);
+        ivf.useCentroids();
         try ivf.addBatch(data);
 
         var fs = try flat.FlatIndex.BatchSearcher.init(a, fl, 9, 10);
@@ -1507,6 +1576,63 @@ test "training and adding give the same bytes on any thread count" {
         try testing.expectEqualSlices(u32, x.ids.items, y.ids.items);
         try testing.expectEqualSlices(f16, x.biases.items, y.biases.items);
         for (x.scalars.items, y.scalars.items) |p, q| try testing.expect(std.meta.eql(p, q));
+    }
+}
+
+test "scoreIds reports what search does, for any id and any probe count" {
+    const a = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(17);
+    const dim = 96;
+    const data = try clusteredRows(a, 2000, dim, 16, prng.random());
+    defer a.free(data);
+    const nq = 6;
+    const queries = try clusteredRows(a, nq, dim, 16, prng.random());
+    defer a.free(queries);
+
+    const Case = struct { metric: Metric, bits: u6, residency: Residency };
+    for ([_]Case{
+        .{ .metric = .inner_product, .bits = 2, .residency = .compact },
+        .{ .metric = .cosine, .bits = 4, .residency = .compact },
+        .{ .metric = .l2, .bits = 3, .residency = .expanded },
+        .{ .metric = .inner_product, .bits = 6, .residency = .compact }, // exact scan
+    }) |c| {
+        var ivf = try IvfIndex.init(a, .{ .dim = dim, .bits = c.bits, .lists = 24, .metric = c.metric, .seed = 4, .residency = c.residency });
+        defer ivf.deinit();
+        try ivf.train(data, 1);
+        try ivf.addBatch(data[0 .. 1500 * dim]);
+        try ivf.addBatch(data[1500 * dim ..]);
+
+        const k = 20;
+        var s = try IvfIndex.Searcher.init(a, ivf, nq, k, 5);
+        defer s.deinit();
+        var scorer = try IvfIndex.Searcher.init(a, ivf, 1, 1, 1);
+        defer scorer.deinit();
+        const found = ivf.searchBatch(queries, &s);
+        for (0..nq) |i| {
+            const q = queries[i * dim ..][0..dim];
+            const row = found[i * k ..][0..k];
+            var ids: [k]u32 = undefined;
+            var want: [k]f32 = undefined;
+            for (row, &ids, &want) |e, *id, *w| {
+                id.* = e.id;
+                w.* = e.score;
+            }
+            // Few ids score their lists one at a time, many score every list at once;
+            // both must give search's bits.
+            var got: [k]f32 = undefined;
+            try ivf.scoreIds(q, ids[0..3], got[0..3], &scorer);
+            try testing.expectEqualSlices(f32, want[0..3], got[0..3]);
+            try ivf.scoreIds(q, &ids, &got, &scorer);
+            try testing.expectEqualSlices(f32, &want, &got);
+        }
+
+        // Every id is found where it was stored.
+        for (0..ivf.count()) |id| {
+            const at = ivf.locate(@intCast(id));
+            try testing.expectEqual(@as(u32, @intCast(id)), ivf.lists[at.list].ids.items[at.slot]);
+        }
+        var out: [1]f32 = undefined;
+        try testing.expectError(error.IdOutOfRange, ivf.scoreIds(queries[0..dim], &.{@intCast(ivf.count())}, &out, &scorer));
     }
 }
 

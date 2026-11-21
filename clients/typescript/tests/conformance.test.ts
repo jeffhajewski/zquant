@@ -20,6 +20,8 @@ interface IndexCase {
   seed: string;
   compact: boolean;
   calibrate: boolean;
+  /** Partition into this many lists instead of calibrating; absent for a flat index. */
+  lists?: number;
   rows: number;
   salt: number;
   sha256: string;
@@ -95,6 +97,7 @@ fixture.index.forEach((c, i) => {
     });
     try {
       if (c.calibrate) ix.calibrate(x);
+      if (c.lists) ix.partition(x, { lists: c.lists });
       ix.add(x);
       assert.equal(sha256(ix.serialize()), c.sha256);
     } finally {

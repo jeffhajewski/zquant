@@ -441,8 +441,10 @@ since loading is a single pass anyway. `codebook_id` became `encoding_version`, 
 the codes as a whole: rotation, codebook and packing. `tests/golden.zig` names it next to
 the hashes it covers. There are no external ids, because the index has none. Format version 2 stores
 the calibration centre (`dim_padded` floats) and, when calibrated, an f16 bias per vector;
-the codes themselves did not change, so `encoding_version` did not. The layout table is at
-the top of `persist.zig`.
+the codes themselves did not change, so `encoding_version` did not. A partitioned index
+uses the same header, with its number of lists in the word that used to be reserved and
+zero, followed by its centroids and then its lists; flat files are unchanged. The layout
+table is at the top of `persist.zig`.
 
 ```
 header:  magic "ZQNT" | format_version | dim | dim_padded | bits | objective

@@ -63,6 +63,11 @@ const Index = struct {
     fn count(ix: *const Index) usize {
         return if (ix.ivf) |*v| v.count() else ix.inner.count();
     }
+
+    fn deinit(ix: *Index) void {
+        if (ix.ivf) |*v| v.deinit();
+        ix.inner.deinit();
+    }
 };
 
 /// Lists a new searcher probes on a partitioned index, until `zq_searcher_set_probes`
@@ -164,8 +169,7 @@ export fn zq_index_create(config: ?*const ZqConfig, out: ?**Index) c_int {
 
 export fn zq_index_free(index: ?*Index) void {
     const ix = index orelse return;
-    if (ix.ivf) |*v| v.deinit();
-    ix.inner.deinit();
+    ix.deinit();
     allocator.destroy(ix);
 }
 
@@ -300,17 +304,19 @@ export fn zq_index_lists(index: ?*const Index) u32 {
 /// Bytes `zq_index_serialize` writes for this index as it stands now.
 export fn zq_index_serialized_size(index: ?*const Index) usize {
     const ix = index orelse return 0;
-    if (ix.ivf != null) return 0;
+    if (ix.ivf) |*v| return zq.persist.serializedSizePartitioned(v);
     return zq.persist.serializedSize(&ix.inner);
 }
 
 export fn zq_index_serialize(index: ?*const Index, buf: ?[*]u8, len: usize, written: ?*usize) c_int {
     const ix = index orelse return ZQ_ERR_INVALID;
-    // Before the buffer check: zq_index_serialized_size says 0, so a caller may well
-    // pass NULL, and the answer should be why rather than that NULL is invalid.
-    if (ix.ivf != null) return ZQ_ERR_UNSUPPORTED;
     const out = buf orelse return ZQ_ERR_INVALID;
-    const n = zq.persist.write(&ix.inner, out[0..len]) catch return ZQ_ERR_INVALID;
+    // A partitioned index here was trained by zq_index_partition, so the only failure
+    // left is a short buffer.
+    const n = if (ix.ivf) |*v|
+        zq.persist.writePartitioned(v, out[0..len]) catch return ZQ_ERR_INVALID
+    else
+        zq.persist.write(&ix.inner, out[0..len]) catch return ZQ_ERR_INVALID;
     if (written) |w| w.* = n;
     return ZQ_OK;
 }
@@ -319,16 +325,48 @@ export fn zq_index_deserialize(buf: ?[*]const u8, len: usize, out: ?**Index) c_i
     if (zq_cpu_supported() == 0) return ZQ_ERR_CPU;
     const data = buf orelse return ZQ_ERR_INVALID;
     const slot = out orelse return ZQ_ERR_INVALID;
-    const index = allocator.create(Index) catch return ZQ_ERR_ALLOC;
-    index.* = .{ .inner = zq.persist.read(allocator, data[0..len]) catch |e| {
-        allocator.destroy(index);
-        return switch (e) {
-            error.OutOfMemory => ZQ_ERR_ALLOC,
-            else => ZQ_ERR_FORMAT,
-        };
-    } };
+    const bytes = data[0..len];
+    const kind = zq.persist.kind(bytes) catch return ZQ_ERR_FORMAT;
+    var loaded: Index = switch (kind) {
+        .flat => .{ .inner = zq.persist.read(allocator, bytes) catch |e| return formatStatus(e) },
+        .partitioned => loadPartitioned(bytes) catch |e| return formatStatus(e),
+    };
+    const index = allocator.create(Index) catch {
+        loaded.deinit();
+        return ZQ_ERR_ALLOC;
+    };
+    index.* = loaded;
     slot.* = index;
     return ZQ_OK;
+}
+
+fn formatStatus(e: (zq.persist.Error || std.mem.Allocator.Error)) c_int {
+    return switch (e) {
+        error.OutOfMemory => ZQ_ERR_ALLOC,
+        else => ZQ_ERR_FORMAT,
+    };
+}
+
+/// A loaded partitioned index, with the empty flat index that describes its
+/// configuration, as `zq_index_partition` leaves one.
+fn loadPartitioned(bytes: []const u8) (zq.persist.Error || std.mem.Allocator.Error)!Index {
+    var v = try zq.persist.readPartitioned(allocator, bytes);
+    errdefer v.deinit();
+    const p = v.params;
+    const inner = zq.flat.FlatIndex.init(allocator, .{
+        .dim = p.dim,
+        .bits = p.bits,
+        .metric = p.metric,
+        .seed = p.seed,
+        .rotation = p.rotation,
+        .residency = p.residency,
+    }) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        // The partitioned index accepted these settings, and the flat one takes the
+        // same, so this is not expected; refuse the file rather than trust it.
+        else => error.Corrupt,
+    };
+    return .{ .inner = inner, .ivf = v };
 }
 
 export fn zq_index_count(index: ?*const Index) usize {
@@ -612,11 +650,14 @@ export fn zq_score_ids(
     const id_ptr = ids orelse return ZQ_ERR_INVALID;
     const scores = out_scores orelse return ZQ_ERR_INVALID;
     if (s.owner != ix) return ZQ_ERR_INVALID;
-    // A partitioned index has no id-to-slot map yet.
-    if (ix.ivf != null) return ZQ_ERR_UNSUPPORTED;
+    if (ix.ivf != null and s.ivf_batch == null) return ZQ_ERR_STATE;
     if (n == 0) return ZQ_OK;
     const row = q[0..ix.inner.dim()];
     if (!zq.flat.allFinite(row)) return ZQ_ERR_INVALID;
+    if (ix.ivf) |*v| {
+        v.scoreIds(row, id_ptr[0..n], scores[0..n], &s.ivf_batch.?) catch return ZQ_ERR_INVALID;
+        return ZQ_OK;
+    }
     ix.inner.scoreIds(row, id_ptr[0..n], scores[0..n], &s.scorer) catch return ZQ_ERR_INVALID;
     return ZQ_OK;
 }

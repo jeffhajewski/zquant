@@ -16,7 +16,13 @@ in our harness**, rather than quoting published numbers.
 - **d=128 and 256** (SIFT, nytimes). PQ still has the best recall per byte at the lowest
   budgets, below about 25 B on SIFT and 100 B on nytimes. Above them zquant matches or
   passes turbovec and passes PQ and RaBitQ.
-- **Not compared:** graph indexes such as HNSW, FAISS on x86, and turbovec since the
+- **Against HNSW** (FAISS's IndexHNSWFlat, the fastest graph index here), both keeping the
+  original vectors: at 100k vectors zquant is 1.8 to 6.1 times as fast from 0.95 recall up.
+  At a million, below about 0.985 recall, HNSW is 1.1 to 1.6 times as fast, more so one
+  query per call; zquant is faster batched from 0.98 up, and both ways at 0.996, by 1.7 to
+  2.6 times. Without the originals, HNSW over 8-bit codes beats zquant at a million by 4 to
+  7 times, in 2.6 times the memory.
+- **Not compared:** other graph indexes (NSG, DiskANN), FAISS on x86, and turbovec since the
   estimator changed. Everything here ran on one Apple M5.
 
 The rest of this page records how that position was reached, measurement by measurement.
@@ -381,6 +387,107 @@ The partitioned index's recall also beats the flat calibrated index's on every c
 since each vector is stored against a nearby centroid rather than the corpus centre
 ([notes.md](notes.md), "Partitioning, measured through the library").
 
+## Against HNSW
+
+HNSW is what most vector databases run: a graph over the vectors, searched greedily from an
+entry point. It's the usual choice when memory is plentiful and latency matters most, so
+it's the comparison that says whether zquant's partitioned index is worth using for speed
+and not only for size. `bench/py/hnsw.py` runs both through their Python packages: one
+thread, k=10, 1000 queries, builds on 8 threads. The 100k corpora are from one run, the
+million from the next.
+
+There are two timings. One sends all 1000 queries in one call. The other sends one query
+per call, as a service answering users one at a time would. zquant regroups a batch by
+list, so batching helps it. HNSW searches each query on its own either way, so its two
+numbers agree within a few percent. That catches anything that disturbed one timing and
+not the other, though not a slowdown lasting a whole configuration (see below).
+
+HNSW is built with efConstruction=200, at M=16 and M=32, and searched at efSearch 16 to
+512. FAISS's default efConstruction of 40 is well below what it's usually run at. FAISS's
+IndexHNSWFlat is the fastest graph index here. hnswlib's SIMD distance kernels are
+x86-only, so on ARM it runs plain loops and is about three times slower than FAISS at the
+same recall (Cohere 100k, M=32: 0.981 at 1,278 QPS, against FAISS's 0.978 at 3,701). Its
+rows are in `data/hnsw.csv` and not below.
+
+zquant is bits=2, one bit a dimension, on √n lists and on 4√n (FAISS's usual advice for
+IVF), with 40 or 100 candidates reranked against the originals. Once reranked, wider codes
+find no more and scan more slowly: in an earlier run, bits=3 reranked was 1.1 to 2.9 times
+slower at the same recall, the most at a million.
+
+**Both keeping the original vectors.** That's 3,181 to 3,217 B a vector for zquant (codes
+plus float32 originals) and 3,216 to 3,344 B for HNSWFlat at d=768, or 6,374 to 6,456 B
+against 6,288 to 6,416 B at d=1536. Each cell is R10@10 / QPS batched / QPS one per call.
+HNSW is shown at whichever of M=16 and M=32 is fastest near that recall.
+
+| corpus | zquant: lists, reranked, probes | zquant | HNSW: M, efSearch | FAISS HNSWFlat | zquant's speed |
+|---|---|---|---|---|---|
+| Cohere 100k × 768 | 316, 40, 19 | 0.949 / 13,827 / 11,215 | 32, 32 | 0.947 / 6,574 / 6,315 | 2.1× / 1.8× |
+| | 316, 40, 39 | 0.977 / 9,857 / 7,986 | 32, 64 | 0.978 / 3,701 / 3,687 | 2.7× / 2.2× |
+| | 316, 40, 79 | 0.990 / 6,916 / 5,200 | 32, 128 | 0.992 / 2,113 / 2,084 | 3.3× / 2.5× |
+| | 316, 100, 79 | 0.996 / 5,689 / 4,392 | 32, 256 | 0.996 / 1,148 / 1,130 | 5.0× / 3.9× |
+| | 316, 100, 158 | 0.999 / 3,828 / 2,643 | 32, 512 | 0.998 / 625 / 602 | 6.1× / 4.4× |
+| OpenAI 50k × 1536 | 224, 40, 28 | 0.968 / 9,969 / 7,986 | 32, 32 | 0.972 / 4,013 / 3,883 | 2.5× / 2.1× |
+| | 224, 40, 56 | 0.989 / 7,390 / 5,822 | 32, 64 | 0.992 / 2,252 / 2,297 | 3.3× / 2.5× |
+| | 224, 40, 112 | 0.998 / 4,921 / 3,703 | 16, 128 | 0.997 / 1,778 / 1,783 | 2.8× / 2.1× |
+| Cohere 1M × 768 | 1000, 40, 31 | 0.937 / 4,450 / 3,691 | 32, 32 | 0.936 / 5,561 / 5,533 | 0.80× / 0.67× |
+| | 4000, 40, 62 | 0.942 / 3,881 / 2,759 | 16, 64 | 0.942 / 4,361 / 4,323 | 0.89× / 0.64× |
+| | 4000, 40, 125 | 0.970 / 2,780 / 2,063 | 32, 64 | 0.969 / 3,185 / 3,143 | 0.87× / 0.66× |
+| | 4000, 40, 250 | 0.984 / 1,927 / 1,319 | 32, 128 | 0.983 / 1,697 / 1,670 | 1.14× / 0.79× |
+| | 4000, 40, 500 | 0.992 / 1,282 / 815 | 32, 256 | 0.991 / 897 / 892 | 1.43× / 0.91× |
+| | 4000, 100, 500 | 0.996 / 1,218 / 768 | 32, 512 | 0.996 / 462 / 458 | 2.64× / 1.68× |
+
+At 100k, zquant is 1.8 to 6.1 times as fast, and 4√n lists doesn't help. At a million the
+picture changes. Below about 0.985 recall, HNSW is 1.1 to 1.25 times as fast batched and
+1.3 to 1.6 times one query per call. zquant is faster batched from 0.98 up, level one per
+call around 0.99, and faster both ways at 0.996. There, 4√n lists is 1.1 to 1.25 times as
+fast as √n batched from 0.97 up, but gains little one per call, for the reason at the end
+of this section.
+
+The difference is how each scales. From 100k to a million, at about 0.99 recall, zquant's
+time per query grew 5.4 times: it read five times as many codes for ten times the corpus.
+HNSW's grew 2.4 times. Larger corpora will favour HNSW further.
+
+These rows are from one run. In it, FAISS's M=16 graph at a million was slower than in an
+earlier run with the same HNSW settings: its build took 366 s against 256 s, and its
+searches 16 to 34% longer, with other work on the machine. M=32 was 6 to 12% faster. With
+the earlier M=16 figures (5,055 / 5,236 QPS at 0.942), HNSW's lead at 0.942 is 1.3 times
+batched and 1.9 one per call. On every other row, the fastest FAISS figure is this run's.
+
+**Compressed only.** Without the originals, zquant at bits=5 against FAISS's HNSW over 8-bit
+scalar codes (HNSWSQ8, M=32), at the nearest recall:
+
+| corpus | zquant bits=5 | bytes | R10@10 / batched / one per call | HNSWSQ8 | bytes | R10@10 / batched / one per call |
+|---|---|---|---|---|---|---|
+| Cohere 100k | probes 79 | 404 | 0.964 / 4,523 / 2,419 | ef 64 | 1,040 | 0.969 / 4,045 / 3,652 |
+| OpenAI 50k | probes 56 | 806 | 0.966 / 5,110 / 2,986 | ef 32 | 1,809 | 0.963 / 4,074 / 4,006 |
+| Cohere 1M | probes 125 | 397 | 0.960 / 875 / 494 | ef 64 | 1,040 | 0.960 / 3,387 / 3,417 |
+
+At 100k, zquant alone is 1.1 to 1.25 times as fast batched, in 39 to 45% of the memory,
+and HNSWSQ8 is 1.3 to 1.5 times as fast one query per call. At a million, HNSWSQ8 is 3.9
+times as fast batched and 6.9 times one per call. It also goes further: up to 0.986 to
+0.988 recall, where zquant alone stops at 0.967 to 0.972.
+
+**Builds**, 8 threads, seconds:
+
+| | Cohere 100k | OpenAI 50k | Cohere 1M |
+|---|---|---|---|
+| zquant bits=2, √n lists | 1.1 | 1.1 | 9.1 |
+| zquant bits=2, 4√n lists | 2.3 | 1.8 | 61.6 |
+| FAISS HNSWFlat, M=16 | 18.4 | 17.9 | 365.8 (256.3 in the earlier run) |
+| FAISS HNSWFlat, M=32 | 25.8 | 22.9 | 414.1 |
+| FAISS HNSWSQ8, M=32 | 13.4 | 13.5 | 192.0 |
+| hnswlib, M=16 / M=32 | 33.9 / 39.5 | 30.4 / 40.6 | 416.7 / 590.6 |
+
+With 4000 lists, k-means runs on the whole corpus (256 rows a list is more than a
+million), which is where the minute goes.
+
+**Where zquant's time goes at a million.** Searching one list, one query per call, takes
+193 µs a query with 4000 lists and 63 µs with 1000. Most of that is ranking the centroids,
+which search still does exhaustively in f32. At the 0.970 setting it's about a third of
+the 485 µs a query takes; batched, 126 µs of 360. The int8 pre-pass that now ranks lists
+during k-means would cut it ([notes.md](notes.md), "Faster partitioning"), if ties at the
+probe cut can be made to break the same way as now.
+
 ## The scalar correction
 
 MSE-optimal reconstruction shrinks ỹ, so ⟨p, ỹ⟩ underestimates ⟨p, y⟩. The paper corrects
@@ -571,9 +678,13 @@ tools/fetch_datasets.sh highdim    # cohere-768, openai-1536 (VectorDBBench parq
 python bench/py/prepare.py cohere-768    # then openai-1536
 python bench/py/highdim.py cohere-768-norm openai-1536-norm   # zquant vs PQ, RaBitQ, sign BQ
 python bench/py/ivf_lab.py cohere-768-norm --curve 1024 --faiss  # estimator and IVF variants
+python bench/py/partition.py cohere-768-norm openai-1536-norm      # IVF against IVF-RaBitQ
+tools/fetch_datasets.sh 1m && python bench/py/prepare.py cohere-768-1m
+python bench/py/hnsw.py cohere-768-norm openai-1536-norm cohere-768-1m-norm  # against HNSW
 zig build diagnose                 # rotation moments, D_mse, estimator RMS
 python bench/py/synth.py spectrum --alpha 1.0   # synthetic corpus with one property varied
 ```
 
 Requires `numpy`, `faiss-cpu`, `turbovec` in a virtualenv, plus `pyarrow` for the
-parquet corpora and the zquant Python client (`PYTHONPATH=clients/python`) for the last two.
+parquet corpora, `hnswlib` for `hnsw.py`, and the zquant Python client
+(`PYTHONPATH=clients/python`) for `highdim.py`, `ivf_lab.py`, `partition.py` and `hnsw.py`.

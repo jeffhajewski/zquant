@@ -130,6 +130,27 @@ times as fast. At the fewest lists the two are level: 3% faster here, 2% slower 
 zquant regroups each batch of queries by list, so a list is read once for all the queries
 that want it.
 
+**Against HNSW**, the graph index most vector databases are built on, on the million
+Cohere embeddings. Both keep the original vectors, about 3.2 KB each: zquant to rerank,
+HNSW to score. FAISS's HNSW is the fastest graph index on this machine, so it's the one
+shown, taking the better of M=16 and M=32 at each recall. Queries per second with all 1000
+in one call, then one query per call:
+
+| recall@10 | zquant, bits=2, 4000 lists, reranked | FAISS HNSW |
+|---|---|---|
+| 0.942 | 3,881 / 2,759 | **4,361 / 4,323** |
+| 0.970 | 2,780 / 2,063 | **3,185 / 3,143** |
+| 0.984 | **1,927** / 1,319 | 1,697 / **1,670** |
+| 0.992 | **1,282** / 815 | 897 / **892** |
+| 0.996 | **1,218 / 768** | 462 / 458 |
+
+zquant reranks 40 candidates, 100 on the last row, and HNSW's recall is within 0.001 of
+zquant's on every row. The closer the top ten has to be to exact, the better zquant does:
+at 0.996 it's 2.6 times as fast batched and 1.7 times one query at a time. On 100k vectors
+it's 1.8 to 6 times as fast at every recall from 0.95 up, batched or not. A graph's cost grows more slowly with the corpus than a partitioned scan's,
+though, so at a million HNSW has caught up below about 0.985. zquant builds this index in
+a minute, or 9 seconds with 1000 lists; HNSW took 4 to 7 minutes on the same 8 threads.
+
 ### Where it falls short
 
 - **Against PQ's fast-scan index at one and two bits.** It's 2 to 31% faster than zquant
@@ -137,9 +158,13 @@ that want it.
   like FAISS's; what's left is the work per candidate after the scan.
 - **Small dimensions at tiny budgets.** At d=128 and d=256, below about 25 B per vector on
   SIFT and 100 B on nytimes, FAISS's product quantization finds more.
-- **No graph index.** zquant scans codes, in full or by list. It hasn't been compared with
-  HNSW or other graph indexes, which are the usual choice when memory is plentiful and
-  latency matters most.
+- **Against HNSW on large corpora, short of near-exact recall.** At a million vectors,
+  below about 0.985 recall, FAISS's HNSW is 1.3 to 1.6 times as fast one query at a time,
+  and 1.1 times as fast batched below 0.97. The gap moves HNSW's way as the corpus grows.
+  Over 8-bit codes, at 1,040 B a vector, it's 4 to 7 times as fast as zquant without
+  reranking at 0.96 recall, and it reaches 0.988, where zquant alone stops at 0.969. With
+  4000 lists, about a third of zquant's time per query goes to ranking the lists, which it
+  still does exhaustively.
 - **One machine.** Nearly everything was measured on an Apple M5. FAISS's fast-scan
   kernels were written for x86 and may do better there. The only x86 numbers are from a
   GitHub runner (AMD Zen 3), where the AVX2 kernels run 1.75 times as fast as the SSSE3

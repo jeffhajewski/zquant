@@ -2673,3 +2673,56 @@ pre-pass would cut it too, but a query wants its best `probes` lists rather than
 at the cut then decide which lists are searched, and the current heap breaks them by its
 own internal order, so matching it exactly needs care. That step is a large part of the
 work at the fewest probes, where FAISS is level with zquant or slightly ahead.
+
+## Against HNSW: ahead at 100k, behind at a million short of near-exact recall
+
+The README listed "no graph index" as a gap, never measured. `bench/py/hnsw.py` now puts
+zquant's partitioned index beside hnswlib and FAISS's HNSW on Cohere 100k, OpenAI 50k and
+Cohere 1M, through both Python packages, one thread. Full tables are in
+[comparison.md](comparison.md), "Against HNSW". What changed the answer along the way is
+worth keeping.
+
+**Batched against one at a time.** The first run timed all 1000 queries in one call.
+zquant regroups a batch by list and reads each list once for every query that wants it, so
+batching favours it. HNSW gains nothing from batching on one thread. Timing one query per
+call as well turned "zquant is 1.5 to 3.3 times as fast" at 100k into "0.8 to 2 times",
+mostly level, for that configuration (bits=3, reranked, √n lists). Both numbers are now in
+every row. HNSW's two agree within a few percent, which catches anything that disturbed one
+timing and not the other, but not a slowdown lasting a whole configuration (see "Noise").
+
+**The million reverses it.** On the same configuration at a million, FAISS's HNSW was 1.5 to
+3.6 times as fast at matched recall below 0.99. zquant only drew level, batched, at 0.997.
+That's the scaling you'd expect. With √n lists, the partitioned scan reads about the same
+share of the corpus for the same recall, so its work grows almost linearly. A graph
+search's grows more like the log of the corpus.
+
+**Then tuning zquant like a competitor.** Two changes, both ones a user would make:
+
+- bits=2 instead of 3. The README already said that once you rerank, the cheapest width
+  finds as much. One bit a dimension also scans with the table-lookup kernel, so it's 1.1
+  to 2.9 times as fast at the same recall, the most at a million.
+- 4√n lists instead of √n at a million, as FAISS advises for IVF. That's 1.1 to 1.25 times
+  as fast batched from 0.97 recall up. It barely helps one query per call, for the reason
+  below. At 100k it doesn't help at all.
+
+With both, at a million: below about 0.985 recall HNSW is 1.1 to 1.25 times as fast batched
+and 1.3 to 1.6 times one per call. The two are level one per call around 0.99. zquant is 1.7
+to 2.6 times as fast at 0.996. At 100k, zquant is 1.8 to 6.1 times as fast from 0.95 up.
+
+**Ranking the lists is now a third of a query.** With 4000 lists, searching a single list
+takes 193 µs a query one per call, against 63 µs with 1000 lists. The difference is the
+coarse step: each query against 4000 centroids, exhaustively, in f32. At the setting that
+gives 0.970 recall, that's about a third of the 485 µs a query takes. The int8 pre-pass
+cuts the same step 4.5 times in k-means. Using it in search needs the `probes` best lists
+rather than one, with ties at the cut broken as the heap breaks them now ("Not done:
+search" above). That's the clearest lead for closing the one-per-call gap at a million.
+
+**Noise.** Other work shared the machine for part of the final million-vector run. FAISS's
+M=16 graph took 366 s to build against 256 s in the run before, and searched 16 to 34%
+slower. M=32 was 6 to 12% faster. The tables use the final run throughout and give the
+earlier M=16 figure where it would have been FAISS's best (0.942 recall, where HNSW's lead
+becomes 1.3 times batched and 1.9 one per call).
+
+**Not measured:** other graph indexes (NSG, DiskANN/Vamana), multi-threaded search, and
+anything past a million vectors, where the trend says HNSW's lead below near-exact recall
+widens.

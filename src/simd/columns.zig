@@ -87,17 +87,18 @@ pub fn buildLut(rotated: []const f32, lut: []u8) LutTerms {
         const p = groupOf(rotated, g);
         // Entry m sums |p_t| over the t whose bit in m agrees with p_t's sign, in t
         // order, so every platform and every lane width adds the same values the same
-        // way.
+        // way. Each t adds |p_t| times 1 or 0, which is |p_t| or 0 exactly. Not a
+        // `@select` on compared bool vectors: on AVX-512 those live in mask registers,
+        // and that build got the entries wrong.
         var e: F = @splat(0);
         inline for (0..4) |t| {
-            const bit: @Vector(16, bool) = comptime blk: {
-                var b: [16]bool = undefined;
-                for (0..16) |m| b[m] = (m >> t) & 1 == 1;
+            const set: F = comptime blk: {
+                var b: [16]f32 = undefined;
+                for (0..16) |m| b[m] = @floatFromInt((m >> t) & 1);
                 break :blk b;
             };
-            const positive: @Vector(16, bool) = @splat(p[t] > 0);
-            const agree = bit == positive;
-            e += @select(f32, agree, @as(F, @splat(@abs(p[t]))), @as(F, @splat(0)));
+            const agree = if (p[t] > 0) set else @as(F, @splat(1)) - set;
+            e += @as(F, @splat(@abs(p[t]))) * agree;
         }
         const q = @floor(e * @as(F, @splat(inverse)) + @as(F, @splat(0.5)));
         const clamped = @min(q, @as(F, @splat(255)));

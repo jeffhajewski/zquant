@@ -2599,3 +2599,77 @@ being rounded differently.
 
 Two bits could go the same way, two dimensions to a nibble, but a lookup then covers half
 as much and the batch gain shrinks to perhaps 1.15× (one query, perhaps 1.9×). Not done.
+
+## Faster partitioning: an int8 pre-pass that can't change the answer
+
+Building the README's million-vector index took 25 s on 8 threads: 16.7 to partition, 8.6
+to add. Sampling the process put nine tenths of it in one function, the f32 dot products
+of each row with all 1000 centroids, which k-means takes ten times over 256k rows and
+adding takes once per vector.
+
+**Why not just a faster f32 kernel.** Those dot products multiply and add separately,
+not fused, so every platform gets the same bits; that's two instructions per four lanes.
+On these 8 cores that ceiling was only 1.4 times what the kernel already ran at. A
+register-blocked product, the plan in the partitioning section above, couldn't do much.
+
+**What instead.** Take every dot product in int8 first, with rows and centroids each
+scaled to ±127, which `sdot` does sixteen at a time. The rounding is measurable, and it
+bounds the error exactly: ⟨y, c⟩ − ⟨ỹ, c̃⟩ = ⟨y − ỹ, c⟩ + ⟨ỹ, c − c̃⟩, so
+
+    |⟨y, c⟩ − ⟨ỹ, c̃⟩|  ≤  ‖y − ỹ‖·‖c‖ + ‖ỹ‖·‖c − c̃‖
+
+with a margin on top for f32's own rounding on both sides. Every list's key is then known
+to within a range. A list whose range tops out below the best list's bottom can be neither
+nearest nor tied for it. The rest are scored exactly, by the same `dotExact` as before,
+and the largest key wins, ties to the lower list. That is the exhaustive answer, bit for
+bit (`src/index/coarse.zig`). The tests compare the two paths directly, on exact ties and
+near ties as well, and check that k-means gives the same centroids either way.
+
+How many lists are left to score exactly depends on how tight the bound is. Simulated on
+Cohere first, before writing any Zig, it was 12 to 24 of 1000 depending on the k-means
+iteration, with a p99 under 100. The true nearest list was always among them. On the real
+training rows it's 13.1 a row (`bench/coarse_bench.zig`, one thread, Cohere 1M):
+
+| | rows a second |
+|---|---|
+| exhaustive f32 | 35–39k |
+| int8 pre-pass + exact recheck | 151k, then 165–177k with the bound taken 8 lists at a time |
+| of which the int8 pass alone | 209–222k |
+
+The int8 pass, now four fifths of the time, runs about 2.3 `sdot`s a cycle where the core
+can issue 4. Tile shapes from 2×8 to 4×4 and L1 blocks from 16 to 64 KB all measured within
+run-to-run noise.
+
+**The threads were waiting on each other.** Eight threads assigned 640k rows a second, 80k
+each, where one thread alone did 165k. Rows were split evenly ahead of time, and four of
+the eight threads land on the M5's efficiency cores, so the other four finished early and
+waited. Work is now handed out 64 rows at a time from a shared counter (`src/index/pool.zig`).
+Two serial steps also went parallel. Encoding the training rows (1.5 s) now runs in
+batches, keeping the serial loop's rows and order, zero rows skipped, which a test checks
+against that loop. The centroid update (0.7 s) is split by columns, so each sum still adds
+its rows in row order. The add path uses the same pool.
+
+**Result**, Cohere 1M, 1000 lists, 8 threads, through the Python client, old and new in the
+same run:
+
+| | before | after |
+|---|---|---|
+| partition | 16.7–16.9 s | 3.7–4.0 s |
+| add | 8.6–8.7 s | 3.8–4.0 s |
+
+The lists, codes and search results are unchanged. Adding is now mostly encoding the
+vectors, which this didn't touch.
+
+**Only where `sdot` exists.** x86 has `pmaddubsw`, four instructions to `sdot`'s one.
+Under Rosetta at x86_64_v2 the pre-pass ran at half the exhaustive speed, 15k rows a
+second against 30k. Rosetta translates SSE's f32 multiply and add one for one but
+`pmaddubsw` and `psignb` into several instructions, so that says little about x86 itself.
+Counting instructions suggests about twice the exhaustive speed there, but nothing here
+can measure it. So x86, like aarch64 without dot-product instructions, keeps the
+exhaustive path, which gives the same lists. The tests run the pre-pass on every platform.
+
+**Not done: search.** A query's coarse step ranks lists the same exhaustive way. The
+pre-pass would cut it too, but a query wants its best `probes` lists rather than one. Ties
+at the cut then decide which lists are searched, and the current heap breaks them by its
+own internal order, so matching it exactly needs care. That step is a large part of the
+work at the fewest probes, where FAISS is level with zquant or slightly ahead.

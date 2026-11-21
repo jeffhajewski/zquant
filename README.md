@@ -56,8 +56,8 @@ index.add(vectors, threads=8)
 ids, scores = index.search_rerank(queries, vectors, k=10, candidates=40, probes=62)
 ```
 
-Building the partitioned index took 24 seconds on 8 threads (16 for k-means, 8 to encode
-the vectors). A flat index takes 1.5 seconds.
+Building the partitioned index took under 8 seconds on 8 threads (4 for k-means, 4 to
+encode the vectors). A flat index takes 1.5 seconds.
 
 ## Why it works
 

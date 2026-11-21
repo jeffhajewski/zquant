@@ -38,6 +38,10 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const coarse_mod = @import("coarse.zig");
+const pool = @import("pool.zig");
+const dotExact = coarse_mod.dotExact;
+const centroidDots = coarse_mod.centroidDots;
 
 const flat = @import("flat.zig");
 const prod_mod = @import("../quant/prod.zig");
@@ -267,19 +271,73 @@ pub const IvfIndex = struct {
         const cap = @min(rows_in, max_train_per_list * k);
         const data = try a.alloc(f32, cap * p);
         defer a.free(data);
-        var ws = try prod_mod.Workspace.init(a, self.quantizer);
-        defer ws.deinit();
-        var rows: usize = 0;
-        for (order) |r| {
-            if (rows == cap) break;
-            const row = sample[@as(usize, r) * d ..][0..d];
-            if (self.quantizer.mse.encodeRotated(row, data[rows * p ..][0..p], ws.staging) == 0) continue;
-            rows += 1;
-        }
+        const rows = try self.trainingRows(sample, order, data, threads);
         if (rows < k) return error.EmptySample;
 
         try kmeans(a, data[0 .. rows * p], p, k, threads, self.centroids);
         self.useCentroids();
+    }
+
+    /// Rotate the rows of `sample` in `order` into `data` until it's full or `order` runs
+    /// out, skipping rows of zero, which have no direction. Returns the rows written:
+    /// the same rows in the same order whatever `threads` is.
+    fn trainingRows(self: *const IvfIndex, sample: []const f32, order: []const u32, data: []f32, threads: usize) !usize {
+        const a = self.allocator;
+        const p = self.padded();
+        const cap = data.len / p;
+        const chunk = 256;
+        const spread = @max(1, @min(threads, cap / 1024));
+        const workspaces = try a.alloc(prod_mod.Workspace, pool.workers(spread, cap, chunk));
+        defer a.free(workspaces);
+        var made: usize = 0;
+        defer for (workspaces[0..made]) |*ws| ws.deinit();
+        while (made < workspaces.len) : (made += 1) workspaces[made] = try prod_mod.Workspace.init(a, self.quantizer);
+        const kept = try a.alloc(bool, cap);
+        defer a.free(kept);
+
+        const Batch = struct {
+            index: *const IvfIndex,
+            sample: []const f32,
+            candidates: []const u32,
+            out: []f32,
+            kept: []bool,
+            workspaces: []prod_mod.Workspace,
+
+            fn run(b: @This(), worker: usize, start: usize, len: usize) void {
+                const d_ = b.index.dim();
+                const p_ = b.index.padded();
+                for (start..start + len) |i| {
+                    const row = b.sample[@as(usize, b.candidates[i]) * d_ ..][0..d_];
+                    const norm = b.index.quantizer.mse.encodeRotated(row, b.out[i * p_ ..][0..p_], b.workspaces[worker].staging);
+                    b.kept[i] = norm != 0;
+                }
+            }
+        };
+        // A batch of candidates at a time, encoded in parallel into the free rows, then
+        // the zero rows squeezed out.
+        var rows: usize = 0;
+        var taken: usize = 0;
+        while (rows < cap and taken < order.len) {
+            const batch = @min(cap - rows, order.len - taken);
+            const work: Batch = .{
+                .index = self,
+                .sample = sample,
+                .candidates = order[taken..][0..batch],
+                .out = data[rows * p ..][0 .. batch * p],
+                .kept = kept[0..batch],
+                .workspaces = workspaces,
+            };
+            pool.forChunks(spread, batch, chunk, work, Batch.run);
+            var to = rows;
+            for (0..batch) |i| {
+                if (!kept[i]) continue;
+                if (to != rows + i) @memcpy(data[to * p ..][0..p], data[(rows + i) * p ..][0..p]);
+                to += 1;
+            }
+            rows = to;
+            taken += batch;
+        }
+        return rows;
     }
 
     /// Take `centroids` as written, by training or by a loader, and mark the index
@@ -326,12 +384,15 @@ pub const IvfIndex = struct {
             .codes = try a.alloc(u8, chunk * stride),
         };
         defer staged.free(a);
+        var near = try coarse_mod.Nearest.init(a, self.lists.len, self.padded());
+        defer near.deinit(a);
+        near.load(self.centroids);
         const workers = @max(1, @min(threads, chunk / min_rows_per_thread));
         const encoders = try a.alloc(Encoder, workers);
         defer a.free(encoders);
         var made: usize = 0;
         defer for (encoders[0..made]) |*e| e.deinit(a);
-        while (made < workers) : (made += 1) encoders[made] = try Encoder.init(a, self);
+        while (made < workers) : (made += 1) encoders[made] = try Encoder.init(a, self, &near);
 
         // Assign every vector first and reserve for all of them, so that once appending
         // starts nothing can fail. Encoding then runs a chunk at a time, since staging a
@@ -400,77 +461,55 @@ pub const IvfIndex = struct {
     /// against the list already chosen there.
     const Mode = enum { assign, encode };
 
-    /// Assign or encode every row of `vectors` into `out`, spread over `encoders.len`
-    /// threads. Each row lands in its own slot.
+    /// Assign or encode every row of `vectors` into `out`, on up to `encoders.len`
+    /// threads taking a block of rows at a time. Each row lands in its own slot.
     fn runEncode(self: *const IvfIndex, vectors: []const f32, out: Staging, encoders: []Encoder, mode: Mode) void {
         const d = self.dim();
         const n = vectors.len / d;
-        const stride = self.codeStride();
-        const workers = @max(1, @min(encoders.len, n / min_rows_per_thread));
-
         const Work = struct {
             index: *const IvfIndex,
             vectors: []const f32,
             out: Staging,
-            enc: *Encoder,
+            encoders: []Encoder,
             mode: Mode,
 
-            fn run(w: @This()) void {
-                w.index.encodeRows(w.vectors, w.out, w.enc, w.mode);
+            fn run(w: @This(), worker: usize, start: usize, len: usize) void {
+                const d_ = w.index.dim();
+                const rows = w.vectors[start * d_ ..][0 .. len * d_];
+                w.index.encodeRows(rows, w.out.slice(start, len, w.index.codeStride()), &w.encoders[worker], w.mode);
             }
         };
-        var handles: [64]?std.Thread = @splat(null);
-        const spawnable = @min(workers, handles.len);
-        const base = n / spawnable;
-        const rem = n % spawnable;
-        var start: usize = 0;
-        var own: Work = undefined;
-        for (0..spawnable) |w| {
-            const take = base + @intFromBool(w < rem);
-            const work: Work = .{
-                .index = self,
-                .vectors = vectors[start * d ..][0 .. take * d],
-                .out = out.slice(start, take, stride),
-                .enc = &encoders[w],
-                .mode = mode,
-            };
-            start += take;
-            if (w == 0) {
-                own = work;
-                continue;
-            }
-            handles[w] = std.Thread.spawn(.{}, Work.run, .{work}) catch blk: {
-                work.run();
-                break :blk null;
-            };
-        }
-        own.run();
-        for (handles[0..spawnable]) |h| if (h) |t| t.join();
+        const spread = @max(1, @min(encoders.len, n / min_rows_per_thread));
+        const work: Work = .{ .index = self, .vectors = vectors, .out = out, .encoders = encoders, .mode = mode };
+        pool.forChunks(spread, n, Encoder.block, work, Work.run);
     }
 
     /// Per-thread encoding scratch.
     const Encoder = struct {
         ws: prod_mod.Workspace,
         codes: []u8,
-        /// Up to `block` rotated directions, and their dot products with every centroid.
+        /// Up to `block` rotated directions.
         rotated: []f32,
-        dots: []f32,
+        near: *const coarse_mod.Nearest,
+        scratch: coarse_mod.Nearest.Scratch,
 
-        const block = 4;
+        /// Rows assigned together: enough that each block of centroids the int8 pass
+        /// holds in L1 serves many rows.
+        const block = coarse_mod.max_rows;
 
-        fn init(a: Allocator, index: *const IvfIndex) !Encoder {
+        fn init(a: Allocator, index: *const IvfIndex, near: *const coarse_mod.Nearest) !Encoder {
             var ws = try prod_mod.Workspace.init(a, index.quantizer);
             errdefer ws.deinit();
             const codes = try a.alloc(u8, index.padded());
             errdefer a.free(codes);
             const rotated = try a.alloc(f32, block * index.padded());
             errdefer a.free(rotated);
-            const dots = try a.alloc(f32, block * index.lists.len);
-            return .{ .ws = ws, .codes = codes, .rotated = rotated, .dots = dots };
+            const scratch = try coarse_mod.Nearest.Scratch.init(a, near);
+            return .{ .ws = ws, .codes = codes, .rotated = rotated, .near = near, .scratch = scratch };
         }
 
         fn deinit(self: *Encoder, a: Allocator) void {
-            a.free(self.dots);
+            self.scratch.deinit(a);
             a.free(self.rotated);
             a.free(self.codes);
             self.ws.deinit();
@@ -480,7 +519,6 @@ pub const IvfIndex = struct {
     fn encodeRows(self: *const IvfIndex, vectors: []const f32, out: Staging, enc: *Encoder, mode: Mode) void {
         const d = self.dim();
         const p = self.padded();
-        const k = self.lists.len;
         const stride = self.codeStride();
         const n = vectors.len / d;
         var norms: [Encoder.block]f32 = undefined;
@@ -492,8 +530,7 @@ pub const IvfIndex = struct {
                 norms[u] = self.quantizer.mse.encodeRotated(row, enc.rotated[u * p ..][0..p], enc.ws.staging);
             }
             if (mode == .assign) {
-                centroidDots(enc.rotated[0 .. take * p], p, self.centroids, k, enc.dots);
-                for (0..take) |u| out.lists[r0 + u] = @intCast(nearest(enc.dots[u * k ..][0..k], self.centroid_sq));
+                enc.near.assign(enc.rotated[0 .. take * p], self.centroids, self.centroid_sq, &enc.scratch, out.lists[r0..][0..take]);
                 continue;
             }
             for (0..take) |u| {
@@ -1146,81 +1183,6 @@ pub const IvfIndex = struct {
 
 // -- k-means and centroid ranking ----------------------------------------------------
 
-const V = @Vector(16, f32);
-
-/// ⟨a, b⟩ with a fixed summation order, so the same pair gives the same bits whichever
-/// caller computes it and however its rows were blocked.
-fn dotExact(a: []const f32, b: []const f32) f32 {
-    var acc: V = @splat(0);
-    var j: usize = 0;
-    while (j + 16 <= a.len) : (j += 16) {
-        const x: V = a[j..][0..16].*;
-        const y: V = b[j..][0..16].*;
-        acc += x * y;
-    }
-    return finish(acc, a[j..], b[j..]);
-}
-
-inline fn finish(acc: V, a_tail: []const f32, b_tail: []const f32) f32 {
-    const lanes: [16]f32 = acc;
-    var s: f32 = 0;
-    for (lanes) |x| s += x;
-    for (a_tail, b_tail) |x, y| s += x * y;
-    return s;
-}
-
-/// `out[r * k + l] = ⟨rows[r], centroids[l]⟩` for every row of `rows` (row-major, `p`
-/// wide) and each of `k` centroids. Rows go four at a time so each centroid load serves
-/// four dot products; every result is bit-identical to `dotExact`.
-fn centroidDots(rows: []const f32, p: usize, centroids: []const f32, k: usize, out: []f32) void {
-    const n = rows.len / p;
-    var r: usize = 0;
-    while (r + 4 <= n) : (r += 4) {
-        const a0 = rows[r * p ..][0..p];
-        const a1 = rows[(r + 1) * p ..][0..p];
-        const a2 = rows[(r + 2) * p ..][0..p];
-        const a3 = rows[(r + 3) * p ..][0..p];
-        for (0..k) |l| {
-            const c = centroids[l * p ..][0..p];
-            var s0: V = @splat(0);
-            var s1: V = @splat(0);
-            var s2: V = @splat(0);
-            var s3: V = @splat(0);
-            var j: usize = 0;
-            while (j + 16 <= p) : (j += 16) {
-                const cv: V = c[j..][0..16].*;
-                s0 += @as(V, a0[j..][0..16].*) * cv;
-                s1 += @as(V, a1[j..][0..16].*) * cv;
-                s2 += @as(V, a2[j..][0..16].*) * cv;
-                s3 += @as(V, a3[j..][0..16].*) * cv;
-            }
-            out[r * k + l] = finish(s0, a0[j..], c[j..]);
-            out[(r + 1) * k + l] = finish(s1, a1[j..], c[j..]);
-            out[(r + 2) * k + l] = finish(s2, a2[j..], c[j..]);
-            out[(r + 3) * k + l] = finish(s3, a3[j..], c[j..]);
-        }
-    }
-    while (r < n) : (r += 1) {
-        const a = rows[r * p ..][0..p];
-        for (0..k) |l| out[r * k + l] = dotExact(a, centroids[l * p ..][0..p]);
-    }
-}
-
-/// The list nearest a unit direction y, given ⟨y, c_l⟩ for every list: the largest
-/// ⟨y, c⟩ − ‖c‖²/2, which is the smallest ‖y − c‖². Ties go to the lower list.
-fn nearest(dots: []const f32, centroid_sq: []const f32) usize {
-    var best: usize = 0;
-    var best_key = -std.math.inf(f32);
-    for (dots, centroid_sq, 0..) |dt, sq, l| {
-        const key = dt - 0.5 * sq;
-        if (key > best_key) {
-            best_key = key;
-            best = l;
-        }
-    }
-    return best;
-}
-
 /// The `out.len` lists nearest a query's direction, given ⟨p, c_l⟩ for every list and
 /// ‖p‖, in no particular order. `keys` is scratch of the same length.
 fn nearestLists(dots: []const f32, norm: f32, centroid_sq: []const f32, keys: []f32, out: []u32) void {
@@ -1271,6 +1233,12 @@ fn nearestLists(dots: []const f32, norm: f32, centroid_sq: []const f32, keys: []
 /// next assignment splits the members between them. The result is the same whatever
 /// `threads` is, since rows are assigned independently and summed in row order.
 fn kmeans(a: Allocator, data: []const f32, p: usize, k: usize, threads: usize, centroids: []f32) !void {
+    return kmeansWith(a, data, p, k, threads, centroids, !coarse_mod.bounded);
+}
+
+/// `kmeans`, with the assignment's path chosen: exhaustive, or by `coarse_mod.Nearest`'s
+/// int8 pre-pass. Both give the same centroids, bit for bit.
+fn kmeansWith(a: Allocator, data: []const f32, p: usize, k: usize, threads: usize, centroids: []f32, exhaustive: bool) !void {
     const rows = data.len / p;
     std.debug.assert(rows >= k);
     @memcpy(centroids, data[0 .. k * p]);
@@ -1284,76 +1252,71 @@ fn kmeans(a: Allocator, data: []const f32, p: usize, k: usize, threads: usize, c
     const sq = try a.alloc(f32, k);
     defer a.free(sq);
 
-    const workers = @max(1, @min(threads, rows / 1024, 64));
-    const dots = try a.alloc(f32, workers * 4 * k);
-    defer a.free(dots);
+    // Below about 1024 rows a thread, spawning costs more than it saves.
+    const spread = @max(1, @min(threads, rows / 1024));
+    const workers = pool.workers(spread, rows, coarse_mod.max_rows);
+    var near = try coarse_mod.Nearest.init(a, k, p);
+    defer near.deinit(a);
+    near.exhaustive = near.exhaustive or exhaustive;
+    const scratch = try a.alloc(coarse_mod.Nearest.Scratch, workers);
+    defer a.free(scratch);
+    var made: usize = 0;
+    defer for (scratch[0..made]) |*s| s.deinit(a);
+    while (made < workers) : (made += 1) scratch[made] = try coarse_mod.Nearest.Scratch.init(a, &near);
 
-    const Assign = struct {
+    const Step = struct {
         data: []const f32,
         p: usize,
-        k: usize,
-        centroids: []const f32,
+        near: *const coarse_mod.Nearest,
+        centroids: []f32,
         sq: []const f32,
-        first: usize,
-        last: usize,
         assign: []u32,
-        dots: []f32,
+        scratch: []coarse_mod.Nearest.Scratch,
+        sums: []f64,
+        sizes: []const usize,
 
-        fn run(w: @This()) void {
-            var r = w.first;
-            while (r < w.last) : (r += 4) {
-                const take = @min(4, w.last - r);
-                centroidDots(w.data[r * w.p ..][0 .. take * w.p], w.p, w.centroids, w.k, w.dots[0 .. take * w.k]);
-                for (0..take) |u| w.assign[r + u] = @intCast(nearest(w.dots[u * w.k ..][0..w.k], w.sq));
+        /// Rows `start..start + len` to their nearest lists.
+        fn nearestRows(w: @This(), worker: usize, start: usize, len: usize) void {
+            const rows_ = w.data[start * w.p ..][0 .. len * w.p];
+            w.near.assign(rows_, w.centroids, w.sq, &w.scratch[worker], w.assign[start..][0..len]);
+        }
+
+        /// Columns `j0..j0 + width` of every list's mean. Each sum adds its rows in row
+        /// order, as one thread would.
+        fn means(w: @This(), _: usize, j0: usize, width: usize) void {
+            const k_ = w.sizes.len;
+            for (0..k_) |l| @memset(w.sums[l * w.p + j0 ..][0..width], 0);
+            for (w.assign, 0..) |l, r| {
+                const src = w.data[r * w.p + j0 ..][0..width];
+                for (w.sums[l * w.p + j0 ..][0..width], src) |*acc, x| acc.* += x;
+            }
+            for (0..k_) |l| {
+                if (w.sizes[l] == 0) continue;
+                const inv = 1 / @as(f64, @floatFromInt(w.sizes[l]));
+                for (w.centroids[l * w.p + j0 ..][0..width], w.sums[l * w.p + j0 ..][0..width]) |*c, acc| c.* = @floatCast(acc * inv);
             }
         }
+    };
+    const step: Step = .{
+        .data = data,
+        .p = p,
+        .near = &near,
+        .centroids = centroids,
+        .sq = sq,
+        .assign = assign,
+        .scratch = scratch,
+        .sums = sums,
+        .sizes = sizes,
     };
 
     for (0..kmeans_iterations) |_| {
         for (0..k) |l| sq[l] = dotExact(centroids[l * p ..][0..p], centroids[l * p ..][0..p]);
-        var handles: [64]?std.Thread = @splat(null);
-        const base = rows / workers;
-        const rem = rows % workers;
-        var start: usize = 0;
-        var own: Assign = undefined;
-        for (0..workers) |w| {
-            const take = base + @intFromBool(w < rem);
-            const work: Assign = .{
-                .data = data,
-                .p = p,
-                .k = k,
-                .centroids = centroids,
-                .sq = sq,
-                .first = start,
-                .last = start + take,
-                .assign = assign,
-                .dots = dots[w * 4 * k ..][0 .. 4 * k],
-            };
-            start += take;
-            if (w == 0) {
-                own = work;
-                continue;
-            }
-            handles[w] = std.Thread.spawn(.{}, Assign.run, .{work}) catch blk: {
-                work.run();
-                break :blk null;
-            };
-        }
-        own.run();
-        for (handles[0..workers]) |h| if (h) |t| t.join();
+        near.load(centroids);
+        pool.forChunks(spread, rows, coarse_mod.max_rows, step, Step.nearestRows);
 
-        @memset(sums, 0);
         @memset(sizes, 0);
-        for (0..rows) |r| {
-            const l = assign[r];
-            sizes[l] += 1;
-            for (sums[l * p ..][0..p], data[r * p ..][0..p]) |*s, x| s.* += x;
-        }
-        for (0..k) |l| {
-            if (sizes[l] == 0) continue;
-            const inv = 1 / @as(f64, @floatFromInt(sizes[l]));
-            for (centroids[l * p ..][0..p], sums[l * p ..][0..p]) |*c, s| c.* = @floatCast(s * inv);
-        }
+        for (assign) |l| sizes[l] += 1;
+        pool.forChunks(spread, p, 16, step, Step.means);
         for (0..k) |l| {
             if (sizes[l] != 0) continue;
             var largest: usize = 0;
@@ -1396,6 +1359,33 @@ fn clusteredRows(a: Allocator, rows: usize, dim: usize, clusters: usize, random:
         for (row) |*x| x.* *= scale;
     }
     return out;
+}
+
+test "k-means gives the same centroids by int8 pre-pass as exhaustively" {
+    const a = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x4B4D);
+    // Clustered rows, normalised as training's directions are, at a width that isn't a
+    // multiple of 16 and a list count that isn't a multiple of 4.
+    for ([_][2]usize{ .{ 96, 37 }, .{ 200, 10 } }) |shape| {
+        const p = shape[0];
+        const k = shape[1];
+        const data = try clusteredRows(a, 5000, p, k / 2 + 1, prng.random());
+        defer a.free(data);
+        for (0..5000) |r| {
+            const row = data[r * p ..][0..p];
+            const inv = 1 / @sqrt(dotExact(row, row));
+            for (row) |*x| x.* *= inv;
+        }
+        const want = try a.alloc(f32, k * p);
+        defer a.free(want);
+        try kmeansWith(a, data, p, k, 1, want, true);
+        for ([_]usize{ 1, 4 }) |threads| {
+            const got = try a.alloc(f32, k * p);
+            defer a.free(got);
+            try kmeansWith(a, data, p, k, threads, got, false);
+            try testing.expectEqualSlices(f32, want, got);
+        }
+    }
 }
 
 /// Exact top-k ids of `query` over `rows` by inner product.
@@ -1594,6 +1584,47 @@ test "training and adding give the same bytes on any thread count" {
         try testing.expectEqualSlices(u32, x.ids.items, y.ids.items);
         try testing.expectEqualSlices(f16, x.biases.items, y.biases.items);
         for (x.scalars.items, y.scalars.items) |p, q| try testing.expect(std.meta.eql(p, q));
+    }
+}
+
+test "training takes the rows the serial loop did, zero rows skipped" {
+    const a = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(21);
+    const random = prng.random();
+    const dim = 40;
+    const n = 3000;
+    const data = try clusteredRows(a, n, dim, 6, random);
+    defer a.free(data);
+    // Every fifth row zero, so each batch leaves gaps for the next to fill.
+    var r: usize = 0;
+    while (r < n) : (r += 5) @memset(data[r * dim ..][0..dim], 0);
+    const order = try a.alloc(u32, n);
+    defer a.free(order);
+    for (order, 0..) |*o, i| o.* = @intCast(i);
+    random.shuffle(u32, order);
+
+    var index = try IvfIndex.init(a, .{ .dim = dim, .bits = 3, .lists = 8 });
+    defer index.deinit();
+    const p = index.padded();
+    for ([_]usize{ 2048, 2900 }) |cap| {
+        // The loop trainingRows replaced.
+        const want = try a.alloc(f32, cap * p);
+        defer a.free(want);
+        var ws = try prod_mod.Workspace.init(a, index.quantizer);
+        defer ws.deinit();
+        var rows: usize = 0;
+        for (order) |o| {
+            if (rows == cap) break;
+            const row = data[@as(usize, o) * dim ..][0..dim];
+            if (index.quantizer.mse.encodeRotated(row, want[rows * p ..][0..p], ws.staging) == 0) continue;
+            rows += 1;
+        }
+        for ([_]usize{ 1, 2, 4 }) |threads| {
+            const got = try a.alloc(f32, cap * p);
+            defer a.free(got);
+            try testing.expectEqual(rows, try index.trainingRows(data, order, got, threads));
+            try testing.expectEqualSlices(f32, want[0 .. rows * p], got[0 .. rows * p]);
+        }
     }
 }
 

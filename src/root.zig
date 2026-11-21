@@ -31,6 +31,8 @@ pub const flat = @import("index/flat.zig");
 pub const ivf = @import("index/ivf.zig");
 pub const persist = @import("index/persist.zig");
 pub const codes = @import("index/codes.zig");
+pub const coarse = @import("index/coarse.zig");
+pub const pool = @import("index/pool.zig");
 pub const rerank = @import("index/rerank.zig");
 
 test {

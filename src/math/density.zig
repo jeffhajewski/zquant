@@ -15,6 +15,9 @@
 
 const std = @import("std");
 const quadrature = @import("quadrature.zig");
+// Not `@exp`, `@log` or `std.math.lgamma`, whose results depend on the libm a build
+// links: see libm.zig.
+const libm = @import("libm.zig");
 
 /// Container-scope, so the Newton solve for the nodes runs once at comptime rather
 /// than on every `mass` call. It was being rebuilt inside Lloyd's inner loop, which
@@ -70,7 +73,7 @@ pub const Density = union(enum) {
         switch (self) {
             .gaussian => |g| {
                 const z = t / g.sigma;
-                return -0.5 * z * z - @log(g.sigma) - 0.5 * @log(2.0 * std.math.pi);
+                return -0.5 * z * z - libm.log(g.sigma) - 0.5 * @log(2.0 * std.math.pi);
             },
             .sphere_coord => |s| {
                 if (t <= -1.0 or t >= 1.0) return -std.math.inf(f64);
@@ -84,7 +87,7 @@ pub const Density = union(enum) {
     }
 
     pub fn pdf(self: Density, t: f64) f64 {
-        return @exp(self.logPdf(t));
+        return libm.exp(self.logPdf(t));
     }
 
     /// ∫_a^b t · f(t) dt, in closed form for both densities.
@@ -105,8 +108,8 @@ pub const Density = union(enum) {
                 const q = p + 1.0;
                 const lo = clampUnit(a);
                 const hi = clampUnit(b);
-                const term_a = @exp(logNorm(s.dim) + q * std.math.log1p(-lo * lo));
-                const term_b = @exp(logNorm(s.dim) + q * std.math.log1p(-hi * hi));
+                const term_a = libm.exp(logNorm(s.dim) + q * std.math.log1p(-lo * lo));
+                const term_b = libm.exp(logNorm(s.dim) + q * std.math.log1p(-hi * hi));
                 return (term_a - term_b) / (2.0 * q);
             },
         }
@@ -159,11 +162,12 @@ pub const Density = union(enum) {
 ///
 /// Computed via lgamma because the ratio of gammas overflows f64 well before the
 /// dimensions we care about: Γ(768) is far past the f64 range, while its log is not.
+/// The constant's `@log` is evaluated at compile time, never by libm.
 fn logNorm(dim: u32) f64 {
     const d: f64 = @floatFromInt(dim);
-    return std.math.lgamma(f64, d * 0.5) -
-        std.math.lgamma(f64, (d - 1.0) * 0.5) -
-        0.5 * @log(std.math.pi);
+    return libm.lgamma(d * 0.5) -
+        libm.lgamma((d - 1.0) * 0.5) -
+        comptime 0.5 * @log(std.math.pi);
 }
 
 fn clampUnit(t: f64) f64 {

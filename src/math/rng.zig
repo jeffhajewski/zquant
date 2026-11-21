@@ -9,6 +9,7 @@
 //! (SC '11). Constants and round structure follow the Random123 implementation.
 
 const std = @import("std");
+const libm = @import("libm.zig");
 
 /// Multiplier and Weyl constants from the Random123 reference implementation.
 const M0: u32 = 0xD2511F53;
@@ -126,8 +127,8 @@ pub const Stream = struct {
     /// Standard normal via Marsaglia polar method.
     ///
     /// Polar rather than Box-Muller: it avoids sin/cos, whose last-bit results vary
-    /// between libm implementations. Only `sqrt` and `log` are used, and this feeds
-    /// the reference dense rotation (a test oracle) rather than anything serialized.
+    /// between libm implementations. Only `sqrt`, which is exact, and `log` are used,
+    /// and `log` is libm.zig's, so the same seed gives the same draws everywhere.
     pub fn nextGaussian(self: *Stream) f64 {
         if (self.gaussian_spare) |g| {
             self.gaussian_spare = null;
@@ -138,7 +139,7 @@ pub const Stream = struct {
             const v = 2.0 * self.nextFloat() - 1.0;
             const s = u * u + v * v;
             if (s >= 1.0 or s == 0.0) continue;
-            const scale = @sqrt(-2.0 * @log(s) / s);
+            const scale = @sqrt(-2.0 * libm.log(s) / s);
             self.gaussian_spare = v * scale;
             return u * scale;
         }

@@ -9,6 +9,7 @@ pub const quadrature = @import("math/quadrature.zig");
 pub const density = @import("math/density.zig");
 pub const lloyd_max = @import("math/lloyd_max.zig");
 pub const rotation = @import("math/rotation.zig");
+pub const libm = @import("math/libm.zig");
 
 pub const codebook = @import("quant/codebook.zig");
 pub const mse = @import("quant/mse.zig");
